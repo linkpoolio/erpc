@@ -197,6 +197,13 @@ var (
 		Buckets:   []float64{0.01, 0.03, 0.05, 0.2, 0.3, 0.5, 0.7, 1, 3},
 	}, []string{"project", "network", "category", "finality"})
 
+	MetricNetworkTimeoutDurationSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "erpc",
+		Name:      "network_timeout_duration_seconds",
+		Help:      "Dynamic timeout duration computed for requests (seconds).",
+		Buckets:   []float64{0.05, 0.1, 0.3, 0.5, 1, 3, 5, 10, 30},
+	}, []string{"project", "network", "category", "finality"})
+
 	MetricNetworkFailedRequests = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "erpc",
 		Name:      "network_failed_request_total",

@@ -4,6 +4,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -502,6 +503,29 @@ func SetScoreMetricsMode(v string) {
 
 func GetScoreMetricsMode() ScoreMetricsMode {
 	return currentScoreMetricsMode
+}
+
+// compactLabels is read on every metric emit from many goroutines and written
+// exactly once at startup by SetHistogramLabelMode. An atomic bool is enough
+// and keeps the read cheap (no mutex, no contention).
+var compactLabels atomic.Bool
+
+// SetHistogramLabelMode configures whether high-cardinality labels should be
+// collapsed to "n/a" on metric emit. Applies to both duration histograms and
+// a handful of counters (e.g. MetricNetworkRequestsReceived). Must be called
+// before any metric is emitted.
+func SetHistogramLabelMode(mode string) {
+	compactLabels.Store(strings.ToLower(strings.TrimSpace(mode)) == "compact")
+}
+
+// CompactLabel returns "n/a" when label compaction is enabled, otherwise the
+// original value. Used wherever we want to reduce Prometheus series cardinality
+// on high-churn dimensions (upstream, user, finality, composite).
+func CompactLabel(v string) string {
+	if compactLabels.Load() {
+		return "n/a"
+	}
+	return v
 }
 
 func SetHistogramBuckets(bucketsStr string) error {

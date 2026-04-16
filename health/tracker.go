@@ -205,11 +205,11 @@ func (t *Tracker) getUpstreamRequestDurationObserver(up common.Upstream, method,
 		project:   t.projectId,
 		vendor:    up.VendorName(),
 		network:   up.NetworkLabel(),
-		upstream:  up.Id(),
+		upstream:  telemetry.CompactLabel(up.Id()),
 		category:  method,
-		composite: composite,
-		finality:  finality.String(),
-		user:      userId,
+		composite: telemetry.CompactLabel(composite),
+		finality:  telemetry.CompactLabel(finality.String()),
+		user:      telemetry.CompactLabel(userId),
 	}
 	if v, ok := t.urdObsCache.Load(key); ok {
 		return v.(prometheus.Observer)

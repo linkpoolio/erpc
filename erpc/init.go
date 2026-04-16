@@ -85,7 +85,7 @@ func Init(
 	//
 	logger.Info().Msg("initializing transports")
 	if cfg.Server != nil {
-		httpServer, err := NewHttpServer(appCtx, &logger, cfg.Server, cfg.HealthCheck, cfg.Admin, erpcInstance)
+		httpServer, err := NewHttpServer(appCtx, &logger, cfg.Server, cfg.HealthCheck, cfg.Admin, cfg.Indexer, erpcInstance)
 		if err != nil {
 			return err
 		}
@@ -113,6 +113,9 @@ func Init(
 	if cfg.Metrics != nil && cfg.Metrics.Enabled != nil && *cfg.Metrics.Enabled {
 		if cfg.Metrics.ErrorLabelMode != "" {
 			common.SetErrorLabelMode(cfg.Metrics.ErrorLabelMode)
+		}
+		if cfg.Metrics.HistogramLabelMode != "" {
+			telemetry.SetHistogramLabelMode(string(cfg.Metrics.HistogramLabelMode))
 		}
 		if cfg.Metrics.Port == nil {
 			return fmt.Errorf("metrics.port is not configured")

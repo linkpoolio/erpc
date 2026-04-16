@@ -210,10 +210,10 @@ func (p *PreparedProject) Forward(ctx context.Context, networkId string, nq *com
 			p.Config.Id,
 			network.Label(),
 			vendor,
-			upstreamId,
+			telemetry.CompactLabel(upstreamId),
 			method,
-			finality.String(),
-			nq.UserId(),
+			telemetry.CompactLabel(finality.String()),
+			telemetry.CompactLabel(nq.UserId()),
 		).Observe(dur.Seconds())
 		return resp, err
 	} else {
@@ -241,10 +241,10 @@ func (p *PreparedProject) Forward(ctx context.Context, networkId string, nq *com
 			p.Config.Id,
 			network.Label(),
 			"<error>",
-			"<error>",
+			telemetry.CompactLabel("<error>"),
 			method,
-			finality.String(),
-			nq.UserId(),
+			telemetry.CompactLabel(finality.String()),
+			telemetry.CompactLabel(nq.UserId()),
 		).Observe(time.Since(start).Seconds())
 	}
 

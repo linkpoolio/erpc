@@ -12461,6 +12461,114 @@ func TestNetwork_HighestFinalizedBlockNumber(t *testing.T) {
 	})
 }
 
+// TestNetwork_NodeGroupSharesBlockHeadState verifies that upstreams sharing a
+// NodeGroup get their state pollers updated in lock-step when a WS ingress
+// observes a newHead on one of them. Without this propagation, the HTTP
+// sibling's independent poller lags behind on fast-block chains and rejects
+// valid client requests with ErrUpstreamBlockUnavailable.
+func TestNetwork_NodeGroupSharesBlockHeadState(t *testing.T) {
+	util.ResetGock()
+	defer util.ResetGock()
+	util.SetupMocksForEvmStatePoller()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Two upstreams pointing at the same "physical node" via HTTP and WS,
+	// tagged with NodeGroup="node-a". A third upstream is in a different
+	// node group — it must NOT receive the propagation.
+	httpUp := &common.UpstreamConfig{
+		Type: common.UpstreamTypeEvm, Id: "node-a-http",
+		Endpoint: "http://node-a.localhost", NodeGroup: "node-a",
+		Evm: &common.EvmUpstreamConfig{ChainId: 123},
+	}
+	wsUp := &common.UpstreamConfig{
+		Type: common.UpstreamTypeEvm, Id: "node-a-ws",
+		Endpoint: "http://node-a-ws.localhost", NodeGroup: "node-a",
+		Evm: &common.EvmUpstreamConfig{ChainId: 123},
+	}
+	unrelated := &common.UpstreamConfig{
+		Type: common.UpstreamTypeEvm, Id: "node-b-http",
+		Endpoint: "http://node-b.localhost", NodeGroup: "node-b",
+		Evm: &common.EvmUpstreamConfig{ChainId: 123},
+	}
+
+	for _, host := range []string{"http://node-a.localhost", "http://node-a-ws.localhost", "http://node-b.localhost"} {
+		gock.New(host).Post("").Persist().
+			Filter(func(r *http.Request) bool { return strings.Contains(util.SafeReadBody(r), `eth_chainId`) }).
+			Reply(200).JSON([]byte(`{"result":"0x7b"}`))
+	}
+
+	rateLimitersRegistry, _ := upstream.NewRateLimitersRegistry(context.Background(), &common.RateLimiterConfig{}, &log.Logger)
+	metricsTracker := health.NewTracker(&log.Logger, "test", time.Minute)
+	vr := thirdparty.NewVendorsRegistry()
+	_, err := thirdparty.NewProvidersRegistry(&log.Logger, vr, []*common.ProviderConfig{}, nil)
+	require.NoError(t, err)
+
+	ssr, err := data.NewSharedStateRegistry(ctx, &log.Logger, &common.SharedStateConfig{
+		Connector: &common.ConnectorConfig{
+			Driver: "memory",
+			Memory: &common.MemoryConnectorConfig{MaxItems: 100_000, MaxTotalSize: "1GB"},
+		},
+	})
+	require.NoError(t, err)
+
+	upstreamsRegistry := upstream.NewUpstreamsRegistry(
+		ctx, &log.Logger, "test",
+		[]*common.UpstreamConfig{httpUp, wsUp, unrelated},
+		ssr, rateLimitersRegistry, vr, nil, nil,
+		metricsTracker, 1*time.Second, nil, nil,
+	)
+
+	networkConfig := &common.NetworkConfig{
+		Architecture: common.ArchitectureEvm,
+		Evm:          &common.EvmNetworkConfig{ChainId: 123},
+	}
+	network, err := NewNetwork(ctx, &log.Logger, "test", networkConfig,
+		rateLimitersRegistry, upstreamsRegistry, metricsTracker)
+	require.NoError(t, err)
+
+	upstreamsRegistry.Bootstrap(ctx)
+	time.Sleep(200 * time.Millisecond)
+	require.NoError(t, upstreamsRegistry.GetInitializer().WaitForTasks(ctx))
+	require.NoError(t, network.Bootstrap(ctx))
+	time.Sleep(250 * time.Millisecond)
+
+	ups := upstreamsRegistry.GetNetworkUpstreams(ctx, util.EvmNetworkId(123))
+	require.Len(t, ups, 3)
+
+	var httpUps, wsUps, otherUps *upstream.Upstream
+	for _, u := range ups {
+		switch u.Id() {
+		case "node-a-http":
+			httpUps = u
+		case "node-a-ws":
+			wsUps = u
+		case "node-b-http":
+			otherUps = u
+		}
+	}
+	require.NotNil(t, httpUps)
+	require.NotNil(t, wsUps)
+	require.NotNil(t, otherUps)
+
+	// Simulate a WS newHeads observation on node-a-ws at block 5000.
+	// A networkHandle mirrors what the indexer does inside Ingest.
+	handle := &networkHandle{nw: network}
+	handle.SuggestLatestBlock("ws:node-a-ws", 5000)
+
+	// Expect: WS source + HTTP sibling (same nodeGroup) both at 5000.
+	// The unrelated upstream (different nodeGroup) must NOT be updated.
+	require.Eventually(t, func() bool {
+		return wsUps.EvmStatePoller().LatestBlock() == 5000 &&
+			httpUps.EvmStatePoller().LatestBlock() == 5000
+	}, 2*time.Second, 10*time.Millisecond,
+		"WS + sibling HTTP should both receive the NodeGroup-propagated update")
+
+	assert.NotEqual(t, int64(5000), otherUps.EvmStatePoller().LatestBlock(),
+		"upstream in a different nodeGroup must not receive the propagation")
+}
+
 func TestNetwork_CacheEmptyBehavior(t *testing.T) {
 	t.Run("ServeCachedEmptyWhenAllowed", func(t *testing.T) {
 		util.ResetGock()

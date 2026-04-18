@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -44,6 +45,11 @@ type Adapter struct {
 	wsClient   *clients.WsJsonRpcClient
 	logger     *zerolog.Logger
 
+	// stripSubscribeFromBlockZero controls whether fromBlock: "0x0" is
+	// removed from eth_subscribe logs filters before forwarding upstream.
+	// See common.EvmNetworkConfig.StripSubscribeFromBlockZero for details.
+	stripSubscribeFromBlockZero bool
+
 	nw   indexer.NetworkHandle
 	sink indexer.Sink
 
@@ -59,6 +65,16 @@ type Adapter struct {
 	filters map[string]*filterSub
 }
 
+// Options carries optional settings for New. Fields zero-valued by default
+// preserve the adapter's standard behaviour — only set what you want to
+// override.
+type Options struct {
+	// StripSubscribeFromBlockZero, when true, removes fromBlock: "0x0" from
+	// eth_subscribe logs filters before sending to the upstream. See
+	// common.EvmNetworkConfig.StripSubscribeFromBlockZero.
+	StripSubscribeFromBlockZero bool
+}
+
 type filterSub struct {
 	subType     string
 	paramsHash  string
@@ -69,13 +85,16 @@ type filterSub struct {
 // New constructs an adapter for one upstream. Returns nil if the upstream
 // is not backed by a WsJsonRpcClient (i.e. it's HTTP) — callers filter
 // upstream lists up-front but this is a cheap safety net.
-func New(up *upstream.Upstream, networkID string, logger *zerolog.Logger) *Adapter {
+//
+// Pass opts for network-level behaviour overrides; a nil opts preserves
+// default behaviour.
+func New(up *upstream.Upstream, networkID string, logger *zerolog.Logger, opts *Options) *Adapter {
 	wsClient, ok := up.Client.(*clients.WsJsonRpcClient)
 	if !ok {
 		return nil
 	}
 	lg := logger.With().Str("upstreamId", up.Id()).Str("networkId", networkID).Logger()
-	return &Adapter{
+	a := &Adapter{
 		upstreamID: up.Id(),
 		networkID:  networkID,
 		upstream:   up,
@@ -83,6 +102,10 @@ func New(up *upstream.Upstream, networkID string, logger *zerolog.Logger) *Adapt
 		logger:     &lg,
 		filters:    make(map[string]*filterSub),
 	}
+	if opts != nil {
+		a.stripSubscribeFromBlockZero = opts.StripSubscribeFromBlockZero
+	}
+	return a
 }
 
 // Name identifies the adapter in indexer registries and logs. Unique per
@@ -244,7 +267,17 @@ func (a *Adapter) subscribeNewHeads(ctx context.Context) {
 }
 
 func (a *Adapter) subscribeFilter(ctx context.Context, sub *filterSub) error {
-	subID, err := a.sendSubscribe(ctx, append([]interface{}{sub.subType}, sub.params[1:]...))
+	outParams := append([]interface{}{sub.subType}, sub.params[1:]...)
+	if a.stripSubscribeFromBlockZero {
+		if cleaned, changed := stripFromBlockZero(outParams); changed {
+			a.logger.Info().
+				Str("subType", sub.subType).
+				Str("paramsHash", sub.paramsHash).
+				Msg("stripping fromBlock:0x0 from eth_subscribe filter (stripSubscribeFromBlockZero)")
+			outParams = cleaned
+		}
+	}
+	subID, err := a.sendSubscribe(ctx, outParams)
 	if err != nil {
 		return fmt.Errorf("filter subscribe: %w", err)
 	}
@@ -385,4 +418,50 @@ func buildJSONRPCBody(method string, params interface{}) ([]byte, error) {
 		"method":  method,
 		"params":  params,
 	})
+}
+
+// stripFromBlockZero returns a copy of params with fromBlock removed from
+// any filter object whose fromBlock equals "0x0" or "0". toBlock is left
+// alone. Other fromBlock values (including "latest", "finalized", or a
+// specific hex block number) are not touched. The input slice is not
+// mutated — filter maps are shallow-copied so the caller's params remain
+// stable for paramsHash computation and resubscribe.
+func stripFromBlockZero(params []interface{}) ([]interface{}, bool) {
+	out := make([]interface{}, len(params))
+	changed := false
+	for i, p := range params {
+		f, ok := p.(map[string]interface{})
+		if !ok {
+			out[i] = p
+			continue
+		}
+		fb, hasFrom := f["fromBlock"]
+		if !hasFrom {
+			out[i] = f
+			continue
+		}
+		s, isStr := fb.(string)
+		if !isStr || !isZeroBlockRef(s) {
+			out[i] = f
+			continue
+		}
+		clean := make(map[string]interface{}, len(f))
+		for k, v := range f {
+			if k == "fromBlock" {
+				continue
+			}
+			clean[k] = v
+		}
+		out[i] = clean
+		changed = true
+	}
+	return out, changed
+}
+
+// isZeroBlockRef reports whether s parses to zero in any form eth clients
+// typically emit ("0", "0x0", "0x00", …). strconv.ParseInt with base 0
+// auto-detects the 0x prefix for hex.
+func isZeroBlockRef(s string) bool {
+	n, err := strconv.ParseInt(strings.TrimSpace(s), 0, 64)
+	return err == nil && n == 0
 }

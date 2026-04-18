@@ -301,6 +301,25 @@ func (sm *SubscriptionManager) CleanupConnection(wsc *WsConnection, _ *PreparedP
 
 // --- internals --------------------------------------------------------
 
+// buildWsAdapterOptions resolves network-level toggles that the wsupstream
+// adapter needs into a flat Options struct. Returns nil when no override
+// applies so the adapter keeps its defaults.
+func buildWsAdapterOptions(cfg *common.NetworkConfig) *wsupstream.Options {
+	if cfg == nil || cfg.Evm == nil {
+		return nil
+	}
+	opts := &wsupstream.Options{}
+	set := false
+	if cfg.Evm.StripSubscribeFromBlockZero != nil && *cfg.Evm.StripSubscribeFromBlockZero {
+		opts.StripSubscribeFromBlockZero = true
+		set = true
+	}
+	if !set {
+		return nil
+	}
+	return opts
+}
+
 // bootstrapNetwork registers the network with the indexer and attaches a
 // wsupstream.Adapter for each WS upstream on the network. Idempotent per
 // networkId — subsequent calls are no-ops.
@@ -321,8 +340,9 @@ func (sm *SubscriptionManager) bootstrapNetwork(ctx context.Context, nw *Network
 	}
 
 	sm.idx.RegisterNetwork(&networkHandle{nw: nw})
+	adapterOpts := buildWsAdapterOptions(nw.cfg)
 	for _, up := range wsUpstreams {
-		adapter := wsupstream.New(up, networkID, sm.logger)
+		adapter := wsupstream.New(up, networkID, sm.logger, adapterOpts)
 		if adapter == nil {
 			continue
 		}

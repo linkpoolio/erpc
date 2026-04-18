@@ -1791,6 +1791,18 @@ type EvmNetworkConfig struct {
 	// Default includes common point-lookup methods like eth_getBlockByNumber, eth_getTransactionByHash, etc.
 	MarkEmptyAsErrorMethods []string `yaml:"markEmptyAsErrorMethods,omitempty" json:"markEmptyAsErrorMethods,omitempty"`
 
+	// StripSubscribeFromBlockZero, when true, removes `fromBlock: "0x0"` from
+	// eth_subscribe logs filters before forwarding to upstream WebSockets.
+	// Some clients include `fromBlock: "0x0"` in the filter as a
+	// "from genesis" marker. eth_subscribe is a live-stream RPC — fromBlock
+	// has no standardised meaning there — and on backends that prune
+	// historical data the subscription fails outright. Enabling this flag
+	// for such networks drops the field so the live stream succeeds;
+	// historical logs remain retrievable via eth_getLogs. Only the exact
+	// value "0x0" or "0" is stripped — non-zero fromBlocks pass through
+	// unchanged. DEFAULT: false.
+	StripSubscribeFromBlockZero *bool `yaml:"stripSubscribeFromBlockZero,omitempty" json:"stripSubscribeFromBlockZero,omitempty"`
+
 	// DynamicBlockTimeDebounceMultiplier scales the EMA-estimated block time to derive
 	// the debounce interval for block polling. A value of 0.7 means debounce = 70% of
 	// the estimated block time, preferring fresher data at the cost of slightly more

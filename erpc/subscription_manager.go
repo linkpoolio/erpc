@@ -571,57 +571,23 @@ func (h *networkHandle) FinalityDepth() int64 {
 // SuggestLatestBlock routes a per-source block observation to the
 // upstream's state poller. sourceId is the ingress adapter's Name(),
 // which for wsupstream.Adapter is "ws:<upstreamId>".
-//
-// If the source upstream declares a NodeGroup, the same observation is
-// propagated to every sibling upstream (same NodeGroup, same network).
-// This keeps an HTTP upstream's state poller aligned with a WS sibling
-// that receives newHeads notifications, avoiding stale-state
-// ErrUpstreamBlockUnavailable rejections on the HTTP transport.
 func (h *networkHandle) SuggestLatestBlock(sourceId string, blockNumber int64) {
 	const prefix = "ws:"
 	if !strings.HasPrefix(sourceId, prefix) {
 		return
 	}
 	upstreamID := sourceId[len(prefix):]
-
-	upstreams := h.nw.upstreamsRegistry.GetNetworkUpstreams(context.Background(), h.nw.networkId)
-
-	var source *upstream.Upstream
-	for _, u := range upstreams {
-		if u.Id() == upstreamID {
-			source = u
-			break
-		}
-	}
-	if source == nil {
-		return
-	}
-	suggestBlock(source, blockNumber)
-
-	nodeGroup := source.Config().NodeGroup
-	if nodeGroup == "" {
-		return
-	}
-	for _, u := range upstreams {
-		if u.Id() == upstreamID {
+	for _, u := range h.nw.upstreamsRegistry.GetNetworkUpstreams(context.Background(), h.nw.networkId) {
+		if u.Id() != upstreamID {
 			continue
 		}
-		if u.Config().NodeGroup != nodeGroup {
-			continue
+		poller := u.EvmStatePoller()
+		if poller == nil || poller.IsObjectNull() {
+			return
 		}
-		suggestBlock(u, blockNumber)
-	}
-}
-
-// suggestBlock pushes a block observation at an upstream's state poller
-// if it's initialised. Safe to call on upstreams whose poller hasn't
-// bootstrapped yet.
-func suggestBlock(u *upstream.Upstream, blockNumber int64) {
-	poller := u.EvmStatePoller()
-	if poller == nil || poller.IsObjectNull() {
+		poller.SuggestLatestBlock(blockNumber)
 		return
 	}
-	poller.SuggestLatestBlock(blockNumber)
 }
 
 // Interface checks: fail the build if either contract drifts.

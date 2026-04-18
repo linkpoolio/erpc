@@ -38,16 +38,6 @@ projects:
         # (OPTIONAL) Upstream ID is optional and can be used to identify the upstream in logs/metrics.
         id: blastapi-chain-42161
 
-        # (OPTIONAL) NodeGroup marks upstreams that target the same physical backend via
-        # different transports (e.g. HTTP + WebSocket). Members of the same nodeGroup
-        # share block-head observations: when a WS upstream receives a newHeads
-        # notification, sibling upstreams with the same nodeGroup get their state
-        # poller updated too. This avoids stale-state ErrUpstreamBlockUnavailable
-        # rejections when requests are routed (or hedged) to the HTTP sibling on
-        # fast-block chains. Leave unset unless you run paired HTTP/WS upstreams
-        # against the same backend.
-        # nodeGroup: my-node-a
-
         # (OPTIONAL) Configurations for EVM-compatible upstreams.
         evm:
           # (OPTIONAL) chainId is optional and will be detected from the endpoint (eth_chainId),

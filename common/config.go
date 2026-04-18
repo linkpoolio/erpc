@@ -656,16 +656,6 @@ type UpstreamConfig struct {
 	Id                           string                   `yaml:"id,omitempty" json:"id"`
 	Type                         UpstreamType             `yaml:"type,omitempty" json:"type" tstype:"TsUpstreamType"`
 	Group                        string                   `yaml:"group,omitempty" json:"group"`
-	// NodeGroup identifies upstreams that target the same physical backend
-	// via different transports (HTTP + WS). Members of the same node group
-	// share block-head observations: when one transport receives a
-	// newHeads notification, sibling upstreams with the same NodeGroup
-	// have their state poller updated too. This avoids the case where a
-	// WS-subscribed upstream has fresh state while its sibling HTTP
-	// upstream's independent poller lags behind — which on fast-block
-	// chains causes ErrUpstreamBlockUnavailable false rejections for
-	// requests that happen to be routed (or hedged) to the HTTP transport.
-	NodeGroup                    string                   `yaml:"nodeGroup,omitempty" json:"nodeGroup"`
 	VendorName                   string                   `yaml:"vendorName,omitempty" json:"vendorName"`
 	Endpoint                     string                   `yaml:"endpoint,omitempty" json:"endpoint"`
 	Evm                          *EvmUpstreamConfig       `yaml:"evm,omitempty" json:"evm"`
@@ -708,7 +698,6 @@ func (u *UpstreamConfig) UnmarshalYAML(unmarshal func(interface{}) error) error 
 		Id                           string                   `yaml:"id,omitempty"`
 		Type                         UpstreamType             `yaml:"type,omitempty"`
 		Group                        string                   `yaml:"group,omitempty"`
-		NodeGroup                    string                   `yaml:"nodeGroup,omitempty"`
 		VendorName                   string                   `yaml:"vendorName,omitempty"`
 		Endpoint                     string                   `yaml:"endpoint,omitempty"`
 		Evm                          *EvmUpstreamConfig       `yaml:"evm,omitempty"`
@@ -734,7 +723,6 @@ func (u *UpstreamConfig) UnmarshalYAML(unmarshal func(interface{}) error) error 
 	u.Id = old.Id
 	u.Type = old.Type
 	u.Group = old.Group
-	u.NodeGroup = old.NodeGroup
 	u.VendorName = old.VendorName
 	u.Endpoint = old.Endpoint
 	u.Evm = old.Evm

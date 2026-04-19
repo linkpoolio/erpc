@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/erpc/erpc/architecture/evm"
@@ -63,6 +64,15 @@ type Network struct {
 	// failure. May be nil in tests or when shared state is unavailable.
 	latestBlockShared    data.CounterInt64SharedVariable
 	finalizedBlockShared data.CounterInt64SharedVariable
+
+	// Last value this Network has ever returned from evmHighestBlockNumber
+	// for each of the monotonic tags. Diagnostic only — if a subsequent
+	// call computes a lower value we log it with the local/shared inputs
+	// so we can see whether the regression originated in the per-upstream
+	// poller max, the cross-cluster shared counter, or nowhere at all
+	// (i.e. a downstream/client-side race).
+	lastReturnedLatestBlock    atomic.Int64
+	lastReturnedFinalizedBlock atomic.Int64
 }
 
 func (n *Network) Bootstrap(ctx context.Context) error {
@@ -126,6 +136,8 @@ func (n *Network) EvmHighestLatestBlockNumber(ctx context.Context) int64 {
 		"eth_blockNumber",
 		(*upstream.Upstream).EvmEffectiveLatestBlock,
 		n.latestBlockShared,
+		&n.lastReturnedLatestBlock,
+		"latest",
 	)
 	span.SetAttributes(attribute.Int64("highest_latest_block", result))
 	return result
@@ -142,6 +154,8 @@ func (n *Network) EvmHighestFinalizedBlockNumber(ctx context.Context) int64 {
 		"eth_getBlockByNumber",
 		(*upstream.Upstream).EvmEffectiveFinalizedBlock,
 		n.finalizedBlockShared,
+		&n.lastReturnedFinalizedBlock,
+		"finalized",
 	)
 	span.SetAttributes(attribute.Int64("highest_finalized_block", result))
 	return result
@@ -167,6 +181,8 @@ func (n *Network) evmHighestBlockNumber(
 	selectionMethod string,
 	blockOf func(*upstream.Upstream) int64,
 	shared data.CounterInt64SharedVariable,
+	lastReturned *atomic.Int64,
+	tag string,
 ) int64 {
 	var primaryMax, fallbackMax int64
 	anyPrimaryUp := false
@@ -205,14 +221,54 @@ func (n *Network) evmHighestBlockNumber(
 		localMax = fallbackMax
 	}
 
+	var result int64
+	var sharedVal int64
 	if shared == nil {
-		return localMax
+		result = localMax
+	} else {
+		sharedVal = shared.GetValue()
+		if localMax > sharedVal {
+			result = shared.TryUpdate(ctx, localMax)
+		} else {
+			result = sharedVal
+		}
 	}
-	sharedVal := shared.GetValue()
-	if localMax > sharedVal {
-		return shared.TryUpdate(ctx, localMax)
+
+	// Monotonicity guard: diagnostic log when this function ever returns a
+	// value lower than a previous return on the same Network. If triggered,
+	// the bug is inside evmHighestBlockNumber itself (primaryMax drop,
+	// shared counter regression, or races between them) and not
+	// downstream. On forward progress we bump the high-water mark with a
+	// CAS so concurrent callers don't tear.
+	if lastReturned != nil {
+		prev := lastReturned.Load()
+		if result < prev {
+			n.logger.Warn().
+				Str("networkId", n.networkId).
+				Str("tag", tag).
+				Int64("previouslyReturned", prev).
+				Int64("nowReturning", result).
+				Int64("delta", result-prev).
+				Int64("localMax", localMax).
+				Int64("primaryMax", primaryMax).
+				Int64("fallbackMax", fallbackMax).
+				Bool("anyPrimaryUp", anyPrimaryUp).
+				Int64("sharedVal", sharedVal).
+				Bool("sharedNil", shared == nil).
+				Msg("evmHighestBlockNumber returned a value lower than a previous return")
+		} else {
+			for {
+				cur := lastReturned.Load()
+				if result <= cur {
+					break
+				}
+				if lastReturned.CompareAndSwap(cur, result) {
+					break
+				}
+			}
+		}
 	}
-	return sharedVal
+	return result
 }
 
 func (n *Network) EvmLowestFinalizedBlockNumber(ctx context.Context) int64 {

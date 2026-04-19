@@ -63,6 +63,16 @@ type Adapter struct {
 	// filters keyed by `subType + ":" + paramsHash`. Survives disconnects
 	// so we can re-subscribe on reconnect.
 	filters map[string]*filterSub
+
+	// Highest block number we've ingested from this upstream's newHeads
+	// subscription. Diagnostic only — lets handleNewHeads warn-log when
+	// the upstream WS ever delivers a lower-numbered head than one it
+	// already delivered, which chainlink HeadTracker treats as a data
+	// integrity violation ("Received finalized block older..."). The
+	// indexer itself already rejects stale heads via its own dedup /
+	// rollback tolerance, so this is purely to surface non-monotonic
+	// upstream behaviour instead of silently filtering it.
+	highestNewHeadSeen atomic.Int64
 }
 
 // Options carries optional settings for New. Fields zero-valued by default
@@ -322,6 +332,28 @@ func (a *Adapter) handleNewHeads(raw []byte) {
 		a.logger.Warn().Err(err).Str("number", header.Number).Msg("failed to parse block number")
 		return
 	}
+
+	// Monotonicity guard: warn-log if this upstream's WS ever delivers a
+	// lower-numbered head than one it already delivered. On forward
+	// progress, advance the high-water mark via CAS so concurrent
+	// notifications from a single adapter can't tear it.
+	for {
+		prev := a.highestNewHeadSeen.Load()
+		if num < prev {
+			a.logger.Warn().
+				Int64("previouslyDeliveredHighest", prev).
+				Int64("nowDelivering", num).
+				Int64("delta", num-prev).
+				Str("hash", header.Hash).
+				Str("parentHash", header.ParentHash).
+				Msg("upstream WS delivered a newHead with a lower block number than a previous head")
+			break
+		}
+		if num == prev || a.highestNewHeadSeen.CompareAndSwap(prev, num) {
+			break
+		}
+	}
+
 	a.sink.Ingest(indexer.StreamEvent{
 		Kind:      indexer.KindNewHead,
 		NetworkId: a.networkID,

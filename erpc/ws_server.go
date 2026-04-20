@@ -1,10 +1,12 @@
 package erpc
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -19,6 +21,16 @@ import (
 
 // wsConnCounter is an atomic counter for generating unique WebSocket connection IDs.
 var wsConnCounter int64
+
+// wsTraceNetwork, when set via the ERPC_WS_TRACE_NETWORK env var, causes
+// the WS server to emit every inbound message and outbound write as an
+// INFO-level "ws trace" event for connections on that network. Intended
+// for targeted debugging of client-side subscription behaviour; leave
+// unset in production to avoid log volume + payload-in-logs concerns.
+var wsTraceNetwork = os.Getenv("ERPC_WS_TRACE_NETWORK")
+
+// wsTraceMaxPayload caps the number of payload bytes logged per event.
+const wsTraceMaxPayload = 4096
 
 // WsConnection represents a single client WebSocket connection to the proxy.
 // Each connection tracks its own subscriptions and enforces per-connection limits.
@@ -187,8 +199,32 @@ func (wsc *WsConnection) readLoop() {
 			return
 		}
 
+		wsc.traceWS("in", message)
 		go wsc.handleMessage(message)
 	}
+}
+
+// traceWS logs a single inbound or outbound WS frame when the connection
+// is on the network targeted by ERPC_WS_TRACE_NETWORK. No-op otherwise,
+// so the call site stays cheap when tracing is disabled.
+func (wsc *WsConnection) traceWS(dir string, payload []byte) {
+	if wsTraceNetwork == "" || wsc.networkId != wsTraceNetwork {
+		return
+	}
+	snippet := payload
+	truncated := false
+	if len(snippet) > wsTraceMaxPayload {
+		snippet = snippet[:wsTraceMaxPayload]
+		truncated = true
+	}
+	wsc.logger.Info().
+		Str("connId", wsc.id).
+		Str("networkId", wsc.networkId).
+		Str("dir", dir).
+		Int("bytes", len(payload)).
+		Bool("truncated", truncated).
+		Str("payload", string(snippet)).
+		Msg("ws trace")
 }
 
 func (wsc *WsConnection) handleMessage(raw []byte) {
@@ -554,6 +590,18 @@ func (wsc *WsConnection) isMethodAllowed(method string) bool {
 const wsWriteDeadline = 10 * time.Second
 
 func (wsc *WsConnection) writeJSON(v interface{}) error {
+	// When ws tracing is active, marshal ourselves so we can log the
+	// exact bytes sent on the wire. Otherwise keep the existing fast
+	// path through gorilla's WriteJSON.
+	if wsTraceNetwork != "" && wsc.networkId == wsTraceNetwork {
+		data, err := json.Marshal(v)
+		if err != nil {
+			return err
+		}
+		wsc.traceWS("out", data)
+		return wsc.writeMessage(websocket.TextMessage, data)
+	}
+
 	wsc.writeMu.Lock()
 	defer wsc.writeMu.Unlock()
 
@@ -581,6 +629,22 @@ func (wsc *WsConnection) writeMessage(messageType int, data []byte) error {
 }
 
 func (wsc *WsConnection) writeNormalizedResponse(resp *common.NormalizedResponse) {
+	// When ws tracing is active, buffer the response into memory first
+	// so we can log the bytes, then send via writeMessage. Otherwise
+	// stream directly through gorilla's NextWriter (zero-copy).
+	if wsTraceNetwork != "" && wsc.networkId == wsTraceNetwork {
+		var buf bytes.Buffer
+		if _, err := resp.WriteTo(&buf); err != nil {
+			wsc.logger.Debug().Err(err).Str("connId", wsc.id).Msg("failed to buffer websocket response for trace")
+		}
+		wsc.traceWS("out", buf.Bytes())
+		if err := wsc.writeMessage(websocket.TextMessage, buf.Bytes()); err != nil {
+			wsc.logger.Debug().Err(err).Str("connId", wsc.id).Msg("failed to write websocket response")
+		}
+		go resp.Release()
+		return
+	}
+
 	wsc.writeMu.Lock()
 	defer wsc.writeMu.Unlock()
 
@@ -606,6 +670,15 @@ func (wsc *WsConnection) writeNormalizedResponse(resp *common.NormalizedResponse
 }
 
 func (wsc *WsConnection) writeBatchResponse(responses []interface{}) {
+	if wsTraceNetwork != "" && wsc.networkId == wsTraceNetwork {
+		var buf bytes.Buffer
+		bw := NewBatchResponseWriter(responses)
+		_, _ = bw.WriteTo(&buf)
+		wsc.traceWS("out", buf.Bytes())
+		_ = wsc.writeMessage(websocket.TextMessage, buf.Bytes())
+		return
+	}
+
 	wsc.writeMu.Lock()
 	defer wsc.writeMu.Unlock()
 

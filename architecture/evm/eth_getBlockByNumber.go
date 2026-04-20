@@ -64,18 +64,41 @@ func networkPostForward_eth_getBlockByNumber(ctx context.Context, network common
 					_, respBlockNumber, bnErr := ExtractBlockReferenceFromResponse(ctx, nr)
 					blockTimestamp, tsErr := ExtractBlockTimestampFromResponse(ctx, nr)
 
-					// Calculate block number lag
-					if common.IsTracingDetailed && bnErr == nil && respBlockNumber > 0 {
+					// Calculate block number lag. Runs unconditionally so we can
+					// WARN when the post-enforcement response is still stale vs
+					// what we know the highest to be — this is the single best
+					// signal that enforceHighestBlock didn't catch a stale read,
+					// and pinpoints where an HTTP "latest" round-trip returns a
+					// block number lower than what WS newHead fan-out has
+					// already delivered to the same client.
+					if bnErr == nil && respBlockNumber > 0 {
 						highestBlock := network.EvmHighestLatestBlockNumber(ctx)
 						blockNumberLag := highestBlock - respBlockNumber
 						if blockNumberLag < 0 {
 							blockNumberLag = 0
 						}
-						span.SetAttributes(
-							attribute.Int64("block.number", respBlockNumber),
-							attribute.Int64("highest_block", highestBlock),
-							attribute.Int64("block.number_lag", blockNumberLag),
-						)
+						if common.IsTracingDetailed {
+							span.SetAttributes(
+								attribute.Int64("block.number", respBlockNumber),
+								attribute.Int64("highest_block", highestBlock),
+								attribute.Int64("block.number_lag", blockNumberLag),
+							)
+						}
+						if blockNumberLag > 0 {
+							ups := nr.Upstream()
+							upstreamId := "<none>"
+							if ups != nil {
+								upstreamId = ups.Id()
+							}
+							network.Logger().Warn().
+								Str("networkId", network.Id()).
+								Str("upstreamId", upstreamId).
+								Int64("respBlockNumber", respBlockNumber).
+								Int64("highestBlock", highestBlock).
+								Int64("blockNumberLag", blockNumberLag).
+								Interface("requestId", nq.ID()).
+								Msg("eth_getBlockByNumber('latest') returned a block lower than network's highest known — enforceHighestBlock either skipped or failed to swap")
+						}
 					}
 
 					// Calculate timestamp lag and record metric

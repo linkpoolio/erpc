@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -22,12 +21,14 @@ import (
 // wsConnCounter is an atomic counter for generating unique WebSocket connection IDs.
 var wsConnCounter int64
 
-// wsTraceNetwork, when set via the ERPC_WS_TRACE_NETWORK env var, causes
-// the WS server to emit every inbound message and outbound write as an
-// INFO-level "ws trace" event for connections on that network. Intended
-// for targeted debugging of client-side subscription behaviour; leave
-// unset in production to avoid log volume + payload-in-logs concerns.
-var wsTraceNetwork = os.Getenv("ERPC_WS_TRACE_NETWORK")
+// wsFrameTraceEnabled reports whether per-frame WS tracing is turned on for
+// the given networkId via the diagnostics config (or the
+// ERPC_WS_TRACE_NETWORK env-var backdoor honored by DiagnosticsConfig.
+// SetDefaults). Kept as a thin wrapper so the hot path's call sites read
+// naturally.
+func wsFrameTraceEnabled(networkId string) bool {
+	return common.Diagnostics().IsNetworkWSFrameTraced(networkId)
+}
 
 // wsTraceMaxPayload caps the number of payload bytes logged per event.
 const wsTraceMaxPayload = 4096
@@ -204,11 +205,12 @@ func (wsc *WsConnection) readLoop() {
 	}
 }
 
-// traceWS logs a single inbound or outbound WS frame when the connection
-// is on the network targeted by ERPC_WS_TRACE_NETWORK. No-op otherwise,
-// so the call site stays cheap when tracing is disabled.
+// traceWS logs a single inbound or outbound WS frame when the connection's
+// networkId matches diagnostics.wsFrameTraceNetworkIds (or the env-var
+// backdoor). No-op otherwise, so the call site stays cheap when tracing
+// is disabled.
 func (wsc *WsConnection) traceWS(dir string, payload []byte) {
-	if wsTraceNetwork == "" || wsc.networkId != wsTraceNetwork {
+	if !wsFrameTraceEnabled(wsc.networkId) {
 		return
 	}
 	snippet := payload
@@ -593,7 +595,7 @@ func (wsc *WsConnection) writeJSON(v interface{}) error {
 	// When ws tracing is active, marshal ourselves so we can log the
 	// exact bytes sent on the wire. Otherwise keep the existing fast
 	// path through gorilla's WriteJSON.
-	if wsTraceNetwork != "" && wsc.networkId == wsTraceNetwork {
+	if wsFrameTraceEnabled(wsc.networkId) {
 		data, err := json.Marshal(v)
 		if err != nil {
 			return err
@@ -632,7 +634,7 @@ func (wsc *WsConnection) writeNormalizedResponse(resp *common.NormalizedResponse
 	// When ws tracing is active, buffer the response into memory first
 	// so we can log the bytes, then send via writeMessage. Otherwise
 	// stream directly through gorilla's NextWriter (zero-copy).
-	if wsTraceNetwork != "" && wsc.networkId == wsTraceNetwork {
+	if wsFrameTraceEnabled(wsc.networkId) {
 		var buf bytes.Buffer
 		if _, err := resp.WriteTo(&buf); err != nil {
 			wsc.logger.Debug().Err(err).Str("connId", wsc.id).Msg("failed to buffer websocket response for trace")
@@ -670,7 +672,7 @@ func (wsc *WsConnection) writeNormalizedResponse(resp *common.NormalizedResponse
 }
 
 func (wsc *WsConnection) writeBatchResponse(responses []interface{}) {
-	if wsTraceNetwork != "" && wsc.networkId == wsTraceNetwork {
+	if wsFrameTraceEnabled(wsc.networkId) {
 		var buf bytes.Buffer
 		bw := NewBatchResponseWriter(responses)
 		_, _ = bw.WriteTo(&buf)

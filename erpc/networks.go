@@ -234,12 +234,11 @@ func (n *Network) evmHighestBlockNumber(
 		}
 	}
 
-	// Monotonicity guard: diagnostic log when this function ever returns a
-	// value lower than a previous return on the same Network. If triggered,
-	// the bug is inside evmHighestBlockNumber itself (primaryMax drop,
-	// shared counter regression, or races between them) and not
-	// downstream. On forward progress we bump the high-water mark with a
-	// CAS so concurrent callers don't tear.
+	// Monotonicity guard: CAS-bumps the high-water mark and WARNs on
+	// regression. A real regression here is an aggregator bug
+	// (primaryMax drop, shared counter going backward, or a race
+	// between them) that should never happen in steady state, so
+	// there's no configurable off switch — when it fires, it's a bug.
 	if lastReturned != nil {
 		prev := lastReturned.Load()
 		if result < prev {

@@ -47,6 +47,7 @@ type Config struct {
 	Indexer      *IndexerConfig     `yaml:"indexer,omitempty" json:"indexer"`
 	ProxyPools   []*ProxyPoolConfig `yaml:"proxyPools,omitempty" json:"proxyPools"`
 	Tracing      *TracingConfig     `yaml:"tracing,omitempty" json:"tracing"`
+	Diagnostics  *DiagnosticsConfig `yaml:"diagnostics,omitempty" json:"diagnostics"`
 }
 
 // IndexerConfig tunes the transport-neutral event-stream indexer that

@@ -64,13 +64,15 @@ func networkPostForward_eth_getBlockByNumber(ctx context.Context, network common
 					_, respBlockNumber, bnErr := ExtractBlockReferenceFromResponse(ctx, nr)
 					blockTimestamp, tsErr := ExtractBlockTimestampFromResponse(ctx, nr)
 
-					// Calculate block number lag. Runs unconditionally so we can
-					// WARN when the post-enforcement response is still stale vs
-					// what we know the highest to be — this is the single best
-					// signal that enforceHighestBlock didn't catch a stale read,
-					// and pinpoints where an HTTP "latest" round-trip returns a
-					// block number lower than what WS newHead fan-out has
-					// already delivered to the same client.
+					// Block-number lag diagnostic: compares the final
+					// response's block number against the network's tracked
+					// tip. Span attributes are always populated when
+					// detailed tracing is on. A Trace fires when the final
+					// response is behind the tip — with per-block-number
+					// cache keying the common cache-induced staleness is
+					// gone, so what remains is cross-pod state-propagation
+					// race or upstream-level lag. Raise logLevel to trace
+					// for targeted investigation.
 					if bnErr == nil && respBlockNumber > 0 {
 						highestBlock := network.EvmHighestLatestBlockNumber(ctx)
 						blockNumberLag := highestBlock - respBlockNumber
@@ -90,14 +92,13 @@ func networkPostForward_eth_getBlockByNumber(ctx context.Context, network common
 							if ups != nil {
 								upstreamId = ups.Id()
 							}
-							network.Logger().Warn().
+							network.Logger().Trace().
 								Str("networkId", network.Id()).
 								Str("upstreamId", upstreamId).
 								Int64("respBlockNumber", respBlockNumber).
 								Int64("highestBlock", highestBlock).
 								Int64("blockNumberLag", blockNumberLag).
-								Interface("requestId", nq.ID()).
-								Msg("eth_getBlockByNumber('latest') returned a block lower than network's highest known — enforceHighestBlock either skipped or failed to swap")
+								Msg("eth_getBlockByNumber('latest') returned a block lower than network's highest known")
 						}
 					}
 

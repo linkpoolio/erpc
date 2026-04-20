@@ -333,14 +333,20 @@ func (a *Adapter) handleNewHeads(raw []byte) {
 		return
 	}
 
-	// Monotonicity guard: warn-log if this upstream's WS ever delivers a
-	// lower-numbered head than one it already delivered. On forward
-	// progress, advance the high-water mark via CAS so concurrent
-	// notifications from a single adapter can't tear it.
+	// Monotonicity guard: tracks the highest block number this upstream
+	// has ever delivered via newHeads and emits a Trace when a later
+	// notification carries a lower number. Advancement runs via CAS so
+	// the tracker stays accurate even when the log is below the
+	// configured level. The indexer's own dedup already filters stale
+	// heads; this observer is purely diagnostic.
+	//
+	// Emitted at Trace because legitimate reorgs produce the same
+	// pattern — raise logLevel to trace when diagnosing a specific
+	// provider suspected of pushing speculative or rolled-back heads.
 	for {
 		prev := a.highestNewHeadSeen.Load()
 		if num < prev {
-			a.logger.Warn().
+			a.logger.Trace().
 				Int64("previouslyDeliveredHighest", prev).
 				Int64("nowDelivering", num).
 				Int64("delta", num-prev).

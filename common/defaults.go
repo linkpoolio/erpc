@@ -71,6 +71,15 @@ func (c *Config) SetDefaults(opts *DefaultOptions) error {
 		}
 	}
 
+	// Diagnostics defaults apply even when the block is absent in config —
+	// the env-var backdoor (ERPC_WS_TRACE_NETWORK) still needs to be
+	// honored, and the monotonicity-canary WARN defaults to on.
+	if c.Diagnostics == nil {
+		c.Diagnostics = &DiagnosticsConfig{}
+	}
+	c.Diagnostics.SetDefaults()
+	SetDiagnostics(c.Diagnostics)
+
 	if c.Database != nil {
 		if err := c.Database.SetDefaults(c.ClusterKey); err != nil {
 			return err

@@ -42,6 +42,15 @@ type Indexer struct {
 }
 
 // networkState holds the indexer's per-network bookkeeping: the
+// headMarker packages the most-recent head seen for a network so
+// networkState can store (num, hash) atomically. Treated as immutable
+// once published via lastHead.Store / CompareAndSwap; readers load
+// and may see nil before the first head arrives.
+type headMarker struct {
+	num  int64
+	hash string
+}
+
 // NetworkHandle for finality lookups, the ingresses feeding it, and the
 // dedup windows for each active filter (plus the newHeads window).
 type networkState struct {
@@ -54,12 +63,17 @@ type networkState struct {
 	// Nil means "treat every registered ingress as a default."
 	selector IngressSelector
 
-	// newHeads dedup: (blockNumber, blockHash) pairs. We keep last-seen
-	// as atomics to take the hot-path allocation-free, and fall back to
-	// DedupWindow for anything that slips past the last-pair check (rare
-	// on well-behaved sources).
-	lastHeadNum  atomic.Int64
-	lastHeadHash atomic.Value // string
+	// newHeads dedup: most-recently-delivered (blockNumber, blockHash)
+	// packed into a single pointer so the check+advance is a single
+	// atomic CAS — separate atomics on num and hash would leave readers
+	// able to see num updated before hash, and producers able to both
+	// pass the "load, check, store" sequence with the same stale num.
+	// We saw the latter in prod against evm:1101 where four upstream WS
+	// sources delivered the same head within ~1ms and both raced past
+	// the dedup. Fallback DedupWindow still catches the rare
+	// "older-but-not-newest" case (out-of-order delivery on a reorg
+	// boundary).
+	lastHead     atomic.Pointer[headMarker]
 	headFallback *DedupWindow
 
 	// Per-filter dedup windows: filterHash -> *DedupWindow.
@@ -446,17 +460,27 @@ func (i *Indexer) emitReorgInvalidations(ns *networkState, evicted []BlockRef) {
 func (i *Indexer) dedupe(ns *networkState, ev *StreamEvent) bool {
 	switch ev.Kind {
 	case KindNewHead:
-		lastNum := ns.lastHeadNum.Load()
-		if ev.Block.Number < lastNum {
-			return false
-		}
-		if ev.Block.Number == lastNum {
-			if lastHash, ok := ns.lastHeadHash.Load().(string); ok && lastHash == ev.Block.Hash {
-				return false
+		// CAS-retry on the packed (num, hash) pointer. On the happy path
+		// exactly one goroutine per distinct head wins the swap and falls
+		// through to mark+deliver; any concurrent ingest of the same head
+		// sees its CAS fail, reloads, and drops as a dupe on the next
+		// iteration. Reorgs at the same height (same num, different hash)
+		// win a second CAS and are delivered.
+		next := &headMarker{num: ev.Block.Number, hash: ev.Block.Hash}
+		for {
+			prev := ns.lastHead.Load()
+			if prev != nil {
+				if ev.Block.Number < prev.num {
+					return false
+				}
+				if ev.Block.Number == prev.num && prev.hash == ev.Block.Hash {
+					return false
+				}
+			}
+			if ns.lastHead.CompareAndSwap(prev, next) {
+				break
 			}
 		}
-		ns.lastHeadNum.Store(ev.Block.Number)
-		ns.lastHeadHash.Store(ev.Block.Hash)
 		// Store in the fallback window too for the rare "older-but-not-
 		// newest" case (out-of-order delivery on a reorg boundary).
 		ns.headFallback.Mark(ev.Block.Hash)
@@ -494,7 +518,10 @@ func (i *Indexer) classify(ns *networkState, ev StreamEvent) Lifecycle {
 	if depth <= 0 {
 		return LifeSoft
 	}
-	latest := ns.lastHeadNum.Load()
+	var latest int64
+	if head := ns.lastHead.Load(); head != nil {
+		latest = head.num
+	}
 	if latest-ev.Block.Number >= depth {
 		return LifeFinalized
 	}

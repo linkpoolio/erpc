@@ -3,6 +3,7 @@ package indexer
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -149,6 +150,47 @@ func TestIndexer_NewHead_FanOutAndDedup(t *testing.T) {
 	idx.Ingest(StreamEvent{Kind: KindNewHead, NetworkId: "evm:1", SourceId: "ws:up1", Block: BlockRef{Number: 101, Hash: "0xBBB"}})
 	if got := eg.count(); got != 2 {
 		t.Fatalf("want 2 after advance, got %d", got)
+	}
+}
+
+// TestIndexer_NewHead_ConcurrentIngestDedupe reproduces the TOCTOU race
+// that prod evm:1101 hit: four WS upstream sources delivered the same
+// newHead within ~1ms, and concurrent Ingest calls both read the stale
+// lastHeadNum + Store the same new value + fell through to fanOut, so
+// clients saw every head twice. The regression asserts that no matter
+// how many goroutines race with the same (number, hash), the egress
+// receives exactly one delivery.
+func TestIndexer_NewHead_ConcurrentIngestDedupe(t *testing.T) {
+	idx := newIndexer(t)
+	nw := newFakeNetwork("evm:1", 0)
+	idx.RegisterNetwork(nw)
+	eg := &fakeEgress{name: "eg1", filters: map[string]struct{}{}, acceptAllHeads: true}
+	idx.Attach(eg)
+
+	const sources = 8
+	ev := StreamEvent{
+		Kind:      KindNewHead,
+		NetworkId: "evm:1",
+		Block:     BlockRef{Number: 100, Hash: "0xAAA"},
+	}
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < sources; i++ {
+		wg.Add(1)
+		ev := ev
+		ev.SourceId = fmt.Sprintf("ws:up%d", i)
+		go func() {
+			defer wg.Done()
+			<-start
+			idx.Ingest(ev)
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if got := eg.count(); got != 1 {
+		t.Fatalf("concurrent ingest of identical head must dedupe to 1 delivery, got %d", got)
 	}
 }
 

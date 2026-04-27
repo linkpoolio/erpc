@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -80,6 +81,12 @@ type WsJsonRpcClient struct {
 	errorExtractor common.JsonRpcErrorExtractor
 
 	connected atomic.Bool
+
+	// wireIDCounter generates unique JSON-RPC ids on the WS wire so that
+	// concurrent SendRequest calls with the same caller-supplied id do not
+	// collide on the pending response map. The original caller id is
+	// restored on the response before returning.
+	wireIDCounter atomic.Uint64
 }
 
 type wsPendingResult struct {
@@ -185,11 +192,18 @@ func (c *WsJsonRpcClient) SendRequest(ctx context.Context, req *common.Normalize
 		)
 	}
 
-	// Serialize the JSON-RPC request
+	// Use a unique outbound wire id so concurrent SendRequest calls with the
+	// same caller-supplied JSON-RPC id do not collide in c.pending. The
+	// original id is restored on the response below before returning.
+	wireID := c.wireIDCounter.Add(1)
+	idKey := strconv.FormatUint(wireID, 10)
+
+	// Serialize the JSON-RPC request with the rewritten wire id
 	jrReq.RLock()
+	originalID := jrReq.ID
 	requestBody, err := common.SonicCfg.Marshal(map[string]interface{}{
 		"jsonrpc": jrReq.JSONRPC,
-		"id":      jrReq.ID,
+		"id":      wireID,
 		"method":  jrReq.Method,
 		"params":  jrReq.Params,
 	})
@@ -204,10 +218,6 @@ func (c *WsJsonRpcClient) SendRequest(ctx context.Context, req *common.Normalize
 			0, 0, 0, 0,
 		)
 	}
-
-	// Create a unique string key for the pending map from the request ID.
-	// Must use normalizeIDKey to handle JSON number parsing (float64 scientific notation).
-	idKey := normalizeIDKey(jrReq.ID)
 
 	// Register a response channel
 	respCh := make(chan *wsPendingResult, 1)
@@ -238,6 +248,13 @@ func (c *WsJsonRpcClient) SendRequest(ctx context.Context, req *common.Normalize
 		if result.err != nil {
 			common.SetTraceSpanError(span, result.err)
 			return nil, result.err
+		}
+		// Restore the caller's original JSON-RPC id on the response, since
+		// the on-wire id was rewritten to our unique counter above.
+		if result.resp != nil {
+			if jrr, perr := result.resp.JsonRpcResponse(ctx); perr == nil && jrr != nil {
+				_ = jrr.SetID(originalID)
+			}
 		}
 		return result.resp, nil
 	case <-ctx.Done():

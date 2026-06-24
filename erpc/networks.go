@@ -65,13 +65,6 @@ type Network struct {
 	lastReturnedLatestBlock    atomic.Int64
 	lastReturnedFinalizedBlock atomic.Int64
 
-	// lastFallbackFinalizedPollMs throttles the on-demand, finalized-only poll
-	// of fallback-tier upstreams (refreshFallbackFinalizedIfStale). That poll
-	// only fires while the primary set can't be trusted for finalized
-	// resolution (primaries configured but none up), so steady-state cost on
-	// probe-off fallbacks stays ~zero.
-	lastFallbackFinalizedPollMs atomic.Int64
-
 	// finalizedProgress tracks, per upstream id, the last finalized block we've
 	// observed for a primary and when it last advanced. It is the state behind
 	// finality-stall detection (detectFinalityStall) and reuses the poller's
@@ -326,64 +319,6 @@ func (n *Network) EvmHighestFinalizedBlockNumber(ctx context.Context) int64 {
 	return result
 }
 
-// fallbackFinalizedRefreshThrottle bounds how often refreshFallbackFinalizedIfStale
-// fires its on-demand poll, so a burst of tag resolutions can't fan out into a
-// burst of upstream calls. The actual fetch is additionally debounced
-// per-upstream by the state poller's TryUpdateIfStale, so real network traffic
-// is governed by the (block-time-derived) poll debounce, not this value.
-const fallbackFinalizedRefreshThrottle = 2 * time.Second
-
-// refreshFallbackFinalizedIfStale fires a single finalized-only poll against
-// each healthy fallback-tier upstream. It is the only path that lets a
-// probe-off fallback (state poller disabled to save quota) contribute its
-// finalized height to tag resolution, and it runs ONLY when the primary set can
-// no longer be trusted for finalized (callers gate on
-// primaryCount > 0 && !anyPrimaryUp). The poll is async — it never adds latency
-// to the caller; the refreshed value is picked up by the next resolution. In
-// steady state (any primary up) this is never called, so cost stays ~zero.
-func (n *Network) refreshFallbackFinalizedIfStale(ctx context.Context) {
-	nowMs := time.Now().UnixMilli()
-	last := n.lastFallbackFinalizedPollMs.Load()
-	if nowMs-last < fallbackFinalizedRefreshThrottle.Milliseconds() {
-		return
-	}
-	if !n.lastFallbackFinalizedPollMs.CompareAndSwap(last, nowMs) {
-		// Another goroutine just claimed this refresh window.
-		return
-	}
-
-	fallbacks := n.upstreamsRegistry.GetFallbackEscapeUpstreams(ctx, n.networkId, "eth_getBlockByNumber")
-	if len(fallbacks) == 0 {
-		return
-	}
-
-	base := n.appCtx
-	if base == nil {
-		base = context.Background()
-	}
-	for _, u := range fallbacks {
-		sp := u.EvmStatePoller()
-		if sp == nil {
-			continue
-		}
-		u, sp := u, sp
-		go func() {
-			pollCtx, cancel := context.WithTimeout(base, 10*time.Second)
-			defer cancel()
-			if _, err := sp.PollFinalizedBlockNumber(pollCtx); err != nil {
-				n.logger.Debug().Err(err).Str("upstreamId", u.Id()).Msg("on-demand fallback finalized refresh failed")
-			}
-			// Also refresh the fallback's own latest so evmHighestBlockNumber can
-			// corroborate (and cap) the finalized we adopt against a tip the same
-			// upstream reports. Only happens during an active outage, never in
-			// steady state.
-			if _, err := sp.PollLatestBlockNumber(pollCtx); err != nil {
-				n.logger.Debug().Err(err).Str("upstreamId", u.Id()).Msg("on-demand fallback latest refresh failed")
-			}
-		}()
-	}
-}
-
 // finalizedProgressFor returns (creating if needed) the finalized-advance record
 // for an upstream id.
 func (n *Network) finalizedProgressFor(id string) *finalizedProgressEntry {
@@ -517,7 +452,6 @@ func (n *Network) evmHighestBlockNumber(
 ) int64 {
 	var primaryMax, fallbackMax, fallbackLatestMax int64
 	anyPrimaryUp := false
-	primaryCount := 0
 	nowMs := time.Now().UnixMilli()
 	checkStall := tag == "finalized"
 	for _, u := range n.upstreamsRegistry.GetNetworkUpstreams(ctx, n.networkId) {
@@ -547,7 +481,6 @@ func (n *Network) evmHighestBlockNumber(
 			}
 			continue
 		}
-		primaryCount++
 		// Distrust a finality-stalled primary as a finalized source: its frozen
 		// finalized must not anchor primaryMax and it must not count as an "up"
 		// primary, so the no-trustworthy-primary failover below engages —
@@ -565,19 +498,11 @@ func (n *Network) evmHighestBlockNumber(
 		}
 	}
 
-	// When the network has primaries but none can be trusted for finalized (all
-	// circuit-broken — the original incident — OR all finality-stalled — the new
-	// case), the primary-driven max is frozen/stale. Kick a throttled, async
-	// refresh of the fallbacks (finalized + their own latest for corroboration)
-	// so their height becomes visible to the failover branch below. Probe-off
-	// fallbacks have their state poller disabled to save quota, so without this
-	// their finalized stays 0 and the failover can never engage. This is the only
-	// extra upstream traffic introduced, and it only happens during an active
-	// finalized-resolution problem.
-	if tag == "finalized" && primaryCount > 0 && !anyPrimaryUp {
-		n.refreshFallbackFinalizedIfStale(ctx)
-	}
-
+	// When no primary can be trusted for finalized (all circuit-broken OR all
+	// finality-stalled), fail over to the fallback tier. Their finalized/latest
+	// are already tracked by the state poller (probe:off only opts a fallback out
+	// of the selection policy's shadow-mirror traffic, not out of state polling),
+	// so the value is available here without any extra on-demand polling.
 	localMax := primaryMax
 	if fallbackMax > 0 && !anyPrimaryUp {
 		if tag == "finalized" {

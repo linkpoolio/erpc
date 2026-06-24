@@ -395,54 +395,65 @@ func (n *Network) finalizedProgressFor(id string) *finalizedProgressEntry {
 }
 
 // detectFinalityStall updates a primary's finalized-advance record and reports
-// whether it is finality-stalled: its finalized has not advanced for longer than
-// the configured window WHILE its latest is more than the configured margin ahead
-// of its finalized. Both conditions are required so a chain with legitimately
-// deep-but-advancing finality (or one whose latest sits close to finalized) is
-// never misclassified. Returns false when detection is disabled (either knob
-// <= 0) or inputs are incomplete. It is edge-triggered for observability: a
-// metric/log fires only on the transition into/out of the stalled state.
+// whether it is finality-stalled, then emits edge-triggered observability
+// (a metric/log fires only on the transition into/out of the stalled state).
+// The classification itself lives in the pure evaluateFinalityStall so it can be
+// unit-tested exhaustively without upstreams, gock, or wall-clock timing.
 func (n *Network) detectFinalityStall(u *upstream.Upstream, finalized, latest, nowMs int64) bool {
 	entry := n.finalizedProgressFor(u.Id())
+	stalled, becameStalled, resumed := evaluateFinalityStall(
+		entry, finalized, latest, nowMs, n.finalityStallWindowMs(), n.finalityStallMargin())
 
+	if resumed {
+		n.logger.Info().Str("upstreamId", u.Id()).Int64("finalized", finalized).
+			Msg("primary finalized resumed advancing; restored as finalized source")
+	}
+	if becameStalled {
+		n.logger.Warn().
+			Str("upstreamId", u.Id()).
+			Int64("finalized", finalized).
+			Int64("latest", latest).
+			Int64("lag", latest-finalized).
+			Msg("primary finalized has stalled (frozen while latest advances); demoting it as a finalized source")
+		telemetry.MetricUpstreamFinalityStalled.WithLabelValues(n.projectId, u.VendorName(), n.Label(), u.Id()).Inc()
+	}
+	return stalled
+}
+
+// evaluateFinalityStall is the pure classification behind detectFinalityStall.
+// It mutates the per-upstream record and reports whether the upstream is
+// finality-stalled: its finalized has not advanced for longer than windowMs
+// WHILE its latest is more than margin blocks ahead of its finalized. Both
+// conditions are required so a chain with legitimately deep-but-advancing
+// finality (or one whose latest sits close to finalized) is never misclassified.
+// Detection is disabled (always returns false) when either threshold is <= 0 or
+// inputs are incomplete. becameStalled/resumed flag the edge transitions so the
+// caller can emit observability exactly once per transition.
+func evaluateFinalityStall(entry *finalizedProgressEntry, finalized, latest, nowMs, windowMs, margin int64) (stalled, becameStalled, resumed bool) {
 	// Advancing finalized always clears the stall and resets the freeze timer.
 	if finalized > entry.value.Load() {
 		entry.value.Store(finalized)
 		entry.sinceMs.Store(nowMs)
-		if entry.stalled.Swap(false) {
-			n.logger.Info().Str("upstreamId", u.Id()).Int64("finalized", finalized).
-				Msg("primary finalized resumed advancing; restored as finalized source")
-		}
-		return false
+		resumed = entry.stalled.Swap(false)
+		return false, false, resumed
 	}
 
-	windowMs := n.finalityStallWindowMs()
-	margin := n.finalityStallMargin()
 	if windowMs <= 0 || margin <= 0 || finalized <= 0 || latest <= 0 {
-		return false
+		return false, false, false
 	}
 
 	since := entry.sinceMs.Load()
 	if since <= 0 {
 		// First observation at this (non-advancing) value — start the timer.
 		entry.sinceMs.Store(nowMs)
-		return false
+		return false, false, false
 	}
 	if nowMs-since < windowMs || latest-finalized < margin {
-		return false
+		return false, false, false
 	}
 
-	if !entry.stalled.Swap(true) {
-		n.logger.Warn().
-			Str("upstreamId", u.Id()).
-			Int64("finalized", finalized).
-			Int64("latest", latest).
-			Int64("lag", latest-finalized).
-			Int64("frozenForMs", nowMs-since).
-			Msg("primary finalized has stalled (frozen while latest advances); demoting it as a finalized source")
-		telemetry.MetricUpstreamFinalityStalled.WithLabelValues(n.projectId, u.VendorName(), n.Label(), u.Id()).Inc()
-	}
-	return true
+	becameStalled = !entry.stalled.Swap(true)
+	return true, becameStalled, false
 }
 
 // corroboratedFallbackFinalized returns the fallback finalized value to adopt

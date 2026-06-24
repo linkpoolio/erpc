@@ -2,11 +2,13 @@ package erpc
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/erpc/erpc/architecture/evm"
 	"github.com/erpc/erpc/common"
 	"github.com/erpc/erpc/util"
 	"github.com/h2non/gock"
@@ -310,4 +312,91 @@ func TestFinalizedResolution_DoesNotDemoteHealthyPrimaryWithSmallFinalityGap(t *
 			primaryFinalized, fallbackFinalized, i)
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+// mockGetBlockByNumberConcrete answers eth_getBlockByNumber for a specific hex
+// block number (the value eRPC re-fetches / interpolates to once it knows the
+// true finalized height). Hex must be lowercase to match eRPC's NormalizeHex.
+func mockGetBlockByNumberConcrete(host, hexNum string) {
+	gock.New("http://" + host).
+		Post("").
+		Persist().
+		Filter(func(r *http.Request) bool {
+			b := util.SafeReadBody(r)
+			return strings.Contains(b, "eth_getBlockByNumber") && strings.Contains(b, hexNum)
+		}).
+		Reply(200).
+		JSON([]byte(fmt.Sprintf(
+			`{"jsonrpc":"2.0","id":1,"result":{"number":"%s","hash":"0xabc","timestamp":"0x6702a8e0"}}`, hexNum)))
+}
+
+// TestEthGetBlockByNumber_Finalized_ReturnsHealthyNodeBlockWhenPrimaryStalled is
+// the end-to-end, RPC-method-level proof of the Base incident fix: a client that
+// calls eth_getBlockByNumber("finalized") — exactly what Chainlink MultiNode polls
+// for finality — must receive the HEALTHY node's higher finalized block when the
+// primary is finality-stalled, not the primary's frozen value.
+//
+// This drives the real network.Forward path, so it exercises the
+// enforce-highest-finalized / tag-interpolation machinery on top of the stall
+// detection — the whole chain a downstream node actually hits.
+func TestEthGetBlockByNumber_Finalized_ReturnsHealthyNodeBlockWhenPrimaryStalled(t *testing.T) {
+	defer util.ResetGock()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const chainIdHex = "0x3e7"
+	const stalledFinalized = "0xf0000"      // frozen, far behind tip (the bug)
+	const healthyFinalizedHex = "0xfff00"   // the true, higher finalized
+	const healthyFinalized = int64(0xfff00) // == 1048320
+
+	// Primaries: circuit-closed, latest at tip, finalized FROZEN far behind.
+	// Fallbacks: healthy, poller on, holding the true higher finalized.
+	mockJsonRpcUpstream("rpc1.localhost", chainIdHex, "0x100000", stalledFinalized)
+	mockJsonRpcUpstream("rpc2.localhost", chainIdHex, "0x100000", stalledFinalized)
+	mockJsonRpcUpstream("rpc3.localhost", chainIdHex, "0x100010", healthyFinalizedHex)
+	mockJsonRpcUpstream("rpc4.localhost", chainIdHex, "0x100010", healthyFinalizedHex)
+	// Any upstream may be asked for the concrete higher block (interpolation or
+	// the enforce-highest-finalized re-fetch, which excludes the stale server).
+	for _, h := range []string{"rpc1.localhost", "rpc2.localhost", "rpc3.localhost", "rpc4.localhost"} {
+		mockGetBlockByNumberConcrete(h, healthyFinalizedHex)
+	}
+
+	// All four pollers on so the fallbacks' finalized is known without waiting on
+	// the on-demand refresh (that path is covered by the other tests).
+	network, upr, _ := buildFailoverNetwork(t, ctx, failoverUpstreamConfigs(), true)
+	require.Len(t, upr.GetNetworkUpstreams(ctx, util.EvmNetworkId(999)), 4)
+	setFinalityStallThresholds(network, 100*time.Millisecond, 100)
+
+	// Resolution-level guard: once the primaries are demoted as finality-stalled,
+	// the network finalized resolves to the healthy fallback's higher value.
+	require.Eventually(t, func() bool {
+		return network.EvmHighestFinalizedBlockNumber(ctx) == healthyFinalized
+	}, 5*time.Second, 100*time.Millisecond,
+		"network finalized must fail over to the healthy node's value (%d) once the primary is stalled", healthyFinalized)
+
+	// Method-level proof: a client's eth_getBlockByNumber("finalized") returns the
+	// healthy node's block, not the stalled primary's frozen one.
+	req := common.NewNormalizedRequest([]byte(
+		`{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["finalized",false]}`))
+	req.SetNetwork(network)
+	// eth_getBlockByNumber finality enforcement is gated on this directive
+	// (defaults to true in production; set explicitly here since the test builds
+	// requests programmatically rather than via the HTTP server).
+	req.SetDirectives(&common.RequestDirectives{EnforceHighestBlock: true})
+	// Replicate the project's request path: network.Forward wrapped by the EVM
+	// network post-forward hook (which is where enforce-highest-finalized lives).
+	resp, err := network.Forward(ctx, req)
+	resp, err = evm.HandleNetworkPostForward(ctx, network, req, resp, err)
+	require.NoError(t, err, "eth_getBlockByNumber(finalized) must succeed")
+	require.NotNil(t, resp)
+	defer resp.Release()
+
+	jrr, err := resp.JsonRpcResponse()
+	require.NoError(t, err)
+	numHex, err := jrr.PeekStringByPath(ctx, "number")
+	require.NoError(t, err)
+	got, err := common.HexToInt64(numHex)
+	require.NoError(t, err)
+	require.Equal(t, healthyFinalized, got,
+		"eth_getBlockByNumber(finalized) must return the healthy node's block %d, not the stalled primary's frozen finalized", healthyFinalized)
 }

@@ -64,6 +64,13 @@ type Network struct {
 	// shared counter, or a race between them.
 	lastReturnedLatestBlock    atomic.Int64
 	lastReturnedFinalizedBlock atomic.Int64
+
+	// lastFallbackFinalizedPollMs throttles the on-demand, finalized-only poll
+	// of fallback-tier upstreams (refreshFallbackFinalizedIfStale). That poll
+	// only fires while the primary set can't be trusted for finalized
+	// resolution (primaries configured but none up), so steady-state cost on
+	// probe-off fallbacks stays ~zero.
+	lastFallbackFinalizedPollMs atomic.Int64
 }
 
 // Bootstrap registers this network with the policy engine. The engine kicks
@@ -303,6 +310,57 @@ func (n *Network) EvmHighestFinalizedBlockNumber(ctx context.Context) int64 {
 	return result
 }
 
+// fallbackFinalizedRefreshThrottle bounds how often refreshFallbackFinalizedIfStale
+// fires its on-demand poll, so a burst of tag resolutions can't fan out into a
+// burst of upstream calls. The actual fetch is additionally debounced
+// per-upstream by the state poller's TryUpdateIfStale, so real network traffic
+// is governed by the (block-time-derived) poll debounce, not this value.
+const fallbackFinalizedRefreshThrottle = 2 * time.Second
+
+// refreshFallbackFinalizedIfStale fires a single finalized-only poll against
+// each healthy fallback-tier upstream. It is the only path that lets a
+// probe-off fallback (state poller disabled to save quota) contribute its
+// finalized height to tag resolution, and it runs ONLY when the primary set can
+// no longer be trusted for finalized (callers gate on
+// primaryCount > 0 && !anyPrimaryUp). The poll is async — it never adds latency
+// to the caller; the refreshed value is picked up by the next resolution. In
+// steady state (any primary up) this is never called, so cost stays ~zero.
+func (n *Network) refreshFallbackFinalizedIfStale(ctx context.Context) {
+	nowMs := time.Now().UnixMilli()
+	last := n.lastFallbackFinalizedPollMs.Load()
+	if nowMs-last < fallbackFinalizedRefreshThrottle.Milliseconds() {
+		return
+	}
+	if !n.lastFallbackFinalizedPollMs.CompareAndSwap(last, nowMs) {
+		// Another goroutine just claimed this refresh window.
+		return
+	}
+
+	fallbacks := n.upstreamsRegistry.GetFallbackEscapeUpstreams(ctx, n.networkId, "eth_getBlockByNumber")
+	if len(fallbacks) == 0 {
+		return
+	}
+
+	base := n.appCtx
+	if base == nil {
+		base = context.Background()
+	}
+	for _, u := range fallbacks {
+		sp := u.EvmStatePoller()
+		if sp == nil {
+			continue
+		}
+		u, sp := u, sp
+		go func() {
+			pollCtx, cancel := context.WithTimeout(base, 10*time.Second)
+			defer cancel()
+			if _, err := sp.PollFinalizedBlockNumber(pollCtx); err != nil {
+				n.logger.Debug().Err(err).Str("upstreamId", u.Id()).Msg("on-demand fallback finalized refresh failed")
+			}
+		}()
+	}
+}
+
 // evmHighestBlockNumber aggregates a per-upstream block number across a
 // network and reconciles it with the cross-pod shared counter.
 //
@@ -328,6 +386,7 @@ func (n *Network) evmHighestBlockNumber(
 ) int64 {
 	var primaryMax, fallbackMax int64
 	anyPrimaryUp := false
+	primaryCount := 0
 	for _, u := range n.upstreamsRegistry.GetNetworkUpstreams(ctx, n.networkId) {
 		if u.EvmStatePoller() == nil {
 			continue
@@ -338,17 +397,35 @@ func (n *Network) evmHighestBlockNumber(
 		}
 		upBlock := blockOf(u)
 		if u.Config().HasTag(common.TagTierFallback) {
+			// A circuit-broken fallback's last-known finalized can't be trusted
+			// as a source once its breaker is open — skip it, same as we treat a
+			// down primary below.
+			if u.IsDown() {
+				continue
+			}
 			if upBlock > fallbackMax {
 				fallbackMax = upBlock
 			}
 			continue
 		}
+		primaryCount++
 		if !u.IsDown() {
 			anyPrimaryUp = true
 		}
 		if upBlock > primaryMax {
 			primaryMax = upBlock
 		}
+	}
+
+	// When the network has primaries but none are up (e.g. all circuit-broken —
+	// the exact incident shape), the primary-driven max is frozen/stale. Kick a
+	// throttled, finalized-only, async refresh of the fallbacks so their height
+	// becomes visible to the failover branch below. Probe-off fallbacks have
+	// their state poller disabled to save quota, so without this their finalized
+	// stays 0 and the failover can never engage. This is the only extra upstream
+	// traffic introduced, and it only happens during an active primary outage.
+	if tag == "finalized" && primaryCount > 0 && !anyPrimaryUp {
+		n.refreshFallbackFinalizedIfStale(ctx)
 	}
 
 	localMax := primaryMax

@@ -2007,6 +2007,8 @@ func (n *NetworkConfig) SetDefaults(upstreams []*UpstreamConfig, defaults *Netwo
 
 const DefaultEvmFinalityDepth = 1024
 const DefaultEvmStatePollerDebounce = Duration(5 * time.Second)
+const DefaultEvmFinalityStallWindow = Duration(90 * time.Second)
+const DefaultEvmFinalityStallMargin = int64(8192)
 const DefaultDynamicBlockTimeDebounceMultiplier = 0.7
 const DefaultBlockUnavailableDelayMultiplier = 0.8
 
@@ -2090,6 +2092,14 @@ func (e *EvmNetworkConfig) SetDefaults() error {
 	}
 	if e.FallbackStatePollerDebounce == 0 {
 		e.FallbackStatePollerDebounce = DefaultEvmStatePollerDebounce
+	}
+	if e.FinalityStallWindow == nil {
+		d := DefaultEvmFinalityStallWindow
+		e.FinalityStallWindow = &d
+	}
+	if e.FinalityStallMargin == nil {
+		d := DefaultEvmFinalityStallMargin
+		e.FinalityStallMargin = &d
 	}
 	if e.DynamicBlockTimeDebounceMultiplier == nil {
 		d := DefaultDynamicBlockTimeDebounceMultiplier

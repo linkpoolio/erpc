@@ -2259,6 +2259,37 @@ type EvmNetworkConfig struct {
 	// to work safely with transaction broadcasting.
 	// Set to false to disable this behavior and return raw upstream errors.
 	IdempotentTransactionBroadcast *bool `yaml:"idempotentTransactionBroadcast,omitempty" json:"idempotentTransactionBroadcast,omitempty"`
+
+	// FinalityStallWindow and FinalityStallMargin together classify a primary
+	// upstream as "finality-stalled": a node whose `finalized` has frozen (a
+	// node-software finality bug) while its `latest` keeps advancing. Such a
+	// primary is circuit-CLOSED and serves requests normally, so it is otherwise
+	// "up", yet it is an untrustworthy SOURCE OF FINALIZED — serving its frozen
+	// value keeps the network finalized far behind the true chain finalized and
+	// trips strict downstream finality guards. eRPC excludes a finality-stalled
+	// primary from finalized resolution and fails over to a healthy fallback.
+	//
+	// A primary is treated as finality-stalled only when BOTH conditions hold:
+	//   - its finalized has not advanced for longer than FinalityStallWindow, AND
+	//   - its latest is more than FinalityStallMargin blocks ahead of its finalized.
+	//
+	// Requiring BOTH is what prevents false-positives on chains with legitimately
+	// deep-but-healthy finality: a chain whose latest sits close to finalized
+	// never crosses the margin, and a chain whose finalized keeps advancing never
+	// crosses the window. Set FinalityStallMargin comfortably ABOVE the chain's
+	// normal latest-minus-finalized gap; for very fast block times or unusually
+	// deep finality, raise it. Default: 90s window, 8192-block margin.
+	// Set either knob to 0 to disable finality-stall detection for the network.
+	FinalityStallWindow *Duration `yaml:"finalityStallWindow,omitempty" json:"finalityStallWindow,omitempty" tstype:"Duration"`
+	FinalityStallMargin *int64    `yaml:"finalityStallMargin,omitempty" json:"finalityStallMargin,omitempty"`
+
+	// FinalizedCorroborationReorgWindow caps the finalized value eRPC will adopt
+	// from a fallback during a primary outage at `fallbackLatest - reorgWindow`.
+	// It is a rogue-high guard: a single fallback cannot push the network
+	// finalized up to (or past) the chain tip. Default 0 means "cap at the
+	// corroborating fallback's own latest" (reject only a finalized that exceeds
+	// it); raise it per-network for a stricter reorg-safety margin.
+	FinalizedCorroborationReorgWindow int64 `yaml:"finalizedCorroborationReorgWindow,omitempty" json:"finalizedCorroborationReorgWindow,omitempty"`
 }
 
 // EvmIntegrityConfig is deprecated. Use DirectiveDefaultsConfig for validation settings.
@@ -2629,8 +2660,8 @@ const tsLoaderWalker = `
 // This means closures, imports, and module-level helpers in the user's
 // TS file flow naturally into the evalFunc:
 //
-//   const weights = { hot: { errorRate: 8 }, cold: { errorRate: 4 } };
-//   selectionPolicy: { evalFunc: (u, ctx) => u.sortByScore((u) => weights[u.id] || PREFER_FASTEST) }
+//	const weights = { hot: { errorRate: 8 }, cold: { errorRate: 4 } };
+//	selectionPolicy: { evalFunc: (u, ctx) => u.sortByScore((u) => weights[u.id] || PREFER_FASTEST) }
 //
 // works as written, because `weights` exists in the same module scope
 // as the function in every pool runtime.

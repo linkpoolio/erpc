@@ -242,6 +242,18 @@ var (
 		Help:      "Total number of times an upstream returned a stale (vs others) finalized block number.",
 	}, []string{"project", "vendor", "network", "upstream"})
 
+	MetricUpstreamFinalityStalled = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "erpc",
+		Name:      "upstream_finality_stalled_total",
+		Help:      "Total number of times a circuit-closed primary upstream was demoted as a finalized source because its finalized stopped advancing while its latest kept advancing.",
+	}, []string{"project", "vendor", "network", "upstream"})
+
+	MetricNetworkFinalizedServedFromFallback = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "erpc",
+		Name:      "network_finalized_served_from_fallback_total",
+		Help:      "Total number of times the network finalized was resolved from a fallback upstream because no primary could be trusted (all down or finality-stalled).",
+	}, []string{"project", "network"})
+
 	MetricUpstreamStaleUpperBound = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "erpc",
 		Name:      "upstream_stale_upper_bound_total",

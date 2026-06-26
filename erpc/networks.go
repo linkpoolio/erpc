@@ -391,12 +391,14 @@ func evaluateFinalityStall(entry *finalizedProgressEntry, finalized, latest, now
 	return true, becameStalled, false
 }
 
-// corroboratedFallbackFinalized returns the fallback finalized value to adopt
-// when no primary can be trusted, or 0 if it can't be corroborated. It guards
-// against a single rogue-high fallback: the value is adopted only when a healthy
+// corroboratedFallbackFinalized validates ONE fallback's finalized against that
+// SAME fallback's latest and returns it (or 0 if it can't be corroborated). It
+// guards against a single rogue-high fallback: the value is adopted only when the
 // fallback's own latest is ahead of it (so finalized is plausibly behind the
-// tip), and it is rejected if it exceeds fallbackLatest - reorgWindow so a bad
-// fallback can't push finalized up to (or past) the chain tip. A stricter
+// tip), and it is rejected if it exceeds latest - reorgWindow so a bad fallback
+// can't push finalized up to (or past) the chain tip. Per-source corroboration is
+// what makes the guard meaningful — comparing against the max latest across all
+// fallbacks would let a rogue fallback ride another's high tip. A stricter
 // >=2-source corroboration remains a separate follow-up.
 func (n *Network) corroboratedFallbackFinalized(fallbackFinalized, fallbackLatest int64) int64 {
 	if fallbackFinalized <= 0 || fallbackLatest <= 0 {
@@ -450,10 +452,10 @@ func (n *Network) evmHighestBlockNumber(
 	lastReturned *atomic.Int64,
 	tag string,
 ) int64 {
-	var primaryMax, fallbackMax, fallbackLatestMax int64
+	var primaryMax, fallbackMax int64
 	anyPrimaryUp := false
 	nowMs := time.Now().UnixMilli()
-	checkStall := tag == "finalized"
+	isFinalized := tag == "finalized"
 	for _, u := range n.upstreamsRegistry.GetNetworkUpstreams(ctx, n.networkId) {
 		sp := u.EvmStatePoller()
 		if sp == nil {
@@ -471,26 +473,35 @@ func (n *Network) evmHighestBlockNumber(
 			if u.IsDown() {
 				continue
 			}
-			if upBlock > fallbackMax {
+			if isFinalized {
+				// Per-source corroboration: trust this fallback's finalized only
+				// when its OWN latest supports it (finalized can't legitimately
+				// exceed latest, less a reorg margin). Guarding per source — not
+				// against the max latest across all fallbacks — stops a single
+				// rogue-high fallback from being adopted just because some other
+				// fallback happens to report a high latest.
+				if cf := n.corroboratedFallbackFinalized(upBlock, sp.LatestBlock()); cf > fallbackMax {
+					fallbackMax = cf
+				}
+			} else if upBlock > fallbackMax {
 				fallbackMax = upBlock
 			}
-			// Track healthy fallbacks' own latest so a fallback finalized can be
-			// corroborated against (and capped by) a tip the same tier reports.
-			if lat := sp.LatestBlock(); lat > fallbackLatestMax {
-				fallbackLatestMax = lat
-			}
-			continue
-		}
-		// Distrust a finality-stalled primary as a finalized source: its frozen
-		// finalized must not anchor primaryMax and it must not count as an "up"
-		// primary, so the no-trustworthy-primary failover below engages —
-		// mirroring how a circuit-broken fallback is skipped above. The primary
-		// is otherwise healthy (circuit closed) and still serves normal traffic;
-		// we only demote it as a SOURCE OF FINALIZED.
-		if checkStall && n.detectFinalityStall(u, upBlock, sp.LatestBlock(), nowMs) {
 			continue
 		}
 		if !u.IsDown() {
+			// Distrust a finality-stalled primary as a finalized source: its
+			// frozen finalized must not anchor primaryMax and it must not count
+			// as an "up" primary, so the no-trustworthy-primary failover below
+			// engages — mirroring how a circuit-broken fallback is skipped above.
+			// The primary is otherwise healthy (circuit closed) and still serves
+			// normal traffic; we only demote it as a SOURCE OF FINALIZED. Only
+			// evaluate stall on a primary that is actually up: a circuit-broken
+			// primary is excluded from the trusted set anyway, and running
+			// detection on it would emit misleading stall signals off stale
+			// poller values.
+			if isFinalized && n.detectFinalityStall(u, upBlock, sp.LatestBlock(), nowMs) {
+				continue
+			}
 			anyPrimaryUp = true
 		}
 		if upBlock > primaryMax {
@@ -502,18 +513,14 @@ func (n *Network) evmHighestBlockNumber(
 	// finality-stalled), fail over to the fallback tier. Their finalized/latest
 	// are already tracked by the state poller (probe:off only opts a fallback out
 	// of the selection policy's shadow-mirror traffic, not out of state polling),
-	// so the value is available here without any extra on-demand polling.
+	// so the value is available here without any extra on-demand polling. For the
+	// finalized tag, fallbackMax already holds only per-source-corroborated
+	// values, so a rogue-high fallback was excluded above.
 	localMax := primaryMax
 	if fallbackMax > 0 && !anyPrimaryUp {
-		if tag == "finalized" {
-			// Corroborate + cap before adopting a fallback's finalized so a single
-			// rogue-high fallback can't shove the network finalized to/past tip.
-			if v := n.corroboratedFallbackFinalized(fallbackMax, fallbackLatestMax); v > 0 {
-				localMax = v
-				telemetry.MetricNetworkFinalizedServedFromFallback.WithLabelValues(n.projectId, n.Label()).Inc()
-			}
-		} else {
-			localMax = fallbackMax
+		localMax = fallbackMax
+		if isFinalized {
+			telemetry.MetricNetworkFinalizedServedFromFallback.WithLabelValues(n.projectId, n.Label()).Inc()
 		}
 	}
 

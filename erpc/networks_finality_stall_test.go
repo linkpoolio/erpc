@@ -3,8 +3,45 @@ package erpc
 import (
 	"testing"
 
+	"github.com/erpc/erpc/common"
 	"github.com/stretchr/testify/require"
 )
+
+// TestCorroboratedFallbackFinalized covers the per-source rogue-high guard: a
+// fallback's finalized is adopted only when its OWN latest supports it. The
+// corroboration is per source on purpose — comparing against the max latest
+// across all fallbacks would let a single rogue-high fallback ride another
+// fallback's high tip, which is exactly the gap this guards.
+func TestCorroboratedFallbackFinalized(t *testing.T) {
+	// reorg window 0 (default): cap at the fallback's own latest.
+	n := &Network{}
+
+	t.Run("finalized below its own latest is adopted", func(t *testing.T) {
+		require.Equal(t, int64(1000), n.corroboratedFallbackFinalized(1000, 1050))
+	})
+	t.Run("finalized equal to its own latest is adopted (reorg 0)", func(t *testing.T) {
+		require.Equal(t, int64(1050), n.corroboratedFallbackFinalized(1050, 1050))
+	})
+	t.Run("rogue-high finalized above its own latest is rejected", func(t *testing.T) {
+		require.Equal(t, int64(0), n.corroboratedFallbackFinalized(1100, 1050),
+			"a fallback claiming finalized past its own tip must not be adopted")
+	})
+	t.Run("zero finalized or latest is rejected", func(t *testing.T) {
+		require.Equal(t, int64(0), n.corroboratedFallbackFinalized(0, 1050))
+		require.Equal(t, int64(0), n.corroboratedFallbackFinalized(1000, 0))
+	})
+
+	t.Run("reorg window tightens the bound to latest - window", func(t *testing.T) {
+		nr := &Network{cfg: &common.NetworkConfig{
+			Evm: &common.EvmNetworkConfig{FinalizedCorroborationReorgWindow: 64},
+		}}
+		// bound = 1050 - 64 = 986.
+		require.Equal(t, int64(980), nr.corroboratedFallbackFinalized(980, 1050),
+			"finalized within latest-window is adopted")
+		require.Equal(t, int64(0), nr.corroboratedFallbackFinalized(1000, 1050),
+			"finalized inside the reorg margin (986..1050) is rejected")
+	})
+}
 
 // TestEvaluateFinalityStall exhaustively covers the pure finality-stall
 // classifier — the timer, the margin, advance-resets-the-timer, the disable

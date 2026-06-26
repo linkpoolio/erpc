@@ -348,9 +348,11 @@ func (e *upstreamExecutor) callBreakerWithTimeout(
 	inner func(ctx context.Context, isHedge bool) (*common.NormalizedResponse, error),
 	isHedge bool,
 ) (*common.NormalizedResponse, error) {
-	// Breaker eligibility check — internal probes and hedge attempts do NOT
-	// count toward the breaker.
-	if e.breaker != nil && upstreamBreakerEligible(req, isHedge) {
+	// Breaker eligibility check — internal probes, selection-recovery probes,
+	// and hedge attempts do NOT count toward the breaker. Decide once so the
+	// permit acquisition and the outcome recording stay consistent.
+	breakerEligible := e.breaker != nil && upstreamBreakerEligible(ctx, req, isHedge)
+	if breakerEligible {
 		if !e.breaker.TryAcquirePermit() {
 			startTime := time.Now()
 			return nil, common.NewErrFailsafeCircuitBreakerOpen(common.ScopeUpstream, failsafe.ErrCircuitOpen, &startTime)
@@ -359,17 +361,23 @@ func (e *upstreamExecutor) callBreakerWithTimeout(
 
 	resp, err := e.callWithTimeout(ctx, req, inner, isHedge)
 
-	if e.breaker != nil && upstreamBreakerEligible(req, isHedge) {
+	if breakerEligible {
 		e.breaker.Record(upstreamBreakerOutcome(resp, err))
 	}
 	return resp, err
 }
 
-// upstreamBreakerEligible decides whether (req, isHedge) should contribute
-// to the breaker counters. Hedge attempts and internal probes are excluded.
-// Composite requests are also excluded.
-func upstreamBreakerEligible(req *common.NormalizedRequest, isHedge bool) bool {
+// upstreamBreakerEligible decides whether (ctx, req, isHedge) should contribute
+// to the breaker counters. Hedge attempts and internal probes are excluded, as
+// are selection-recovery probes — a probe must reach the upstream even with the
+// breaker open so it can gather a real health signal for the selection policy;
+// being denied a permit would otherwise record as a probe failure and wedge the
+// upstream excluded. Composite requests are also excluded.
+func upstreamBreakerEligible(ctx context.Context, req *common.NormalizedRequest, isHedge bool) bool {
 	if isHedge {
+		return false
+	}
+	if common.IsSelectionProbe(ctx) {
 		return false
 	}
 	if req == nil {

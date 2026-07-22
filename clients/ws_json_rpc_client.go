@@ -41,12 +41,19 @@ const (
 // re-dials. wsPongWait must comfortably exceed wsPingInterval so at least
 // two pings fit in the window.
 //
+// Sized so a black-holed upstream is torn down and re-dialed before typical
+// downstream head-liveness thresholds (~30s, e.g. Polygon NoNewHeadsThreshold).
+// Sticky client WS connections pin one eRPC pod: if that pod's head-feeding
+// upstream wedges for wsPongWait, the client sees silence even while other
+// pods / HTTP failover still tip. 30s/75s left a ~45s gap where consumers
+// marked the gateway unhealthy before we reconnected.
+//
 // Vars (not consts) so tests can compress time. They are copied into
 // per-client fields at construction, so client goroutines never read them
 // after NewWsJsonRpcClient returns.
 var (
-	wsPingInterval = 30 * time.Second
-	wsPongWait     = 75 * time.Second
+	wsPingInterval = 10 * time.Second
+	wsPongWait     = 25 * time.Second
 )
 
 // WsJsonRpcClient implements ClientInterface for WebSocket-based JSON-RPC upstream connections.

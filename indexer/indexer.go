@@ -528,6 +528,40 @@ func (i *Indexer) classify(ns *networkState, ev StreamEvent) Lifecycle {
 	return LifeSoft
 }
 
+// HealthReporter is an optional interface an EventIngress can implement to
+// report whether it can currently deliver events (e.g. a WS upstream
+// adapter with a live connection and an active newHeads subscription).
+// Ingresses that don't implement it are assumed live — the indexer can't
+// assess transports it doesn't understand.
+type HealthReporter interface {
+	Healthy() bool
+}
+
+// IngressHealth returns how many of the network's registered ingresses
+// currently report themselves able to deliver events, alongside the total
+// registered count. (0, 0) means the network is unknown or has no
+// ingresses yet.
+func (i *Indexer) IngressHealth(networkId string) (live, total int) {
+	nsRaw, ok := i.networks.Load(networkId)
+	if !ok {
+		return 0, 0
+	}
+	ns := nsRaw.(*networkState)
+	ns.ingressMu.RLock()
+	defer ns.ingressMu.RUnlock()
+	for _, ing := range ns.ingresses {
+		total++
+		if hr, ok := ing.(HealthReporter); ok {
+			if hr.Healthy() {
+				live++
+			}
+		} else {
+			live++
+		}
+	}
+	return live, total
+}
+
 // fanOut dispatches to every registered egress whose InterestedIn matches.
 func (i *Indexer) fanOut(ev IndexedEvent) {
 	i.egresses.Range(func(_, v any) bool {

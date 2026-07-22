@@ -902,10 +902,10 @@ func TestWebSocket_UpstreamClient(t *testing.T) {
 //
 
 func TestWebSocket_SubscriptionRecovery(t *testing.T) {
-	// Verifies that when the upstream WS connection drops, eRPC closes the
-	// client connection with CloseGoingAway (1001) so the client can reconnect
-	// and re-subscribe cleanly instead of holding a zombie subscription.
-	t.Run("ClientDisconnectedOnUpstreamDrop", func(t *testing.T) {
+	// Self-heal keeps the client WS up when the upstream drops; 1001
+	// GoingAway is reserved for process shutdown. A GoingAway close here
+	// would force MultiNode to mark the RPC unreachable.
+	t.Run("ClientStaysConnectedOnUpstreamDrop", func(t *testing.T) {
 		closeUpstream := make(chan struct{})
 
 		mockUpstream := mockWsUpstream(t, func(conn *websocket.Conn) {
@@ -959,16 +959,17 @@ func TestWebSocket_SubscriptionRecovery(t *testing.T) {
 		// Kill the upstream WS connection
 		close(closeUpstream)
 
-		// Client should receive a close frame with GoingAway (1001)
-		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		// Client must stay connected — expect a read timeout (no frames)
+		// or a non-GoingAway error, never 1001.
+		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 		_, _, err := conn.ReadMessage()
-		require.Error(t, err, "client should be disconnected")
-		closeErr, ok := err.(*websocket.CloseError)
-		if ok {
-			assert.Equal(t, websocket.CloseGoingAway, closeErr.Code, "close code should be 1001 GoingAway")
-			t.Logf("client received close frame: code=%d reason=%q", closeErr.Code, closeErr.Text)
+		require.Error(t, err, "expected no spontaneous client close frame")
+		if closeErr, ok := err.(*websocket.CloseError); ok {
+			assert.NotEqual(t, websocket.CloseGoingAway, closeErr.Code,
+				"upstream drop must not close the client with GoingAway (1001); got code=%d reason=%q",
+				closeErr.Code, closeErr.Text)
 		} else {
-			t.Logf("client disconnected with error: %v", err)
+			t.Logf("client stayed connected (read ended with: %v)", err)
 		}
 	})
 
@@ -995,8 +996,18 @@ func TestWebSocket_SubscriptionRecovery(t *testing.T) {
 		defer conn.Close()
 
 		resp := sendAndReceive(t, conn, `{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}`)
-		assert.NotNil(t, resp["error"], "should return error when upstream WS is not connected")
-		t.Logf("got expected error: %v", resp["error"])
+		require.NotNil(t, resp["error"], "should return error when upstream WS is not connected")
+		errObj, _ := resp["error"].(map[string]interface{})
+		t.Logf("got expected error: %v", errObj)
+		// Prefer the loud refusal (ErrNoLiveSubscriptionSource). ErrNoWsUpstreamAvailable
+		// is also acceptable if bootstrap never registered a WS ingress.
+		if data, ok := errObj["data"].(map[string]interface{}); ok {
+			code, _ := data["code"].(string)
+			assert.Contains(t, []string{
+				"ErrNoLiveSubscriptionSource",
+				"ErrNoWsUpstreamAvailable",
+			}, code, "unexpected error code: %v", errObj)
+		}
 	})
 }
 

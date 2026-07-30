@@ -190,6 +190,8 @@ func TestNetworkHandle_SuggestLatestBlock_AdvancesNetworkTipBeforeFanOut(t *test
 		"network tip must advance before any client would see the WS head")
 	assert.GreaterOrEqual(t, network.lastReturnedLatestBlock.Load(), int64(90677359),
 		"process-local high-water mark must cover the delivered WS tip")
+	assert.Equal(t, "bor-1", network.EvmTipSourceUpstreamId(90677359),
+		"tip-source must be the WS ingress that delivered the head")
 }
 
 // Fallback WS tips must advance TipHW even while primaries are up: Ingest
@@ -430,4 +432,197 @@ func TestEvmRefreshHighestLatestBlockNumber_PreservesObservedTip(t *testing.T) {
 	assert.Equal(t, int64(1001), network.EvmRefreshHighestLatestBlockNumber(ctx),
 		"refresh after sync TipHW publish must keep the observed tip")
 	assert.Equal(t, int64(1001), network.EvmHighestLatestBlockNumber(ctx))
+}
+
+func TestHttpTwinUpstreamId(t *testing.T) {
+	assert.Equal(t, "internal-eth-mainnet-reth-0", httpTwinUpstreamId("internal-eth-mainnet-reth-ws-0"))
+	assert.Equal(t, "eth-mainnet-reth", httpTwinUpstreamId("eth-mainnet-reth-ws"))
+	assert.Equal(t, "", httpTwinUpstreamId("rpc1"))
+}
+
+func TestHttpTwinEndpoint(t *testing.T) {
+	assert.Equal(t,
+		"https://eth-mainnet-reth.internal.linkpool.com/0",
+		httpTwinEndpoint("wss://eth-mainnet-reth.internal.linkpool.com/0/ws"),
+	)
+	assert.Equal(t, "http://host/1", httpTwinEndpoint("ws://host/1/websocket"))
+	assert.Equal(t, "", httpTwinEndpoint("https://already-http.example/0"))
+}
+
+// SuggestLatestBlock must record tip-source and bump the HTTP twin poller so
+// partition/leader prefer the same physical node that delivered newHeads.
+func TestNetworkHandle_SuggestLatestBlock_RecordsTipSourceAndBumpsHttpTwin(t *testing.T) {
+	util.ResetGock()
+	defer util.ResetGock()
+	util.SetupMocksForEvmStatePoller()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	wsUp := &common.UpstreamConfig{
+		Type:     common.UpstreamTypeEvm,
+		Id:       "internal-eth-mainnet-reth-ws-0",
+		Endpoint: "wss://eth-mainnet-reth.internal.linkpool.com/0/ws",
+		Evm:      &common.EvmUpstreamConfig{ChainId: 123},
+	}
+	httpUp := &common.UpstreamConfig{
+		Type:     common.UpstreamTypeEvm,
+		Id:       "internal-eth-mainnet-reth-0",
+		Endpoint: "https://eth-mainnet-reth.internal.linkpool.com/0",
+		Evm:      &common.EvmUpstreamConfig{ChainId: 123},
+	}
+	sibling := &common.UpstreamConfig{
+		Type:     common.UpstreamTypeEvm,
+		Id:       "internal-eth-mainnet-reth-1",
+		Endpoint: "https://eth-mainnet-reth.internal.linkpool.com/1",
+		Evm:      &common.EvmUpstreamConfig{ChainId: 123},
+	}
+
+	for _, host := range []string{
+		"eth-mainnet-reth.internal.linkpool.com/0",
+		"eth-mainnet-reth.internal.linkpool.com/1",
+	} {
+		gock.New("https://" + host).
+			Post("").
+			Persist().
+			Filter(func(r *http.Request) bool {
+				return strings.Contains(util.SafeReadBody(r), `eth_chainId`)
+			}).
+			Reply(200).
+			JSON([]byte(`{"result":"0x7b"}`))
+	}
+	// WS upstream may still hit https after scheme normalize in some paths;
+	// chainId mocks above cover HTTP twins. WS client bootstrap is separate.
+
+	rateLimitersRegistry, _ := upstream.NewRateLimitersRegistry(context.Background(), &common.RateLimiterConfig{}, &log.Logger)
+	metricsTracker := health.NewTracker(&log.Logger, "test", time.Minute)
+	vr := thirdparty.NewVendorsRegistry()
+	pr, err := thirdparty.NewProvidersRegistry(&log.Logger, vr, []*common.ProviderConfig{}, nil)
+	require.NoError(t, err)
+	ssr, err := data.NewSharedStateRegistry(ctx, &log.Logger, &common.SharedStateConfig{
+		Connector: &common.ConnectorConfig{
+			Driver: "memory",
+			Memory: &common.MemoryConnectorConfig{MaxItems: 100_000, MaxTotalSize: "1GB"},
+		},
+	})
+	require.NoError(t, err)
+
+	// Use http endpoints for all three so bootstrap does not need a live WS.
+	wsUp.Endpoint = "http://rpc-ws-twin.localhost"
+	httpUp.Endpoint = "http://rpc-http-twin.localhost"
+	sibling.Endpoint = "http://rpc-sibling.localhost"
+	for _, host := range []string{"rpc-ws-twin.localhost", "rpc-http-twin.localhost", "rpc-sibling.localhost"} {
+		gock.New("http://" + host).
+			Post("").
+			Persist().
+			Filter(func(r *http.Request) bool {
+				return strings.Contains(util.SafeReadBody(r), `eth_chainId`)
+			}).
+			Reply(200).
+			JSON([]byte(`{"result":"0x7b"}`))
+	}
+
+	upstreamsRegistry := upstream.NewUpstreamsRegistry(
+		ctx, &log.Logger, "test",
+		[]*common.UpstreamConfig{wsUp, httpUp, sibling}, ssr, rateLimitersRegistry, vr, pr, nil,
+		metricsTracker, nil,
+	)
+	networkConfig := &common.NetworkConfig{
+		Architecture: common.ArchitectureEvm,
+		Evm:          &common.EvmNetworkConfig{ChainId: 123},
+	}
+	network, err := NewNetwork(ctx, &log.Logger, "test", networkConfig,
+		rateLimitersRegistry, upstreamsRegistry, metricsTracker, nil)
+	require.NoError(t, err)
+
+	upstreamsRegistry.Bootstrap(ctx)
+	time.Sleep(200 * time.Millisecond)
+	require.NoError(t, upstreamsRegistry.GetInitializer().WaitForTasks(ctx))
+	require.NoError(t, network.Bootstrap(ctx))
+	time.Sleep(250 * time.Millisecond)
+
+	upsList := upstreamsRegistry.GetNetworkUpstreams(ctx, util.EvmNetworkId(123))
+	require.Len(t, upsList, 3)
+	byID := map[string]*upstream.Upstream{}
+	for _, u := range upsList {
+		byID[u.Id()] = u
+		u.EvmStatePoller().SuggestLatestBlock(1000)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	handle := &networkHandle{nw: network}
+	handle.SuggestLatestBlock("ws:internal-eth-mainnet-reth-ws-0", 1001, []byte(`{"number":"0x3e9"}`))
+
+	assert.Equal(t, int64(1001), byID["internal-eth-mainnet-reth-ws-0"].EvmStatePoller().LatestBlock())
+	assert.Equal(t, int64(1001), byID["internal-eth-mainnet-reth-0"].EvmStatePoller().LatestBlock(),
+		"HTTP twin poller must advance with WS tip (same physical node)")
+	assert.Equal(t, int64(1000), byID["internal-eth-mainnet-reth-1"].EvmStatePoller().LatestBlock(),
+		"lagging sibling must not be bumped")
+	assert.Equal(t, "internal-eth-mainnet-reth-ws-0", network.EvmTipSourceUpstreamId(1001))
+	assert.Equal(t, int64(1001), network.EvmHighestLatestBlockNumber(ctx))
+}
+
+func TestEvmTipSourceUpstreamId_IgnoresFallbackWhilePrimaryUp(t *testing.T) {
+	util.ResetGock()
+	defer util.ResetGock()
+	util.SetupMocksForEvmStatePoller()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	primary := &common.UpstreamConfig{
+		Type:     common.UpstreamTypeEvm,
+		Id:       "primary",
+		Endpoint: "http://primary.localhost",
+		Evm:      &common.EvmUpstreamConfig{ChainId: 123},
+	}
+	fallback := &common.UpstreamConfig{
+		Type:     common.UpstreamTypeEvm,
+		Id:       "fallback-ws",
+		Endpoint: "http://fallback.localhost",
+		Tags:     []string{common.TagTierFallback},
+		Evm:      &common.EvmUpstreamConfig{ChainId: 123},
+	}
+	for _, host := range []string{"primary.localhost", "fallback.localhost"} {
+		gock.New("http://" + host).
+			Post("").
+			Persist().
+			Filter(func(r *http.Request) bool {
+				return strings.Contains(util.SafeReadBody(r), `eth_chainId`)
+			}).
+			Reply(200).
+			JSON([]byte(`{"result":"0x7b"}`))
+	}
+
+	rateLimitersRegistry, _ := upstream.NewRateLimitersRegistry(context.Background(), &common.RateLimiterConfig{}, &log.Logger)
+	metricsTracker := health.NewTracker(&log.Logger, "test", time.Minute)
+	vr := thirdparty.NewVendorsRegistry()
+	pr, err := thirdparty.NewProvidersRegistry(&log.Logger, vr, []*common.ProviderConfig{}, nil)
+	require.NoError(t, err)
+	ssr, err := data.NewSharedStateRegistry(ctx, &log.Logger, &common.SharedStateConfig{
+		Connector: &common.ConnectorConfig{
+			Driver: "memory",
+			Memory: &common.MemoryConnectorConfig{MaxItems: 100_000, MaxTotalSize: "1GB"},
+		},
+	})
+	require.NoError(t, err)
+
+	upstreamsRegistry := upstream.NewUpstreamsRegistry(
+		ctx, &log.Logger, "test",
+		[]*common.UpstreamConfig{primary, fallback}, ssr, rateLimitersRegistry, vr, pr, nil,
+		metricsTracker, nil,
+	)
+	network, err := NewNetwork(ctx, &log.Logger, "test",
+		&common.NetworkConfig{Architecture: common.ArchitectureEvm, Evm: &common.EvmNetworkConfig{ChainId: 123}},
+		rateLimitersRegistry, upstreamsRegistry, metricsTracker, nil)
+	require.NoError(t, err)
+	upstreamsRegistry.Bootstrap(ctx)
+	time.Sleep(200 * time.Millisecond)
+	require.NoError(t, upstreamsRegistry.GetInitializer().WaitForTasks(ctx))
+	require.NoError(t, network.Bootstrap(ctx))
+	time.Sleep(250 * time.Millisecond)
+
+	network.noteTipSource(2000, "fallback-ws")
+	assert.Equal(t, "", network.EvmTipSourceUpstreamId(2000),
+		"must not pin tip re-fetch to fallback WS while a primary is up")
 }

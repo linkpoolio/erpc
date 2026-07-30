@@ -19,6 +19,13 @@ type tipRefresher interface {
 	EvmRefreshHighestLatestBlockNumber(ctx context.Context) int64
 }
 
+// tipSourceProvider is implemented by *erpc.Network. Optional so test
+// doubles keep compiling. Returns the WS tip-source upstream id for a
+// TipHW block when known on this pod.
+type tipSourceProvider interface {
+	EvmTipSourceUpstreamId(blockNumber int64) string
+}
+
 func refreshHighestLatestBlockNumber(ctx context.Context, network common.Network) int64 {
 	if r, ok := network.(tipRefresher); ok {
 		return r.EvmRefreshHighestLatestBlockNumber(ctx)
@@ -225,21 +232,25 @@ func enforceHighestBlock(ctx context.Context, network common.Network, nq *common
 			).Inc()
 		}
 
-		// Prefer the upstream whose poller already owns this tip
-		// (EvmLeaderUpstream — typically the WS ingress that called
-		// SuggestLatestBlock). If TipHW advanced via Redis/WS while
-		// local pollers lag inside their debounce window, force-poll
-		// the leader once before deciding. Fall back to excluding the
-		// stale responder when no local poller has caught up yet.
+		// Prefer the upstream that delivered this TipHW via WS newHeads
+		// (tip-source pin). Fall back to EvmLeaderUpstream (poller max),
+		// then to excluding the stale responder. Tip-source matches the
+		// cross-node race: TipHW from reth-0 WS must not re-fetch on
+		// lagging reth-1.
 		useUpstream := ""
-		if leader := network.EvmLeaderUpstream(ctx); leader != nil {
-			if eu, ok := leader.(common.EvmUpstream); ok {
-				if sp := eu.EvmStatePoller(); sp != nil && !sp.IsObjectNull() {
-					if sp.LatestBlock() < highestBlockNumber {
-						_, _ = sp.PollLatestBlockNumberNow(ctx)
-					}
-					if sp.LatestBlock() >= highestBlockNumber {
-						useUpstream = leader.Id()
+		if provider, ok := network.(tipSourceProvider); ok {
+			useUpstream = provider.EvmTipSourceUpstreamId(highestBlockNumber)
+		}
+		if useUpstream == "" {
+			if leader := network.EvmLeaderUpstream(ctx); leader != nil {
+				if eu, ok := leader.(common.EvmUpstream); ok {
+					if sp := eu.EvmStatePoller(); sp != nil && !sp.IsObjectNull() {
+						if sp.LatestBlock() < highestBlockNumber {
+							_, _ = sp.PollLatestBlockNumberNow(ctx)
+						}
+						if sp.LatestBlock() >= highestBlockNumber {
+							useUpstream = leader.Id()
+						}
 					}
 				}
 			}

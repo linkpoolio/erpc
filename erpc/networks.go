@@ -68,6 +68,18 @@ type Network struct {
 	// cannot regress below a head we have already delivered on the same pod.
 	lastReturnedLatestBlock    atomic.Int64
 	lastReturnedFinalizedBlock atomic.Int64
+
+	// lastTipSource is the upstream that most recently delivered TipHW via
+	// WS newHeads on this pod (set by networkHandle.SuggestLatestBlock).
+	// EnforceHighestBlock pins tip re-fetch to this upstream so HTTP does
+	// not land on a lagging sibling after TipHW advanced from another node.
+	lastTipSource atomic.Pointer[tipSourceMark]
+}
+
+// tipSourceMark records which upstream delivered a given TipHW head.
+type tipSourceMark struct {
+	blockNumber int64
+	upstreamId  string
 }
 
 // NoteObservedLatestBlock records that this Network has observed head
@@ -105,6 +117,57 @@ func (n *Network) NoteObservedLatestBlock(ctx context.Context, blockNumber int64
 			return
 		}
 	}
+}
+
+// noteTipSource records that upstreamId delivered head blockNumber via WS
+// newHeads. Only advances when blockNumber is ≥ the previously recorded tip
+// (equal tip updates the source to the most recent deliverer).
+func (n *Network) noteTipSource(blockNumber int64, upstreamId string) {
+	if n == nil || blockNumber <= 0 || upstreamId == "" {
+		return
+	}
+	for {
+		cur := n.lastTipSource.Load()
+		if cur != nil && blockNumber < cur.blockNumber {
+			return
+		}
+		next := &tipSourceMark{blockNumber: blockNumber, upstreamId: upstreamId}
+		if n.lastTipSource.CompareAndSwap(cur, next) {
+			return
+		}
+	}
+}
+
+// EvmTipSourceUpstreamId returns the upstream that delivered TipHW via WS
+// newHeads on this pod when blockNumber matches that tip. Fallback-tier tip
+// sources are ignored while any primary is up (same rule as EvmLeaderUpstream)
+// so tip re-fetch does not pin UseUpstream to a cordoned Infura/etc. WS.
+func (n *Network) EvmTipSourceUpstreamId(blockNumber int64) string {
+	if n == nil || blockNumber <= 0 {
+		return ""
+	}
+	mark := n.lastTipSource.Load()
+	if mark == nil || mark.blockNumber != blockNumber || mark.upstreamId == "" {
+		return ""
+	}
+	upsList := n.upstreamsRegistry.GetNetworkUpstreams(context.Background(), n.networkId)
+	var tipUp common.Upstream
+	anyPrimaryUp := false
+	for _, u := range upsList {
+		if u.Id() == mark.upstreamId {
+			tipUp = u
+		}
+		if u.Config() != nil && u.Config().HasTag(common.TagTierFallback) {
+			continue
+		}
+		if !u.IsDown() {
+			anyPrimaryUp = true
+		}
+	}
+	if tipUp != nil && tipUp.Config() != nil && tipUp.Config().HasTag(common.TagTierFallback) && anyPrimaryUp {
+		return ""
+	}
+	return mark.upstreamId
 }
 
 // EvmRefreshHighestLatestBlockNumber pulls TipHW from Redis once and returns

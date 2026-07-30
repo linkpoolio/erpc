@@ -272,6 +272,118 @@ func TestHttpServer_GetBlockByNumberLatest_RefusesStaleFailOpen(t *testing.T) {
 		"expected error when tip re-fetch cannot reach TipHW, got status=%d body=%s", statusCode, body)
 }
 
+// After WS ingest records a tip-source upstream, EnforceHighestBlock must pin
+// the concrete tip re-fetch to that upstream — even when its poller was not
+// bumped (partition cannot help) and a lagging sibling answers "latest" first.
+func TestHttpServer_GetBlockByNumberLatest_PinsReFetchToTipSourceUpstream(t *testing.T) {
+	util.ResetGock()
+	defer util.ResetGock()
+	util.SetupMocksForEvmStatePoller()
+	defer util.AssertNoPendingMocks(t, 0)
+
+	const tip = int64(0x33338889)
+	tipHex := "0x33338889"
+	var tipSourceHits atomic.Int64
+
+	gock.New("http://rpc2.localhost").
+		Post("").
+		Filter(func(r *http.Request) bool {
+			body := util.SafeReadBody(r)
+			if !strings.Contains(body, "eth_getBlockByNumber") || !strings.Contains(body, tipHex) {
+				return false
+			}
+			tipSourceHits.Add(1)
+			return true
+		}).
+		Reply(200).
+		JSON([]byte(`{"result":{"number":"0x33338889","hash":"0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","parentHash":"0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","timestamp":"0x6702a8f1"}}`))
+
+	cfg := &common.Config{
+		Server: &common.ServerConfig{
+			MaxTimeout: common.Duration(100 * time.Second).Ptr(),
+		},
+		Projects: []*common.ProjectConfig{
+			{
+				Id: "test_project",
+				Networks: []*common.NetworkConfig{
+					{
+						Architecture: "evm",
+						Evm: &common.EvmNetworkConfig{
+							ChainId: 123,
+							Integrity: &common.EvmIntegrityConfig{
+								EnforceHighestBlock: util.BoolPtr(true),
+							},
+						},
+						Failsafe: []*common.FailsafeConfig{
+							{
+								Retry: &common.RetryPolicyConfig{MaxAttempts: 3},
+							},
+						},
+					},
+				},
+				Upstreams: []*common.UpstreamConfig{
+					{
+						Id:       "rpc1",
+						Endpoint: "http://rpc1.localhost",
+						Type:     common.UpstreamTypeEvm,
+						Evm: &common.EvmUpstreamConfig{
+							ChainId:             123,
+							StatePollerInterval: common.Duration(10 * time.Second),
+						},
+					},
+					{
+						Id:       "rpc2",
+						Endpoint: "http://rpc2.localhost",
+						Type:     common.UpstreamTypeEvm,
+						Evm: &common.EvmUpstreamConfig{
+							ChainId:             123,
+							StatePollerInterval: common.Duration(10 * time.Second),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	sendRequest, _, _, shutdown, erpcInstance := createServerTestFixtures(cfg, t)
+	defer shutdown()
+
+	prj, err := erpcInstance.GetProject("test_project")
+	require.NoError(t, err)
+	policy.OverrideAllForTest(prj.policyEngine)
+	// Prefer lagging HTTP first so tip-source pin (not partition) is exercised.
+	policy.OverrideOrderForTest(prj.policyEngine, "evm:123", "rpc1", "rpc2")
+
+	time.Sleep(500 * time.Millisecond)
+
+	nw, err := prj.GetNetwork(context.Background(), "evm:123")
+	require.NoError(t, err)
+
+	// TipHW + tip-source id WITHOUT bumping rpc2's poller — partition cannot
+	// reorder rpc2 ahead; pin must select it on EnforceHighestBlock re-fetch.
+	nw.noteTipSource(tip, "rpc2")
+	nw.NoteObservedLatestBlock(context.Background(), tip)
+	require.Equal(t, tip, nw.EvmHighestLatestBlockNumber(context.Background()))
+	require.Equal(t, "rpc2", nw.EvmTipSourceUpstreamId(tip))
+
+	statusCode, _, body := sendRequest(`{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "eth_getBlockByNumber",
+		"params": ["latest", false]
+	}`, nil, nil)
+
+	require.Equal(t, http.StatusOK, statusCode)
+
+	var respObject map[string]interface{}
+	require.NoError(t, sonic.UnmarshalString(body, &respObject))
+	result, ok := respObject["result"].(map[string]interface{})
+	require.True(t, ok, "response should have a result object, got: %s", body)
+	assert.Equal(t, tipHex, result["number"])
+	assert.GreaterOrEqual(t, tipSourceHits.Load(), int64(1),
+		"EnforceHighestBlock must pin tip re-fetch to the tip-source upstream")
+}
+
 // TipHW tip re-fetch must refuse-stale when primaries miss the concrete tip,
 // without escaping to tier:fallback pay-per-call upstreams. Goes through the
 // HTTP → project doForward → HandleNetworkPostForward path (not bare

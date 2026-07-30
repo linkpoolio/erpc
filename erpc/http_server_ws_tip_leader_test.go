@@ -11,9 +11,11 @@ import (
 	"github.com/bytedance/sonic"
 	"github.com/erpc/erpc/common"
 	"github.com/erpc/erpc/internal/policy"
+	"github.com/erpc/erpc/telemetry"
 	"github.com/erpc/erpc/upstream"
 	"github.com/erpc/erpc/util"
 	"github.com/h2non/gock"
+	promUtil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -268,4 +270,152 @@ func TestHttpServer_GetBlockByNumberLatest_RefusesStaleFailOpen(t *testing.T) {
 	_, hasErr := respObject["error"]
 	require.True(t, hasErr || statusCode >= 400,
 		"expected error when tip re-fetch cannot reach TipHW, got status=%d body=%s", statusCode, body)
+}
+
+// TipHW tip re-fetch must refuse-stale when primaries miss the concrete tip,
+// without escaping to tier:fallback pay-per-call upstreams. Goes through the
+// HTTP → project doForward → HandleNetworkPostForward path (not bare
+// Network.Forward, which skips TipHW enforcement).
+func TestHttpServer_GetBlockByNumberLatest_TipRefetchSkipsFallbackEscape(t *testing.T) {
+	util.ResetGock()
+	defer util.ResetGock()
+	util.SetupMocksForEvmStatePoller()
+	// Persist tip mocks on primary + fallback remain pending by design.
+	defer util.AssertNoPendingMocks(t, 2)
+
+	const tip = int64(0x11118889)
+	tipHex := "0x11118889"
+	staleHex := "0x11118888"
+
+	var fallbackHits atomic.Int64
+	// Primary tip re-fetch misses.
+	gock.New("http://rpc1.localhost").
+		Post("").
+		Persist().
+		Filter(func(r *http.Request) bool {
+			body := util.SafeReadBody(r)
+			return strings.Contains(body, "eth_getBlockByNumber") && strings.Contains(body, tipHex)
+		}).
+		Reply(200).
+		JSON([]byte(`{"result":null}`))
+	// Fallback would serve TipHW — must not be reached via escape on tip re-fetch.
+	gock.New("http://rpc2.localhost").
+		Post("").
+		Persist().
+		Filter(func(r *http.Request) bool {
+			body := util.SafeReadBody(r)
+			if strings.Contains(body, "eth_getBlockByNumber") && strings.Contains(body, tipHex) {
+				fallbackHits.Add(1)
+				return true
+			}
+			return false
+		}).
+		Reply(200).
+		JSON([]byte(`{"result":{"number":"0x11118889","hash":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","parentHash":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","timestamp":"0x6702a8f1"}}`))
+
+	cfg := &common.Config{
+		Server: &common.ServerConfig{
+			MaxTimeout: common.Duration(100 * time.Second).Ptr(),
+		},
+		Projects: []*common.ProjectConfig{
+			{
+				Id: "test_project",
+				Networks: []*common.NetworkConfig{
+					{
+						Architecture: "evm",
+						Evm: &common.EvmNetworkConfig{
+							ChainId: 123,
+							Integrity: &common.EvmIntegrityConfig{
+								EnforceHighestBlock: util.BoolPtr(true),
+							},
+						},
+						// Freeze policy ticks so a lazy method-slot eval cannot
+						// re-introduce the cordoned fallback mid-request.
+						SelectionPolicy: &common.SelectionPolicyConfig{
+							EvalInterval: 0,
+						},
+						Failover: &common.FailoverConfig{
+							OnDefaultsExhausted: util.BoolPtr(true),
+						},
+						Failsafe: []*common.FailsafeConfig{
+							{
+								Retry: &common.RetryPolicyConfig{MaxAttempts: 2},
+							},
+						},
+					},
+				},
+				Upstreams: []*common.UpstreamConfig{
+					{
+						Id:       "rpc1",
+						Endpoint: "http://rpc1.localhost",
+						Type:     common.UpstreamTypeEvm,
+						Evm: &common.EvmUpstreamConfig{
+							ChainId:             123,
+							StatePollerInterval: common.Duration(10 * time.Second),
+						},
+					},
+					{
+						Id:       "rpc2",
+						Endpoint: "http://rpc2.localhost",
+						Type:     common.UpstreamTypeEvm,
+						Tags:     []string{common.TagTierFallback},
+						Evm: &common.EvmUpstreamConfig{
+							ChainId:             123,
+							StatePollerInterval: common.Duration(10 * time.Second),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	sendRequest, _, _, shutdown, erpcInstance := createServerTestFixtures(cfg, t)
+	defer shutdown()
+
+	prj, err := erpcInstance.GetProject("test_project")
+	require.NoError(t, err)
+	// Pin ordered list to primary only — mirrors preferTag cordoning
+	// fallbacks while a primary is healthy. Escape would be the only way
+	// to reach rpc2; SkipFallbackEscape must block that.
+	policy.OverrideOrderForTest(prj.policyEngine, "evm:123", "rpc1")
+
+	time.Sleep(500 * time.Millisecond)
+
+	nw, err := prj.GetNetwork(context.Background(), "evm:123")
+	require.NoError(t, err)
+	require.Equal(t, []string{"rpc1"}, nw.PolicyOrderedUpstreams("eth_getBlockByNumber"),
+		"fallback must stay cordoned so only escape could reach it")
+	nw.NoteObservedLatestBlock(context.Background(), tip)
+	require.Equal(t, tip, nw.EvmHighestLatestBlockNumber(context.Background()))
+
+	escapeCounter := telemetry.MetricNetworkFallbackEscapeTotal.WithLabelValues(
+		"test_project", "evm:123", "eth_getBlockByNumber",
+	)
+	escapeBefore := promUtil.ToFloat64(escapeCounter)
+
+	statusCode, _, body := sendRequest(`{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "eth_getBlockByNumber",
+		"params": ["latest", false]
+	}`, nil, nil)
+
+	var respObject map[string]interface{}
+	require.NoError(t, sonic.UnmarshalString(body, &respObject))
+	if result, ok := respObject["result"].(map[string]interface{}); ok {
+		require.NotEqual(t, staleHex, result["number"],
+			"must not fail-open to stale tip below TipHW; status=%d body=%s", statusCode, body)
+		require.NotEqual(t, tipHex, result["number"],
+			"must not serve TipHW from fallback escape; body=%s", body)
+	}
+	_, hasErr := respObject["error"]
+	require.True(t, hasErr || statusCode >= 400,
+		"expected refuse-stale error when tip re-fetch misses without fallback escape; status=%d body=%s",
+		statusCode, body)
+
+	assert.Equal(t, escapeBefore, promUtil.ToFloat64(escapeCounter),
+		"TipHW tip re-fetch must not fire fallback escape")
+	// fallbackHits may still move from background pollers probing tip hex;
+	// escape counter + refuse-stale response are the request-path proofs.
+	_ = fallbackHits
 }

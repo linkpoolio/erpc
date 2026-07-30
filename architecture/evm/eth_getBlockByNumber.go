@@ -251,7 +251,9 @@ func enforceHighestBlock(ctx context.Context, network common.Network, nq *common
 		// Do not use pickHighestBlock against the stale "latest" response —
 		// that helper fail-opens to stale when the tip re-fetch misses, which
 		// is exactly the MultiNode FOOS / EnforceRepeatableRead trigger.
-		nnr, ferr := forwardGetBlockByNumber(ctx, network, nq, highestBlockNumber, itx, useUpstream)
+		// SkipFallbackEscape: empty tip races must refuse-stale rather than
+		// escape to pay-per-call tier:fallback upstreams (Infura etc.).
+		nnr, ferr := forwardGetBlockByNumber(ctx, network, nq, highestBlockNumber, itx, useUpstream, true)
 		if meetsTipFloor(ctx, nnr, highestBlockNumber) {
 			if nr != nil {
 				nr.Release()
@@ -264,9 +266,8 @@ func enforceHighestBlock(ctx context.Context, network common.Network, nq *common
 
 		// Pinned / excluded re-fetch missed the tip (sibling fullnode
 		// lag, WS JSON-RPC miss, etc.). Retry with no UseUpstream pin
-		// so every upstream (including fallbacks via escape) can serve
-		// the concrete TipHW block.
-		nnr2, ferr2 := forwardGetBlockByNumber(ctx, network, nq, highestBlockNumber, itx, "")
+		// so remaining primaries can serve the concrete TipHW block.
+		nnr2, ferr2 := forwardGetBlockByNumber(ctx, network, nq, highestBlockNumber, itx, "", true)
 		if meetsTipFloor(ctx, nnr2, highestBlockNumber) {
 			if nr != nil {
 				nr.Release()
@@ -330,7 +331,9 @@ func enforceHighestBlock(ctx context.Context, network common.Network, nq *common
 		if respBlockNumber > 0 {
 			useUpstream = fmt.Sprintf("!%s", nr.UpstreamId())
 		}
-		nnr, err := forwardGetBlockByNumber(ctx, network, nq, highestBlockNumber, itx, useUpstream)
+		// Finalized re-fetch keeps fallback escape available for HA —
+		// SkipFallbackEscape is tip/latest-only (paid tip-race burn).
+		nnr, err := forwardGetBlockByNumber(ctx, network, nq, highestBlockNumber, itx, useUpstream, false)
 		return pickHighestBlock(ctx, nnr, nr, err)
 	default:
 		return nr, re
@@ -392,6 +395,7 @@ func forwardGetBlockByNumber(
 	blockNumber int64,
 	includeTx bool,
 	useUpstream string,
+	skipFallbackEscape bool,
 ) (*common.NormalizedResponse, error) {
 	request, err := BuildGetBlockByNumberRequest(blockNumber, includeTx)
 	if err != nil {
@@ -404,6 +408,7 @@ func forwardGetBlockByNumber(
 	dr := original.Directives().Clone()
 	dr.SkipCacheRead = "true"
 	dr.UseUpstream = useUpstream
+	dr.SkipFallbackEscape = skipFallbackEscape
 	newReq.SetDirectives(dr)
 	newReq.SetNetwork(network)
 	newReq.CopyHttpContextFrom(original)

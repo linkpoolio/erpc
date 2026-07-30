@@ -147,6 +147,12 @@ type RequestDirectives struct {
 	// timeout still applies. Never set from HTTP headers.
 	IsInternal bool `json:"-"`
 
+	// SkipFallbackEscape suppresses the per-request tier:fallback escape
+	// hatch for this request. Used by TipHW tip re-fetch so empty tip races
+	// on healthy primaries do not fan out to pay-per-call fallbacks
+	// (Infura etc.). Never set from HTTP headers.
+	SkipFallbackEscape bool `json:"-"`
+
 	// Instruct the normalization layer to avoid mutating JSON-RPC params for block tag interpolation.
 	// When true, the system will still compute and cache block references (for finality/metrics),
 	// but will NOT replace tags like "latest"/"finalized" with hex numbers in outbound requests.
@@ -244,6 +250,8 @@ func (d *RequestDirectives) Clone() *RequestDirectives {
 		SkipCacheRead:                   d.SkipCacheRead,
 		UseUpstream:                     d.UseUpstream,
 		ByPassMethodExclusion:           d.ByPassMethodExclusion,
+		IsInternal:                      d.IsInternal,
+		SkipFallbackEscape:              d.SkipFallbackEscape,
 		SkipInterpolation:               d.SkipInterpolation,
 		SkipConsensus:                   d.SkipConsensus,
 		EnforceHighestBlock:             d.EnforceHighestBlock,

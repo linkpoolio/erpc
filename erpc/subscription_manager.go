@@ -579,11 +579,13 @@ func (h *networkHandle) FinalityDepth() int64 {
 // pod is already ≥ N. That invariant applies to every ingress source,
 // including tier:fallback: Ingest fans out all sources, so skipping TipHW
 // for fallback heads while still delivering them to clients causes
-// MultiNode FOOS (WS tip ahead of HTTP TipHW).
+// MultiNode FOOS (WS tip ahead of HTTP TipHW). Tip re-fetch of a TipHW
+// that came from a fallback must reach that fallback via the emptyish
+// escape hatch instead.
 //
-// Also records the tip-source upstream id (for EnforceHighestBlock pin) and
-// bumps any HTTP twin's poller so partitionUpstreamsByLatestBlock prefers
-// the same physical node for subsequent eth_getBlockByNumber tip reads.
+// Also bumps the HTTP twin poller (id: *-ws-* → *) so existing
+// partitionUpstreamsByLatestBlock / EvmLeaderUpstream prefer the same
+// physical node that just delivered newHeads — the cross-node tip race.
 func (h *networkHandle) SuggestLatestBlock(sourceId string, blockNumber int64, payload json.RawMessage) {
 	_ = payload
 	const prefix = "ws:"
@@ -591,88 +593,17 @@ func (h *networkHandle) SuggestLatestBlock(sourceId string, blockNumber int64, p
 		return
 	}
 	upstreamID := sourceId[len(prefix):]
-	var wsUp *upstream.Upstream
-	ups := h.nw.upstreamsRegistry.GetNetworkUpstreams(context.Background(), h.nw.networkId)
-	for _, u := range ups {
-		if u.Id() != upstreamID {
+	twinID := strings.Replace(upstreamID, "-ws-", "-", 1) // no-op if no -ws-
+	for _, u := range h.nw.upstreamsRegistry.GetNetworkUpstreams(context.Background(), h.nw.networkId) {
+		id := u.Id()
+		if id != upstreamID && id != twinID {
 			continue
 		}
-		wsUp = u
-		poller := u.EvmStatePoller()
-		if poller != nil && !poller.IsObjectNull() {
+		if poller := u.EvmStatePoller(); poller != nil && !poller.IsObjectNull() {
 			poller.SuggestLatestBlock(blockNumber)
 		}
-		break
-	}
-	h.nw.noteTipSource(blockNumber, upstreamID)
-	if wsUp != nil {
-		suggestHttpTwinLatestBlock(ups, wsUp, blockNumber)
 	}
 	h.nw.NoteObservedLatestBlock(h.nw.appCtx, blockNumber)
-}
-
-// suggestHttpTwinLatestBlock advances pollers for HTTP upstreams that are
-// the same physical node as wsUp (id convention *-ws-* / endpoint /ws twin).
-// Same-node live tests show WS newHeads implies HTTP getBlock is immediately
-// available on that node; the lagging sibling is the real tip-race.
-func suggestHttpTwinLatestBlock(ups []*upstream.Upstream, wsUp *upstream.Upstream, blockNumber int64) {
-	if wsUp == nil || blockNumber <= 0 {
-		return
-	}
-	twinID := httpTwinUpstreamId(wsUp.Id())
-	wsEp := ""
-	if cfg := wsUp.Config(); cfg != nil {
-		wsEp = cfg.Endpoint
-	}
-	httpTwinEp := httpTwinEndpoint(wsEp)
-	for _, u := range ups {
-		if u == nil || u.Id() == wsUp.Id() {
-			continue
-		}
-		match := twinID != "" && u.Id() == twinID
-		if !match && httpTwinEp != "" {
-			if cfg := u.Config(); cfg != nil && cfg.Endpoint == httpTwinEp {
-				match = true
-			}
-		}
-		if !match {
-			continue
-		}
-		poller := u.EvmStatePoller()
-		if poller != nil && !poller.IsObjectNull() {
-			poller.SuggestLatestBlock(blockNumber)
-		}
-	}
-}
-
-// httpTwinUpstreamId maps internal-eth-mainnet-reth-ws-0 → internal-eth-mainnet-reth-0.
-func httpTwinUpstreamId(wsUpstreamId string) string {
-	if strings.Contains(wsUpstreamId, "-ws-") {
-		return strings.Replace(wsUpstreamId, "-ws-", "-", 1)
-	}
-	if strings.HasSuffix(wsUpstreamId, "-ws") {
-		return strings.TrimSuffix(wsUpstreamId, "-ws")
-	}
-	return ""
-}
-
-// httpTwinEndpoint maps wss://host/0/ws → https://host/0 (and ws→http).
-func httpTwinEndpoint(wsEndpoint string) string {
-	if wsEndpoint == "" {
-		return ""
-	}
-	ep := wsEndpoint
-	switch {
-	case strings.HasPrefix(ep, "wss://"):
-		ep = "https://" + strings.TrimPrefix(ep, "wss://")
-	case strings.HasPrefix(ep, "ws://"):
-		ep = "http://" + strings.TrimPrefix(ep, "ws://")
-	default:
-		return ""
-	}
-	ep = strings.TrimSuffix(ep, "/ws")
-	ep = strings.TrimSuffix(ep, "/websocket")
-	return ep
 }
 
 // Interface checks: fail the build if either contract drifts.

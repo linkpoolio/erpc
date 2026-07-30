@@ -582,10 +582,6 @@ func (h *networkHandle) FinalityDepth() int64 {
 // MultiNode FOOS (WS tip ahead of HTTP TipHW). Tip re-fetch of a TipHW
 // that came from a fallback must reach that fallback via the emptyish
 // escape hatch instead.
-//
-// Also bumps the HTTP twin poller (id: *-ws-* → *) so existing
-// partitionUpstreamsByLatestBlock / EvmLeaderUpstream prefer the same
-// physical node that just delivered newHeads — the cross-node tip race.
 func (h *networkHandle) SuggestLatestBlock(sourceId string, blockNumber int64, payload json.RawMessage) {
 	_ = payload
 	const prefix = "ws:"
@@ -593,15 +589,15 @@ func (h *networkHandle) SuggestLatestBlock(sourceId string, blockNumber int64, p
 		return
 	}
 	upstreamID := sourceId[len(prefix):]
-	twinID := strings.Replace(upstreamID, "-ws-", "-", 1) // no-op if no -ws-
 	for _, u := range h.nw.upstreamsRegistry.GetNetworkUpstreams(context.Background(), h.nw.networkId) {
-		id := u.Id()
-		if id != upstreamID && id != twinID {
+		if u.Id() != upstreamID {
 			continue
 		}
-		if poller := u.EvmStatePoller(); poller != nil && !poller.IsObjectNull() {
+		poller := u.EvmStatePoller()
+		if poller != nil && !poller.IsObjectNull() {
 			poller.SuggestLatestBlock(blockNumber)
 		}
+		break
 	}
 	h.nw.NoteObservedLatestBlock(h.nw.appCtx, blockNumber)
 }

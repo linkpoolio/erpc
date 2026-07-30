@@ -226,8 +226,8 @@ func enforceHighestBlock(ctx context.Context, network common.Network, nq *common
 		}
 
 		// Prefer the upstream whose poller already owns this tip
-		// (EvmLeaderUpstream — typically the WS ingress / HTTP twin that
-		// SuggestLatestBlock advanced). If TipHW advanced via Redis/WS while
+		// (EvmLeaderUpstream — typically the WS ingress that called
+		// SuggestLatestBlock). If TipHW advanced via Redis/WS while
 		// local pollers lag inside their debounce window, force-poll
 		// the leader once before deciding. Fall back to excluding the
 		// stale responder when no local poller has caught up yet.

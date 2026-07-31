@@ -231,23 +231,31 @@ func enforceHighestBlock(ctx context.Context, network common.Network, nq *common
 		// local pollers lag inside their debounce window, force-poll
 		// the leader once before deciding. Fall back to excluding the
 		// stale responder when no local poller has caught up yet.
+		var leaderId string
+		var leaderLatest int64
 		resolveLeaderPin := func() string {
 			leader := network.EvmLeaderUpstream(ctx)
 			if leader == nil {
+				leaderId = ""
+				leaderLatest = 0
 				return ""
 			}
+			leaderId = leader.Id()
 			eu, ok := leader.(common.EvmUpstream)
 			if !ok {
+				leaderLatest = 0
 				return ""
 			}
 			sp := eu.EvmStatePoller()
 			if sp == nil || sp.IsObjectNull() {
+				leaderLatest = 0
 				return ""
 			}
 			if sp.LatestBlock() < highestBlockNumber {
 				_, _ = sp.PollLatestBlockNumberNow(ctx)
 			}
-			if sp.LatestBlock() >= highestBlockNumber {
+			leaderLatest = sp.LatestBlock()
+			if leaderLatest >= highestBlockNumber {
 				return leader.Id()
 			}
 			return ""
@@ -270,7 +278,11 @@ func enforceHighestBlock(ctx context.Context, network common.Network, nq *common
 			}
 			return nnr, nil
 		}
+		pin1Upstream := ""
+		pin1Empty := true
 		if nnr != nil {
+			pin1Upstream = nnr.UpstreamId()
+			pin1Empty = nnr.IsResultEmptyish()
 			nnr.Release()
 		}
 
@@ -287,14 +299,45 @@ func enforceHighestBlock(ctx context.Context, network common.Network, nq *common
 		if !firstPinnedToLeader {
 			pin2 = resolveLeaderPin()
 		}
+		staleUpstream := ""
+		if nr != nil {
+			staleUpstream = nr.UpstreamId()
+		}
+		logger.Warn().
+			Int64("tipHW", highestBlockNumber).
+			Int64("staleBlockNumber", respBlockNumber).
+			Str("staleUpstream", staleUpstream).
+			Str("leaderId", leaderId).
+			Int64("leaderLatest", leaderLatest).
+			Bool("firstPinnedToLeader", firstPinnedToLeader).
+			Str("pin1", useUpstream).
+			Str("pin1Upstream", pin1Upstream).
+			Bool("pin1Empty", pin1Empty).
+			Err(ferr).
+			Str("pin2", pin2).
+			Msg("tip re-fetch miss after first attempt")
+
 		nnr2, ferr2 := forwardGetBlockByNumber(ctx, network, nq, highestBlockNumber, itx, pin2, true)
 		if meetsTipFloor(ctx, nnr2, highestBlockNumber) {
+			servedBy := ""
+			if nnr2 != nil {
+				servedBy = nnr2.UpstreamId()
+			}
+			logger.Warn().
+				Int64("tipHW", highestBlockNumber).
+				Str("leaderId", leaderId).
+				Bool("firstPinnedToLeader", firstPinnedToLeader).
+				Str("pin2", pin2).
+				Str("servedBy", servedBy).
+				Msg("tip re-fetch recovered on second attempt")
 			if nr != nil {
 				nr.Release()
 			}
 			return nnr2, nil
 		}
+		pin2Upstream := ""
 		if nnr2 != nil {
+			pin2Upstream = nnr2.UpstreamId()
 			nnr2.Release()
 		}
 
@@ -302,6 +345,13 @@ func enforceHighestBlock(ctx context.Context, network common.Network, nq *common
 		logger.Warn().
 			Int64("highestBlockNumber", highestBlockNumber).
 			Int64("staleBlockNumber", respBlockNumber).
+			Str("staleUpstream", staleUpstream).
+			Str("leaderId", leaderId).
+			Int64("leaderLatest", leaderLatest).
+			Bool("firstPinnedToLeader", firstPinnedToLeader).
+			Str("pin1", useUpstream).
+			Str("pin2", pin2).
+			Str("pin2Upstream", pin2Upstream).
 			Err(ferr2).
 			Msg("tip re-fetch could not reach TipHW; refusing stale latest")
 		if nr != nil {

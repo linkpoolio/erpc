@@ -1092,6 +1092,24 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 			//     out to pay-per-call tier:fallback upstreams.
 			dirs := effectiveReq.Directives()
 			skipFallbackEscape := dirs != nil && dirs.SkipFallbackEscape
+			if !skipFallbackEscape {
+				// Tip-race miss: the requested block is at or one ahead of the
+				// primary leader's poller — primaries import it within ~a block
+				// time (sibling lag, measured 100-200ms), so escaping to
+				// pay-per-call fallbacks buys nothing. Let the failsafe retry
+				// (emptyResultDelay / blockUnavailableDelay) re-visit primaries.
+				// Blocks further ahead (primaries stuck), older-block data gaps,
+				// and block-less methods (receipts) escape as before.
+				if bn, ok := effectiveReq.EvmBlockNumber().(int64); ok && bn > 0 {
+					if leader, ok2 := n.EvmLeaderUpstream(execSpanCtx).(common.EvmUpstream); ok2 && leader != nil {
+						if sp := leader.EvmStatePoller(); sp != nil && !sp.IsObjectNull() {
+							if l := sp.LatestBlock(); l > 0 && bn >= l && bn <= l+1 {
+								skipFallbackEscape = true
+							}
+						}
+					}
+				}
+			}
 			bestRespEmptyish := bestResp != nil && bestResp.IsResultEmptyish()
 			if (bestResp == nil || bestRespEmptyish) &&
 				!skipFallbackEscape &&

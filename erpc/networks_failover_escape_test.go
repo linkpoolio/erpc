@@ -627,15 +627,18 @@ func TestFailover_EscapeHatch(t *testing.T) {
 			"escape hatch must fire exactly once for the non-retryable gate-skip case")
 	})
 
-	t.Run("EscapesOnEmptyishGetBlockByNumber", func(t *testing.T) {
+	t.Run("NearTipEmptyishDoesNotEscape", func(t *testing.T) {
 		defer util.ResetGock()
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		// Primaries and fallbacks both report tip 1002 via poller, so the
-		// availability gate fails open / passes. Primaries return null for
-		// the concrete tip block (missing data); fallbacks return the header.
-		// Before the emptyish-escape fix, bestResp=null blocked escalation.
+		// Primaries and fallbacks both report tip 1002 via poller, and the
+		// request targets that tip. Primaries returning null for a block at
+		// (or one ahead of) the primary leader's poller is the sibling
+		// import race — primaries serve it within ~a block time, so the
+		// escape hatch must NOT burn pay-per-call fallbacks. The failsafe
+		// retry re-visits primaries instead. (Blocks further ahead — stuck
+		// primaries — still escape: see the gate-skip subtests above.)
 		network, _, _ := setupFailoverFixture(t, ctx, failoverFixtureOpts{
 			primaryLatest:  "0x3ea", // 1002
 			fallbackLatest: "0x3ea", // 1002
@@ -675,22 +678,22 @@ func TestFailover_EscapeHatch(t *testing.T) {
 		))
 		req.SetNetwork(network)
 		resp, err := network.Forward(ctx, req)
-		require.NoError(t, err, "null from primaries must escalate to fallbacks on the same request")
-		require.NotNil(t, resp)
-		defer resp.Release()
+		if resp != nil {
+			defer resp.Release()
+		}
 
-		jrr, err := resp.JsonRpcResponse()
-		require.NoError(t, err)
-		require.False(t, jrr.IsResultEmptyish(), "fallback must return a non-null block header")
-		num, err := jrr.PeekStringByPath(ctx, "number")
-		require.NoError(t, err)
-		assert.Equal(t, "0x3ea", num)
-
-		assert.Contains(t, []string{"fallback-1", "fallback-2"}, resp.UpstreamId(),
-			"emptyish primary miss must be served by a fallback")
+		if err == nil {
+			require.NotNil(t, resp)
+			jrr, jerr := resp.JsonRpcResponse()
+			require.NoError(t, jerr)
+			require.True(t, jrr.IsResultEmptyish(),
+				"near-tip miss must stay emptyish from primaries, not be served by a fallback")
+			assert.NotContains(t, []string{"fallback-1", "fallback-2"}, resp.UpstreamId(),
+				"near-tip miss must not be served via fallback escape")
+		}
 
 		after := promUtil.ToFloat64(counter)
-		assert.Equal(t, before+1, after,
-			"escape hatch must fire for emptyish eth_getBlockByNumber primary misses")
+		assert.Equal(t, before, after,
+			"escape hatch must NOT fire for near-tip emptyish primary misses")
 	})
 }

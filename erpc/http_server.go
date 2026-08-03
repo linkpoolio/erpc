@@ -1827,6 +1827,16 @@ func gzipHandler(next http.Handler) http.Handler {
 	var gzPool = util.NewGzipWriterPool()
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// WebSocket upgrades need Hijack() on the real ResponseWriter.
+		// conditionalGzipWriter does not implement http.Hijacker, so wrapping
+		// breaks gorilla's Upgrade (500: "response does not implement http.Hijacker").
+		// Cloudflare always sends Accept-Encoding: gzip, which previously
+		// forced the wrap on every proxied WS handshake.
+		if websocket.IsWebSocketUpgrade(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		// Check if client accepts gzip encoding
 		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 			next.ServeHTTP(w, r)

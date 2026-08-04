@@ -174,7 +174,11 @@ func (sm *SubscriptionManager) Subscribe(
 		return nil, err
 	}
 
-	conn.adapter.AddSubscription(clientSubID, networkId, kind, filterHash)
+	conn.adapter.AddSubscription(clientSubID, networkId, kind, filterHash, wsclient.SubscriptionLabels{
+		Project:   project.Config.Id,
+		User:      nq.UserId(),
+		AgentName: nq.AgentName(),
+	})
 	sm.bySubID.Store(clientSubID, &subRecord{
 		clientSubID: clientSubID,
 		connID:      wsc.id,

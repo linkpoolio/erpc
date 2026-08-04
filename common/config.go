@@ -2389,11 +2389,12 @@ func (s *SelectionPolicyConfig) UnmarshalYAML(unmarshal func(interface{}) error)
 type AuthType string
 
 const (
-	AuthTypeSecret   AuthType = "secret"
-	AuthTypeDatabase AuthType = "database"
-	AuthTypeJwt      AuthType = "jwt"
-	AuthTypeSiwe     AuthType = "siwe"
-	AuthTypeNetwork  AuthType = "network"
+	AuthTypeSecret            AuthType = "secret"
+	AuthTypeDatabase          AuthType = "database"
+	AuthTypeJwt               AuthType = "jwt"
+	AuthTypeSiwe              AuthType = "siwe"
+	AuthTypeNetwork           AuthType = "network"
+	AuthTypeForwardedClientId AuthType = "forwardedClientId"
 )
 
 type AuthConfig struct {
@@ -2405,12 +2406,24 @@ type AuthStrategyConfig struct {
 	AllowMethods    []string `yaml:"allowMethods,omitempty" json:"allowMethods,omitempty"`
 	RateLimitBudget string   `yaml:"rateLimitBudget,omitempty" json:"rateLimitBudget,omitempty"`
 
-	Type     AuthType                `yaml:"type" json:"type" tstype:"TsAuthType"`
-	Network  *NetworkStrategyConfig  `yaml:"network,omitempty" json:"network,omitempty"`
-	Secret   *SecretStrategyConfig   `yaml:"secret,omitempty" json:"secret,omitempty"`
-	Database *DatabaseStrategyConfig `yaml:"database,omitempty" json:"database,omitempty"`
-	Jwt      *JwtStrategyConfig      `yaml:"jwt,omitempty" json:"jwt,omitempty"`
-	Siwe     *SiweStrategyConfig     `yaml:"siwe,omitempty" json:"siwe,omitempty"`
+	Type              AuthType                        `yaml:"type" json:"type" tstype:"TsAuthType"`
+	Network           *NetworkStrategyConfig          `yaml:"network,omitempty" json:"network,omitempty"`
+	Secret            *SecretStrategyConfig           `yaml:"secret,omitempty" json:"secret,omitempty"`
+	Database          *DatabaseStrategyConfig         `yaml:"database,omitempty" json:"database,omitempty"`
+	Jwt               *JwtStrategyConfig              `yaml:"jwt,omitempty" json:"jwt,omitempty"`
+	Siwe              *SiweStrategyConfig             `yaml:"siwe,omitempty" json:"siwe,omitempty"`
+	ForwardedClientId *ForwardedClientIdStrategyConfig `yaml:"forwardedClientId,omitempty" json:"forwardedClientId,omitempty"`
+}
+
+// ForwardedClientIdStrategyConfig trusts a non-secret client identity header
+// injected by an upstream gateway after API-key auth (e.g. Envoy
+// apiKeyAuth.forwardClientIDHeader → X-Client-Id). Must only be enabled
+// behind a gateway that strips client-supplied values of that header.
+type ForwardedClientIdStrategyConfig struct {
+	// Header is the request header carrying the client id. Default: "X-Client-Id".
+	Header string `yaml:"header,omitempty" json:"header,omitempty"`
+	// RateLimitBudget, if set, is applied to the authenticated user.
+	RateLimitBudget string `yaml:"rateLimitBudget,omitempty" json:"rateLimitBudget,omitempty"`
 }
 
 type SecretStrategyConfig struct {

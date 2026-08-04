@@ -66,6 +66,7 @@ export {
   AuthTypeJwt,
   AuthTypeSiwe,
   AuthTypeNetwork,
+  AuthTypeForwardedClientId,
   // Consensus related
   ConsensusLowParticipantsBehaviorReturnError,
   ConsensusLowParticipantsBehaviorAcceptMostCommonValidResult,

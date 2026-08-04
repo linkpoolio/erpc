@@ -729,6 +729,13 @@ func (s *AuthStrategyConfig) Validate() error {
 		if err := s.Database.Validate(); err != nil {
 			return err
 		}
+	case AuthTypeForwardedClientId:
+		if s.ForwardedClientId == nil {
+			return fmt.Errorf("auth.*.forwardedClientId is required for forwardedClientId strategy")
+		}
+		if err := s.ForwardedClientId.Validate(); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("auth.*.type '%s' is invalid must be one of: %v", s.Type, []AuthType{
 			AuthTypeNetwork,
@@ -736,7 +743,15 @@ func (s *AuthStrategyConfig) Validate() error {
 			AuthTypeJwt,
 			AuthTypeSiwe,
 			AuthTypeDatabase,
+			AuthTypeForwardedClientId,
 		})
+	}
+	return nil
+}
+
+func (s *ForwardedClientIdStrategyConfig) Validate() error {
+	if s == nil {
+		return fmt.Errorf("auth.*.forwardedClientId is required")
 	}
 	return nil
 }

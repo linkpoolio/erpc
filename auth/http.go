@@ -77,6 +77,12 @@ func NewPayloadFromHttp(method string, remoteAddr string, headers http.Header, a
 				Message:   normalizeSiweMessage(msg),
 			}
 		}
+	} else if clientId := firstNonEmptyHeader(headers, "X-Client-Id", "x-client-id"); clientId != "" {
+		// Gateway-injected identity after edge API-key auth (Envoy forwardClientIDHeader).
+		ap.Type = common.AuthTypeForwardedClientId
+		ap.ForwardedClientId = &ForwardedClientIdPayload{
+			Value: clientId,
+		}
 	}
 
 	// Default to network strategy when no other auth signals are present.
@@ -85,6 +91,15 @@ func NewPayloadFromHttp(method string, remoteAddr string, headers http.Header, a
 	}
 
 	return ap, nil
+}
+
+func firstNonEmptyHeader(headers http.Header, names ...string) string {
+	for _, name := range names {
+		if v := strings.TrimSpace(headers.Get(name)); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func normalizeSiweMessage(msg string) string {

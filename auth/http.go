@@ -5,12 +5,13 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 
 	"github.com/erpc/erpc/common"
 )
 
-func NewPayloadFromHttp(method string, remoteAddr string, headers http.Header, args url.Values) (*AuthPayload, error) {
+func NewPayloadFromHttp(method string, remoteAddr string, headers http.Header, args url.Values, requestPath string) (*AuthPayload, error) {
 	ap := &AuthPayload{
 		Method: method,
 	}
@@ -25,10 +26,21 @@ func NewPayloadFromHttp(method string, remoteAddr string, headers http.Header, a
 		ap.Secret = &SecretPayload{
 			Value: secret,
 		}
+	} else if apikey := args.Get("apikey"); apikey != "" {
+		// Alias used by edge gateways / clients that speak "apikey" rather than "secret".
+		ap.Type = common.AuthTypeSecret
+		ap.Secret = &SecretPayload{
+			Value: apikey,
+		}
 	} else if tkn := headers.Get("X-ERPC-Secret-Token"); tkn != "" {
 		ap.Type = common.AuthTypeSecret
 		ap.Secret = &SecretPayload{
 			Value: tkn,
+		}
+	} else if apikey := firstNonEmptyHeader(headers, "apikey", "X-Api-Key"); apikey != "" {
+		ap.Type = common.AuthTypeSecret
+		ap.Secret = &SecretPayload{
+			Value: apikey,
 		}
 	} else if ath := headers.Get("Authorization"); ath != "" {
 		ath = strings.TrimSpace(ath)
@@ -77,6 +89,13 @@ func NewPayloadFromHttp(method string, remoteAddr string, headers http.Header, a
 				Message:   normalizeSiweMessage(msg),
 			}
 		}
+	} else if pathSecret := singlePathSegmentSecret(requestPath); pathSecret != "" {
+		// Path form: https://host/<SECRET> (with domain aliasing so the segment
+		// is not consumed as project/network). Avoids edge Lua/WASM filters.
+		ap.Type = common.AuthTypeSecret
+		ap.Secret = &SecretPayload{
+			Value: pathSecret,
+		}
 	} else if clientId := firstNonEmptyHeader(headers, "X-Client-Id", "x-client-id"); clientId != "" {
 		// Gateway-injected identity after edge API-key auth (Envoy forwardClientIDHeader).
 		ap.Type = common.AuthTypeForwardedClientId
@@ -91,6 +110,28 @@ func NewPayloadFromHttp(method string, remoteAddr string, headers http.Header, a
 	}
 
 	return ap, nil
+}
+
+// singlePathSegmentSecret returns the sole path segment when the URL is
+// `/<secret>` (or `/<secret>/`). Multi-segment eRPC paths and reserved
+// endpoints are ignored so routing/healthchecks stay unchanged.
+func singlePathSegmentSecret(requestPath string) string {
+	if requestPath == "" {
+		return ""
+	}
+	ps := path.Clean(requestPath)
+	if ps == "/" || ps == "." {
+		return ""
+	}
+	seg := strings.TrimPrefix(ps, "/")
+	if seg == "" || strings.Contains(seg, "/") {
+		return ""
+	}
+	switch seg {
+	case "admin", "healthcheck", "metrics":
+		return ""
+	}
+	return seg
 }
 
 func firstNonEmptyHeader(headers http.Header, names ...string) string {

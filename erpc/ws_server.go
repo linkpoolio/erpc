@@ -342,7 +342,7 @@ func (wsc *WsConnection) authenticate(requestCtx context.Context, nq *common.Nor
 		return nil
 	}
 
-	ap, err := auth.NewPayloadFromHttp(method, wsc.httpReq.RemoteAddr, wsc.httpReq.Header, wsc.httpReq.URL.Query())
+	ap, err := auth.NewPayloadFromHttp(method, wsc.httpReq.RemoteAddr, wsc.httpReq.Header, wsc.httpReq.URL.Query(), wsc.httpReq.URL.Path)
 	if err != nil {
 		return err
 	}
@@ -455,7 +455,7 @@ func (wsc *WsConnection) handleBatchItem(index int, reqRaw json.RawMessage, star
 	}
 
 	if wsc.project != nil {
-		ap, err := auth.NewPayloadFromHttp(method, wsc.httpReq.RemoteAddr, wsc.httpReq.Header, wsc.httpReq.URL.Query())
+		ap, err := auth.NewPayloadFromHttp(method, wsc.httpReq.RemoteAddr, wsc.httpReq.Header, wsc.httpReq.URL.Query(), wsc.httpReq.URL.Path)
 		if err != nil {
 			responses[index] = processErrorBody(wsc.logger, startedAt, nq, err, &common.TRUE)
 			common.EndRequestSpan(requestCtx, nil, err)

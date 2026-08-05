@@ -176,6 +176,7 @@ func (sm *SubscriptionManager) Subscribe(
 
 	conn.adapter.AddSubscription(clientSubID, networkId, kind, filterHash, wsclient.SubscriptionLabels{
 		Project:   project.Config.Id,
+		Network:   nw.Label(),
 		User:      nq.UserId(),
 		AgentName: nq.AgentName(),
 	})

@@ -66,6 +66,8 @@ type routeKey struct {
 // on delivered / dropped notification events.
 type SubscriptionLabels struct {
 	Project   string
+	// Network is the metrics network label (alias if configured, else network id).
+	Network   string
 	User      string
 	AgentName string
 }
@@ -268,9 +270,13 @@ func (a *Adapter) runWriter(sub *clientSub) {
 				// Drain us when the peer is truly gone.
 				continue
 			}
+			network := sub.labels.Network
+			if network == "" {
+				network = sub.networkID
+			}
 			telemetry.MetricWsSubscriptionEventsTotal.WithLabelValues(
 				sub.labels.Project,
-				sub.networkID,
+				network,
 				sub.kind.String(),
 				sub.labels.User,
 				sub.labels.AgentName,
@@ -290,18 +296,26 @@ func enqueue(sub *clientSub, payload json.RawMessage) {
 			// Buffer full; drop oldest to make room.
 			select {
 			case <-sub.notify:
+				network := sub.labels.Network
+				if network == "" {
+					network = sub.networkID
+				}
 				telemetry.MetricWsSubscriptionEventsDroppedTotal.WithLabelValues(
 					sub.labels.Project,
-					sub.networkID,
+					network,
 					sub.kind.String(),
 					sub.labels.User,
 					sub.labels.AgentName,
 				).Inc()
 			default:
 				// Concurrent drain won the race — drop this message.
+				network := sub.labels.Network
+				if network == "" {
+					network = sub.networkID
+				}
 				telemetry.MetricWsSubscriptionEventsDroppedTotal.WithLabelValues(
 					sub.labels.Project,
-					sub.networkID,
+					network,
 					sub.kind.String(),
 					sub.labels.User,
 					sub.labels.AgentName,

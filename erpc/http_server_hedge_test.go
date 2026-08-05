@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/erpc/erpc/common"
-	"github.com/erpc/erpc/upstream"
+	"github.com/erpc/erpc/internal/policy"
 	"github.com/erpc/erpc/util"
 	"github.com/h2non/gock"
 	"github.com/stretchr/testify/assert"
@@ -39,7 +39,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 								{
 									Hedge: &common.HedgePolicyConfig{
 										MaxCount: 1,
-										Delay:    common.Duration(10 * time.Millisecond),
+										Delay:    common.NewStaticDuration(10 * time.Millisecond),
 									},
 								},
 							},
@@ -107,7 +107,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 
 		prj, err := erpcInstance.GetProject("test_project")
 		require.NoError(t, err)
-		upstream.ReorderUpstreams(prj.upstreamsRegistry)
+		policy.OverrideAllForTest(prj.policyEngine)
 
 		statusCode, _, body := sendRequest(`{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x123"],"id":1}`, nil, nil)
 
@@ -140,7 +140,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 								{
 									Hedge: &common.HedgePolicyConfig{
 										MaxCount: 2,
-										Delay:    common.Duration(100 * time.Millisecond),
+										Delay:    common.NewStaticDuration(100 * time.Millisecond),
 									},
 								},
 							},
@@ -230,7 +230,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 
 		prj, err := erpcInstance.GetProject("test_project")
 		require.NoError(t, err)
-		upstream.ReorderUpstreams(prj.upstreamsRegistry)
+		policy.OverrideAllForTest(prj.policyEngine)
 
 		statusCode, _, body := sendRequest(`{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x123"],"id":1}`, nil, nil)
 
@@ -264,7 +264,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 								{
 									Hedge: &common.HedgePolicyConfig{
 										MaxCount: 2,
-										Delay:    common.Duration(30 * time.Millisecond), // Short delay
+										Delay:    common.NewStaticDuration(30 * time.Millisecond), // Short delay
 									},
 								},
 							},
@@ -356,7 +356,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 
 		prj, err := erpcInstance.GetProject("test_project")
 		require.NoError(t, err)
-		upstream.ReorderUpstreams(prj.upstreamsRegistry)
+		policy.OverrideAllForTest(prj.policyEngine)
 
 		statusCode, _, body := sendRequest(`{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x123"],"id":1}`, nil, nil)
 
@@ -394,7 +394,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 									},
 									Hedge: &common.HedgePolicyConfig{
 										MaxCount: 1,
-										Delay:    common.Duration(200 * time.Millisecond), // Hedge delay
+										Delay:    common.NewStaticDuration(200 * time.Millisecond), // Hedge delay
 									},
 								},
 							},
@@ -462,7 +462,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 
 		prj, err := erpcInstance.GetProject("test_project")
 		require.NoError(t, err)
-		upstream.ReorderUpstreams(prj.upstreamsRegistry)
+		policy.OverrideAllForTest(prj.policyEngine)
 		start := time.Now()
 
 		statusCode, _, body := sendRequest(`{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x123"],"id":1}`, nil, nil)
@@ -505,7 +505,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 									},
 									Hedge: &common.HedgePolicyConfig{
 										MaxCount: 1,
-										Delay:    common.Duration(30 * time.Millisecond), // Short hedge delay
+										Delay:    common.NewStaticDuration(30 * time.Millisecond), // Short hedge delay
 									},
 								},
 							},
@@ -579,7 +579,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 
 		prj, err := erpcInstance.GetProject("test_project")
 		require.NoError(t, err)
-		upstream.ReorderUpstreams(prj.upstreamsRegistry)
+		policy.OverrideAllForTest(prj.policyEngine)
 
 		statusCode, _, body := sendRequest(`{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x123"],"id":1}`, nil, nil)
 		elapsed := time.Since(start)
@@ -615,7 +615,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 								{
 									Hedge: &common.HedgePolicyConfig{
 										MaxCount: 2,
-										Delay:    common.Duration(50 * time.Millisecond),
+										Delay:    common.NewStaticDuration(50 * time.Millisecond),
 									},
 								},
 							},
@@ -701,7 +701,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 
 		prj, err := erpcInstance.GetProject("test_project")
 		require.NoError(t, err)
-		upstream.ReorderUpstreams(prj.upstreamsRegistry)
+		policy.OverrideAllForTest(prj.policyEngine)
 
 		statusCode, _, body := sendRequest(`{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x123"],"id":1}`, nil, nil)
 
@@ -734,7 +734,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 								{
 									Hedge: &common.HedgePolicyConfig{
 										MaxCount: 1,
-										Delay:    common.Duration(200 * time.Millisecond),
+										Delay:    common.NewStaticDuration(200 * time.Millisecond),
 									},
 								},
 							},
@@ -801,7 +801,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 
 		prj, err := erpcInstance.GetProject("test_project")
 		require.NoError(t, err)
-		upstream.ReorderUpstreams(prj.upstreamsRegistry)
+		policy.OverrideAllForTest(prj.policyEngine)
 
 		statusCode, _, body := sendRequest(`{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x123"],"id":1}`, nil, nil)
 
@@ -833,7 +833,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 								{
 									Hedge: &common.HedgePolicyConfig{
 										MaxCount: 1,
-										Delay:    common.Duration(100 * time.Millisecond),
+										Delay:    common.NewStaticDuration(100 * time.Millisecond),
 									},
 								},
 							},
@@ -896,7 +896,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 
 		prj, err := erpcInstance.GetProject("test_project")
 		require.NoError(t, err)
-		upstream.ReorderUpstreams(prj.upstreamsRegistry)
+		policy.OverrideAllForTest(prj.policyEngine)
 
 		statusCode, _, body := sendRequest(`{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x123"],"id":1}`, nil, nil)
 
@@ -928,7 +928,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 								{
 									Hedge: &common.HedgePolicyConfig{
 										MaxCount: 1,
-										Delay:    common.Duration(100 * time.Millisecond),
+										Delay:    common.NewStaticDuration(100 * time.Millisecond),
 									},
 								},
 							},
@@ -996,7 +996,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 
 		prj, err := erpcInstance.GetProject("test_project")
 		require.NoError(t, err)
-		upstream.ReorderUpstreams(prj.upstreamsRegistry)
+		policy.OverrideAllForTest(prj.policyEngine)
 
 		statusCode, _, body := sendRequest(`{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x123"],"id":1}`, nil, nil)
 
@@ -1028,7 +1028,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 								{
 									Hedge: &common.HedgePolicyConfig{
 										MaxCount: 1,
-										Delay:    common.Duration(100 * time.Millisecond),
+										Delay:    common.NewStaticDuration(100 * time.Millisecond),
 									},
 								},
 							},
@@ -1096,7 +1096,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 
 		prj, err := erpcInstance.GetProject("test_project")
 		require.NoError(t, err)
-		upstream.ReorderUpstreams(prj.upstreamsRegistry)
+		policy.OverrideAllForTest(prj.policyEngine)
 
 		statusCode, _, body := sendRequest(`{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x123"],"id":1}`, nil, nil)
 
@@ -1129,7 +1129,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 								{
 									Hedge: &common.HedgePolicyConfig{
 										MaxCount: 1,
-										Delay:    common.Duration(50 * time.Millisecond), // Hedge starts quickly
+										Delay:    common.NewStaticDuration(50 * time.Millisecond), // Hedge starts quickly
 									},
 								},
 							},
@@ -1197,7 +1197,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 
 		prj, err := erpcInstance.GetProject("test_project")
 		require.NoError(t, err)
-		upstream.ReorderUpstreams(prj.upstreamsRegistry)
+		policy.OverrideAllForTest(prj.policyEngine)
 
 		statusCode, _, body := sendRequest(`{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x123"],"id":1}`, nil, nil)
 
@@ -1230,7 +1230,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 								{
 									Hedge: &common.HedgePolicyConfig{
 										MaxCount: 1,
-										Delay:    common.Duration(100 * time.Millisecond),
+										Delay:    common.NewStaticDuration(100 * time.Millisecond),
 									},
 								},
 							},
@@ -1294,7 +1294,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 
 		prj, err := erpcInstance.GetProject("test_project")
 		require.NoError(t, err)
-		upstream.ReorderUpstreams(prj.upstreamsRegistry)
+		policy.OverrideAllForTest(prj.policyEngine)
 
 		statusCode, _, body := sendRequest(`{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x123"],"id":1}`, nil, nil)
 
@@ -1326,7 +1326,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 								{
 									Hedge: &common.HedgePolicyConfig{
 										MaxCount: 1,
-										Delay:    common.Duration(100 * time.Millisecond),
+										Delay:    common.NewStaticDuration(100 * time.Millisecond),
 									},
 								},
 							},
@@ -1374,14 +1374,16 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 				"error": "internal server error",
 			})
 
-		// rpc2: Never called because primary fails before hedge starts
+		// rpc2: fires after the hedge delay because the executor keeps
+		// racing on a transient primary failure. Returns 503 so we end
+		// up with both errors in the exhausted wrapper.
 		gock.New("http://rpc2.localhost").
 			Post("").
 			Filter(func(request *http.Request) bool {
 				body := util.SafeReadBody(request)
 				return strings.Contains(string(body), "eth_getBalance")
 			}).
-			Persist(). // Keep it pending
+			Persist().
 			Reply(503).
 			JSON(map[string]interface{}{
 				"error": "service unavailable",
@@ -1392,13 +1394,19 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 
 		prj, err := erpcInstance.GetProject("test_project")
 		require.NoError(t, err)
-		upstream.ReorderUpstreams(prj.upstreamsRegistry)
+		policy.OverrideAllForTest(prj.policyEngine)
 
 		statusCode, _, body := sendRequest(`{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x123"],"id":1}`, nil, nil)
 
-		// Should fail immediately with primary error (500)
+		// Both upstreams fail with different errors. The exhausted-wrapper
+		// surfaces both — `internal server error` (rpc1's 500) AND
+		// `service unavailable` (rpc2's 503) both end up in the cause
+		// chain. Asserting on either signal is fine; we pick the
+		// upstream-exhausted code as the canonical client-visible
+		// classification.
 		assert.Equal(t, http.StatusOK, statusCode)
-		assert.Contains(t, body, "internal server error")
+		assert.Contains(t, body, "ErrUpstreamsExhausted")
+		assert.Contains(t, body, "service unavailable")
 	})
 
 	t.Run("BothFailDifferentErrorsWithHedgeRunning", func(t *testing.T) {
@@ -1425,7 +1433,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 								{
 									Hedge: &common.HedgePolicyConfig{
 										MaxCount: 1,
-										Delay:    common.Duration(500 * time.Millisecond), // Short delay
+										Delay:    common.NewStaticDuration(500 * time.Millisecond), // Short delay
 									},
 								},
 							},
@@ -1491,7 +1499,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 
 		prj, err := erpcInstance.GetProject("test_project")
 		require.NoError(t, err)
-		upstream.ReorderUpstreams(prj.upstreamsRegistry)
+		policy.OverrideAllForTest(prj.policyEngine)
 
 		statusCode, _, body := sendRequest(`{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x123"],"id":1}`, nil, nil)
 
@@ -1525,7 +1533,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 								{
 									Hedge: &common.HedgePolicyConfig{
 										MaxCount: 1,
-										Delay:    common.Duration(50 * time.Millisecond),
+										Delay:    common.NewStaticDuration(50 * time.Millisecond),
 									},
 								},
 							},
@@ -1594,7 +1602,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 							Failsafe: []*common.FailsafeConfig{
 								{
 									Hedge: &common.HedgePolicyConfig{
-										Delay:    common.Duration(10 * time.Millisecond),
+										Delay:    common.NewStaticDuration(10 * time.Millisecond),
 										MaxCount: 2,
 									},
 								},
@@ -1665,7 +1673,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 							Failsafe: []*common.FailsafeConfig{
 								{
 									Hedge: &common.HedgePolicyConfig{
-										Delay:    common.Duration(300 * time.Millisecond),
+										Delay:    common.NewStaticDuration(300 * time.Millisecond),
 										MaxCount: 2,
 									},
 								},
@@ -1727,7 +1735,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 
 		prj, err := erpcInstance.GetProject("test_project")
 		require.NoError(t, err)
-		upstream.ReorderUpstreams(prj.upstreamsRegistry)
+		policy.OverrideAllForTest(prj.policyEngine)
 
 		body := `{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x123"],"id":1}`
 		statusCode, _, respBody := sendRequest(body, nil, nil)
@@ -1762,7 +1770,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 							Failsafe: []*common.FailsafeConfig{
 								{
 									Hedge: &common.HedgePolicyConfig{
-										Delay:    common.Duration(50 * time.Millisecond),
+										Delay:    common.NewStaticDuration(50 * time.Millisecond),
 										MaxCount: 2,
 									},
 								},
@@ -1824,7 +1832,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 
 		prj, err := erpcInstance.GetProject("test_project")
 		require.NoError(t, err)
-		upstream.ReorderUpstreams(prj.upstreamsRegistry)
+		policy.OverrideAllForTest(prj.policyEngine)
 
 		body := `{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x123"],"id":1}`
 		statusCode, _, respBody := sendRequest(body, nil, nil)
@@ -1863,7 +1871,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 										Delay:       common.Duration(10 * time.Millisecond),
 									},
 									Hedge: &common.HedgePolicyConfig{
-										Delay:    common.Duration(50 * time.Millisecond),
+										Delay:    common.NewStaticDuration(50 * time.Millisecond),
 										MaxCount: 2,
 									},
 								},
@@ -1942,7 +1950,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 
 		prj, err := erpcInstance.GetProject("test_project")
 		require.NoError(t, err)
-		upstream.ReorderUpstreams(prj.upstreamsRegistry)
+		policy.OverrideAllForTest(prj.policyEngine)
 
 		body := `{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x123"],"id":1}`
 		statusCode, _, respBody := sendRequest(body, nil, nil)
@@ -1977,7 +1985,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 								{
 									Hedge: &common.HedgePolicyConfig{
 										MaxCount: 1,
-										Delay:    common.Duration(10 * time.Millisecond),
+										Delay:    common.NewStaticDuration(10 * time.Millisecond),
 									},
 								},
 							},
@@ -2034,7 +2042,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 
 		prj, err := erpcInstance.GetProject("test_project")
 		require.NoError(t, err)
-		upstream.ReorderUpstreams(prj.upstreamsRegistry)
+		policy.OverrideAllForTest(prj.policyEngine)
 
 		statusCode, _, body := sendRequest(`{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x123"],"id":1}`, nil, nil)
 
@@ -2062,7 +2070,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 									Retry:   nil,
 									Hedge: &common.HedgePolicyConfig{
 										MaxCount: 1,
-										Delay:    common.Duration(100 * time.Millisecond),
+										Delay:    common.NewStaticDuration(100 * time.Millisecond),
 									},
 								},
 							},
@@ -2152,7 +2160,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 
 		prj, err := erpcInstance.GetProject("test_project")
 		require.NoError(t, err)
-		upstream.ReorderUpstreams(prj.upstreamsRegistry)
+		policy.OverrideAllForTest(prj.policyEngine)
 
 		statusCode, _, body := sendRequest(`{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x123"],"id":111}`, nil, nil)
 
@@ -2179,10 +2187,10 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 									Retry: nil,
 									Hedge: &common.HedgePolicyConfig{
 										MaxCount: 1,
-										Delay:    common.Duration(50 * time.Millisecond),
+										Delay:    common.NewStaticDuration(50 * time.Millisecond),
 									},
 									Timeout: &common.TimeoutPolicyConfig{
-										Duration: common.Duration(1000 * time.Millisecond),
+										Duration: common.NewStaticDuration(1000 * time.Millisecond),
 									},
 								},
 							},
@@ -2200,7 +2208,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 								{
 									Retry: nil,
 									Timeout: &common.TimeoutPolicyConfig{
-										Duration: common.Duration(100 * time.Millisecond),
+										Duration: common.NewStaticDuration(100 * time.Millisecond),
 									},
 								},
 							},
@@ -2219,7 +2227,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 								{
 									Retry: nil,
 									Timeout: &common.TimeoutPolicyConfig{
-										Duration: common.Duration(500 * time.Millisecond),
+										Duration: common.NewStaticDuration(500 * time.Millisecond),
 									},
 								},
 							},
@@ -2272,7 +2280,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 
 		prj, err := erpcInstance.GetProject("test_project")
 		require.NoError(t, err)
-		upstream.ReorderUpstreams(prj.upstreamsRegistry)
+		policy.OverrideAllForTest(prj.policyEngine)
 
 		statusCode, _, body := sendRequest(`{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x123"],"id":1}`, nil, nil)
 
@@ -2299,10 +2307,10 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 									Retry: nil,
 									Hedge: &common.HedgePolicyConfig{
 										MaxCount: 1,
-										Delay:    common.Duration(100 * time.Millisecond),
+										Delay:    common.NewStaticDuration(100 * time.Millisecond),
 									},
 									Timeout: &common.TimeoutPolicyConfig{
-										Duration: common.Duration(1000 * time.Millisecond),
+										Duration: common.NewStaticDuration(1000 * time.Millisecond),
 									},
 								},
 							},
@@ -2320,7 +2328,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 								{
 									Retry: nil,
 									Timeout: &common.TimeoutPolicyConfig{
-										Duration: common.Duration(1000 * time.Millisecond),
+										Duration: common.NewStaticDuration(1000 * time.Millisecond),
 									},
 								},
 							},
@@ -2339,7 +2347,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 								{
 									Retry: nil,
 									Timeout: &common.TimeoutPolicyConfig{
-										Duration: common.Duration(1000 * time.Millisecond),
+										Duration: common.NewStaticDuration(1000 * time.Millisecond),
 									},
 								},
 							},
@@ -2395,7 +2403,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 
 		prj, err := erpcInstance.GetProject("test_project")
 		require.NoError(t, err)
-		upstream.ReorderUpstreams(prj.upstreamsRegistry)
+		policy.OverrideAllForTest(prj.policyEngine)
 
 		statusCode, _, body := sendRequest(`{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x123"],"id":1}`, nil, nil)
 
@@ -2422,10 +2430,10 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 									Retry: nil,
 									Hedge: &common.HedgePolicyConfig{
 										MaxCount: 1,
-										Delay:    common.Duration(10 * time.Millisecond),
+										Delay:    common.NewStaticDuration(10 * time.Millisecond),
 									},
 									Timeout: &common.TimeoutPolicyConfig{
-										Duration: common.Duration(300 * time.Millisecond),
+										Duration: common.NewStaticDuration(300 * time.Millisecond),
 									},
 								},
 							},
@@ -2442,7 +2450,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 							Failsafe: []*common.FailsafeConfig{
 								{
 									Timeout: &common.TimeoutPolicyConfig{
-										Duration: common.Duration(150 * time.Millisecond),
+										Duration: common.NewStaticDuration(150 * time.Millisecond),
 									},
 									Retry: nil,
 								},
@@ -2461,7 +2469,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 							Failsafe: []*common.FailsafeConfig{
 								{
 									Timeout: &common.TimeoutPolicyConfig{
-										Duration: common.Duration(200 * time.Millisecond),
+										Duration: common.NewStaticDuration(200 * time.Millisecond),
 									},
 									Retry: nil,
 								},
@@ -2540,7 +2548,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 								{
 									Hedge: &common.HedgePolicyConfig{
 										MaxCount: 1,
-										Delay:    common.Duration(10 * time.Millisecond),
+										Delay:    common.NewStaticDuration(10 * time.Millisecond),
 									},
 								},
 							},
@@ -2645,7 +2653,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 								{
 									Hedge: &common.HedgePolicyConfig{
 										MaxCount: 1,
-										Delay:    common.Duration(10 * time.Millisecond),
+										Delay:    common.NewStaticDuration(10 * time.Millisecond),
 									},
 								},
 							},
@@ -2747,7 +2755,7 @@ func TestHttpServer_HedgedRequests(t *testing.T) {
 								{
 									Hedge: &common.HedgePolicyConfig{
 										MaxCount: 1,
-										Delay:    common.Duration(100 * time.Millisecond),
+										Delay:    common.NewStaticDuration(100 * time.Millisecond),
 									},
 								},
 							},

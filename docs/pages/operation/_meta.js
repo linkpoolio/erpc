@@ -2,6 +2,9 @@ module.exports = {
 	"url": {
 		title: "URL",
 	},
+	"websocket": {
+		title: "WebSocket",
+	},
 	"healthcheck": {
 		title: "Healthcheck",
 	},
@@ -22,5 +25,11 @@ module.exports = {
 	},
 	admin: {
 		title: "Admin",
+	},
+	cordoning: {
+		title: "Cordoning",
+	},
+	cli: {
+		title: "CLI & env vars",
 	}
 };

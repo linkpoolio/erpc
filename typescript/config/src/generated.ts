@@ -15,6 +15,39 @@ import type {
 } from "./types"
 
 //////////
+// source: adaptive_duration.go
+
+/**
+ * AdaptiveDuration describes a duration that may be static, derived from a
+ * per-method latency quantile, or both. It's the reusable building block
+ * for any failsafe knob that wants "fixed base + adaptive component
+ * clamped between min/max" semantics — currently consensus wait caps,
+ * with timeout/hedge supporting it as an alternative entry-point.
+ * Resolution rules:
+ *   final = Base + adaptive
+ * where `adaptive` is:
+ *   - `qt.GetQuantile(Quantile)` when Quantile > 0 and quantile data exists
+ *   - `Min` (the floor) when Quantile > 0 but quantile data is cold (no
+ *     observations yet) — this gives a sensible non-zero cap immediately
+ *     after boot
+ *   - `0` when Quantile is unset
+ * After `Base + adaptive`, the result is clamped to [Min, Max] when those
+ * are set. A nil or all-zero AdaptiveDuration returns 0 (the caller treats
+ * that as "no cap" / "disabled").
+ * Wire format accepts both shorthand and object form:
+ * 	caps: 500ms                                   # shorthand: Base only
+ * 	caps: { base: 500ms }                         # explicit Base
+ * 	caps: { quantile: 0.5, min: 5ms, max: 1s }    # quantile with bounds
+ * 	caps: { base: 100ms, quantile: 0.9, max: 2s } # combined
+ */
+export interface AdaptiveDuration {
+  base?: Duration;
+  quantile?: number /* float64 */;
+  min?: Duration;
+  max?: Duration;
+}
+
+//////////
 // source: architecture_evm.go
 
 export const UpstreamTypeEvm: UpstreamType = "evm";
@@ -116,6 +149,13 @@ export interface ServerConfig {
   httpPort?: number /* int */; // Deprecated: use HttpPortV4
   httpPortV4?: number /* int */;
   httpPortV6?: number /* int */;
+  grpcEnabled?: boolean;
+  grpcHostV4?: string;
+  grpcPortV4?: number /* int */;
+  grpcHostV6?: string;
+  grpcPortV6?: number /* int */;
+  grpcMaxRecvMsgSize?: number /* int */;
+  grpcMaxSendMsgSize?: number /* int */;
   maxTimeout?: Duration;
   readTimeout?: Duration;
   writeTimeout?: Duration;
@@ -128,7 +168,35 @@ export interface ServerConfig {
   trustedIPForwarders?: string[];
   trustedIPHeaders?: string[];
   responseHeaders?: { [key: string]: string};
+  /**
+   * ExecutionHeaders controls the per-request diagnostic headers
+   * (X-ERPC-Attempts, X-ERPC-Upstreams-Tried, etc.) that expose how
+   * eRPC routed and resolved each request. Defaults to "all" — set
+   * "summary" to keep only counters, or "off" to disable entirely
+   * (useful for low-latency / bandwidth-constrained clients).
+   */
+  executionHeaders?: ExecutionHeadersMode;
 }
+/**
+ * ExecutionHeadersMode controls how much per-request execution detail is
+ * exposed in HTTP response headers.
+ */
+export type ExecutionHeadersMode = string;
+/**
+ * ExecutionHeadersAll emits the full set: counters + per-upstream
+ * trace (upstream IDs, outcomes, reasons, durations). Default.
+ */
+export const ExecutionHeadersAll: ExecutionHeadersMode = "all";
+/**
+ * ExecutionHeadersSummary emits only the counter triplet
+ * (X-ERPC-Attempts/Retries/Hedges) + the cache-hit / final-upstream
+ * markers. Skips the (potentially large) per-attempt slice headers.
+ */
+export const ExecutionHeadersSummary: ExecutionHeadersMode = "summary";
+/**
+ * ExecutionHeadersOff disables all X-ERPC-* diagnostic headers.
+ */
+export const ExecutionHeadersOff: ExecutionHeadersMode = "off";
 export interface HealthCheckConfig {
   mode?: HealthCheckMode;
   auth?: AuthConfig;
@@ -289,6 +357,8 @@ export interface ConnectorConfig {
   dynamodb?: DynamoDBConnectorConfig;
   postgresql?: PostgreSQLConnectorConfig;
   grpc?: GrpcConnectorConfig;
+  failsafeForGets?: (FailsafeConfig | undefined)[];
+  failsafeForSets?: (FailsafeConfig | undefined)[];
 }
 export interface GrpcConnectorConfig {
   bootstrap?: string;
@@ -369,48 +439,44 @@ export interface ProjectConfig {
   networkDefaults?: NetworkDefaults;
   networks?: (NetworkConfig | undefined)[];
   rateLimitBudget?: string;
-  scoreMetricsWindowSize?: Duration;
-  scoreRefreshInterval?: Duration;
-  /**
-   * RoutingStrategy selects the upstream ordering algorithm.
-   * "score-based" (default): penalty-based sticky routing.
-   * "round-robin": time-rotating equal distribution across upstreams.
-   */
-  routingStrategy?: string;
-  /**
-   * ScoreGranularity controls whether penalties are computed per-upstream or per-method.
-   * "upstream" (default): one penalty across all methods using aggregate metrics.
-   * "method": separate penalty per (upstream, method) pair.
-   */
-  scoreGranularity?: string;
-  /**
-   * ScorePenaltyDecayRate is the fraction of previous penalty retained per refresh tick (0..1).
-   * Lower = faster forgetting. At 0.85 with 30s ticks a penalty halves in ~2 minutes.
-   * Use a negative value (e.g. -1) to disable EMA memory entirely (instant penalty = no decay).
-   */
-  scorePenaltyDecayRate?: number /* float64 */;
-  /**
-   * ScoreSwitchHysteresis prevents primary flip-flop: the challenger's penalty
-   * must be at least this fraction lower than the current primary's penalty to
-   * trigger a switch (0..1). For example 0.10 means 10% better. Negative disables stickiness.
-   */
-  scoreSwitchHysteresis?: number /* float64 */;
-  /**
-   * ScoreMinSwitchInterval is the cooldown between primary upstream switches.
-   */
-  scoreMinSwitchInterval?: Duration;
-  /**
-   * ScoreMetricsMode controls label cardinality for upstream score metrics for this project.
-   * Allowed values:
-   * - "compact": emit compact series by setting upstream and category labels to 'n/a'
-   * - "detailed": emit full project/vendor/network/upstream/category series
-   */
-  scoreMetricsMode?: string;
-  healthCheck?: DeprecatedProjectHealthCheckConfig;
   /**
    * Configure user agent tracking at the project level
    */
   userAgentMode?: UserAgentTrackingMode;
+  forwardHeaders?: string[];
+  ignoreMethods?: string[];
+  allowMethods?: string[];
+  /**
+   * ScoreMetricsWindowSize is the tumbling window the per-upstream
+   * health tracker uses for its rolling counters (errorRate, p50/p70/
+   * p95 latency, throttledRate, misbehaviorRate). At each tick the
+   * counters reset and start re-accumulating, so this knob effectively
+   * controls how fast a degraded upstream's metrics start reflecting
+   * the new reality. Short windows (e.g. 30s) react quickly but give
+   * noisier ranking; long windows (5–10m) give stable averages but
+   * hide spikes for longer. Defaults to 10m when zero — production
+   * systems typically leave it default; the eRPC simulator overrides
+   * to 30s so knob changes show up in the UI within seconds.
+   */
+  scoreMetricsWindowSize?: Duration;
+}
+/**
+ * LegacyProjectFields collects the deprecated project-level scoring +
+ * routing keys. The translator inspects these to synthesize a
+ * `selectionPolicy.eval` for each network and to emit deprecation
+ * warnings. All fields are zero-valued for a clean modern config.
+ * `scoreMetricsWindowSize` was previously listed here as inert; it is
+ * now a first-class field on ProjectConfig (above) — operators
+ * control the health tracker window directly.
+ */
+export interface LegacyProjectFields {
+  routingStrategy?: string;
+  scoreGranularity?: string;
+  scorePenaltyDecayRate?: number /* float64 */;
+  scoreSwitchHysteresis?: number /* float64 */;
+  scoreMinSwitchInterval?: Duration;
+  scoreMetricsMode?: string;
+  scoreRefreshInterval?: Duration;
 }
 /**
  * UserAgentTrackingMode controls how user agents are recorded for metrics/labels
@@ -459,7 +525,24 @@ export interface ProviderConfig {
 export interface UpstreamConfig {
   id?: string;
   type?: TsUpstreamType;
-  group?: string;
+  /**
+   * Tags is the single canonical user-applied label set. Convention is
+   * `<dimension>:<value>` so a single upstream can carry orthogonal labels:
+   *   tags:
+   *     - tier:main               # used by .preferTag for tiering
+   *     - region:us-east          # used by .spreadAcrossTags('region:')
+   *     - sequencer:op-base       # shared-fate label
+   * Bare strings (no prefix) work too. Patterns supported by every
+   * stdlib tag method: glob (`*`, `?`) and `!negation`.
+   * Tier convention: `tier:fallback` declares a fallback-tier upstream
+   * (matches the long-standing eRPC convention; the default policy
+   * looks for `!tier:fallback` as the primary tier).
+   * The legacy `group: X` / `cohort: Y` YAML keys are accepted at
+   * load time only — UnmarshalYAML rewrites them as `tier:X` /
+   * `cohort:Y` tags and forgets them. There is no Go-level Group or
+   * Cohort field; programmatic code uses Tags directly.
+   */
+  tags?: string[];
   vendorName?: string;
   endpoint?: string;
   evm?: EvmUpstreamConfig;
@@ -470,17 +553,105 @@ export interface UpstreamConfig {
   failsafe?: (FailsafeConfig | undefined)[];
   rateLimitBudget?: string;
   rateLimitAutoTune?: RateLimitAutoTuneConfig;
-  routing?: RoutingConfig;
   shadow?: ShadowUpstreamConfig;
+  /**
+   * Routing holds per-upstream routing hints consumed by the selection
+   * policy. `scoreMultipliers` bias this upstream's rank inside
+   * `sortByScore` (see SelectionPolicyConfig): the engine resolves the
+   * matching entry for each (network, method, finality) tick and exposes
+   * the resulting weight map to the eval function as `u.scoreMultipliers`.
+   * When the upstream omits its own `routing` block, `ApplyDefaults`
+   * inherits the project-level `upstreamDefaults.routing` (all-or-nothing,
+   * matching the Tags inheritance pattern).
+   */
+  routing?: UpstreamRoutingConfig;
 }
 /**
- * Define a type alias to avoid recursion
+ * UpstreamRoutingConfig holds per-upstream routing hints. Today this is
+ * the home of `scoreMultipliers` (per-upstream weight overrides folded
+ * into `sortByScore`) and `probe` (per-upstream opt-out for the
+ * selection policy's `probeExcluded` shadow-mirror traffic).
+ */
+export interface UpstreamRoutingConfig {
+  /**
+   * ScoreMultipliers biases this upstream's rank. Each entry is a
+   * matcher (network/method/finality) plus weight overrides; the engine
+   * resolves the first matching entry per tick and hands it to the eval
+   * function as `u.scoreMultipliers`. `sortByScore` merges it over the
+   * base weights by default (see its `multipliers` option).
+   */
+  scoreMultipliers?: (ScoreMultiplierConfig | undefined)[];
+  /**
+   * ScoreLatencyQuantile selects which response-time quantile feeds the
+   * score (e.g. 0.9 → p90). When unset, the policy's own
+   * `sortByScore({ latencyQuantile })` (default p70) applies.
+   */
+  scoreLatencyQuantile?: number /* float64 */;
+  /**
+   * Probe gates whether the selection policy's `probeExcluded` step
+   * may shadow-mirror real requests to THIS upstream when it's
+   * currently in the excluded set. `"on"` (default) opts in; `"off"`
+   * disables probing entirely — the upstream stays excluded
+   * permanently once predicates trip until an operator intervenes
+   * (manual cordon/uncordon, or until the predicate stops matching
+   * via state-poller-driven structural metrics like head lag). Use
+   * `"off"` for pay-per-call vendors where shadow traffic eats quota.
+   */
+  probe?: ProbeMode | "on" | "off";
+}
+/**
+ * ProbeMode is the per-upstream `routing.probe` enum.
+ */
+export type ProbeMode = string;
+/**
+ * ProbeModeOn — default. The selection policy may mirror sampled
+ * real requests to this upstream while it's excluded so it
+ * accumulates fresh tracker samples for natural re-admission.
+ */
+export const ProbeModeOn: ProbeMode = "on";
+/**
+ * ProbeModeOff — never mirror. Upstream stays excluded after
+ * predicates trip; only structural signals (head lag, etc.) can
+ * drive re-admission.
+ */
+export const ProbeModeOff: ProbeMode = "off";
+/**
+ * ScoreMultiplierConfig is one per-upstream weight override. The matcher
+ * fields (network/method/finality) scope the entry — leave them empty (or
+ * `"*"`) for an entry that applies to every request. Weight fields are
+ * pointers so "unset" is distinct from "zero": an unset weight inherits
+ * from the policy's base weights (merge mode), a zero weight removes that
+ * metric's contribution. `overall` scales the upstream's FINAL score — a
+ * preference dial where >1 prefers this upstream and <1 avoids it.
+ */
+export interface ScoreMultiplierConfig {
+  network?: string;
+  method?: string;
+  finality?: DataFinalityState[];
+  overall?: number /* float64 */;
+  errorRate?: number /* float64 */;
+  respLatency?: number /* float64 */;
+  throttledRate?: number /* float64 */;
+  blockHeadLag?: number /* float64 */;
+  finalizationLag?: number /* float64 */;
+  misbehaviors?: number /* float64 */;
+  /**
+   * TotalRequests is accepted for backward compatibility but no longer
+   * influences scoring (the score is computed from rolling-window rates,
+   * not absolute request counts).
+   */
+  totalRequests?: number /* float64 */;
+}
+/**
+ * Strict-schema shadow: inlines the canonical config and adds the
+ * deprecated yaml-only keys. yaml v3 ignores `json:"-"` so this is safe.
  */
 /**
- * If that fails, try the old format with single failsafe object
+ * Legacy shape: `failsafe:` as a single object instead of a list.
  */
 export interface ShadowUpstreamConfig {
   enabled: boolean;
+  sampleRate?: number /* float64 */;
   ignoreFields?: { [key: string]: string[]};
 }
 export interface UpstreamIntegrityConfig {
@@ -491,24 +662,8 @@ export interface UpstreamIntegrityEthGetBlockReceiptsConfig {
   checkLogIndexStrictIncrements?: boolean;
   checkLogsBloom?: boolean;
 }
-export interface RoutingConfig {
-  scoreMultipliers: (ScoreMultiplierConfig | undefined)[];
-  scoreLatencyQuantile?: number /* float64 */;
-}
-export interface ScoreMultiplierConfig {
-  network: string;
-  method: string;
-  finality?: DataFinalityState[];
-  overall?: number /* float64 */;
-  errorRate?: number /* float64 */;
-  respLatency?: number /* float64 */;
-  totalRequests?: number /* float64 */;
-  throttledRate?: number /* float64 */;
-  blockHeadLag?: number /* float64 */;
-  finalizationLag?: number /* float64 */;
-  misbehaviors?: number /* float64 */;
-}
-export type Alias = UpstreamConfig;
+export type UJAlias = UpstreamConfig;
+export type UYAlias = UpstreamConfig;
 export interface RateLimitAutoTuneConfig {
   enabled?: boolean;
   adjustmentPeriod: Duration;
@@ -529,9 +684,22 @@ export interface JsonRpcUpstreamConfig {
 export interface EvmUpstreamConfig {
   chainId: number /* int64 */;
   statePollerInterval?: Duration;
+  /**
+   * StatePollerDebounce overrides the debounce interval for the state poller.
+   * When 0 (default), the interval is dynamically inferred from the chain's
+   * observed block time, falling back to the network-level
+   * FallbackStatePollerDebounce, then to a 1s floor.
+   */
   statePollerDebounce?: Duration;
   blockAvailability?: EvmBlockAvailabilityConfig;
   getLogsAutoSplittingRangeThreshold?: number /* int64 */;
+  /**
+   * TraceFilterAutoSplittingRangeThreshold proactively splits trace_filter and
+   * arbtrace_filter requests whose block range exceeds this value into contiguous
+   * sub-requests executed concurrently and merged before returning. Zero disables
+   * the feature.
+   */
+  traceFilterAutoSplittingRangeThreshold?: number /* int64 */;
   skipWhenSyncing?: boolean;
   integrity?: UpstreamIntegrityConfig;
   /**
@@ -542,6 +710,15 @@ export interface EvmUpstreamConfig {
    * @deprecated: should be removed in a future release
    */
   maxAvailableRecentBlocks?: number /* int64 */;
+  queryShim?: EvmQueryShimConfig;
+}
+export interface EvmQueryShimConfig {
+  enabled?: boolean;
+  allowedMethods?: string[];
+  concurrency?: number /* int */;
+  maxBlockRange?: number /* int64 */;
+  maxLimit?: number /* int */;
+  defaultLimit?: number /* int */;
 }
 /**
  * EvmBlockAvailability defines optional lower/upper block availability expressions for an upstream.
@@ -578,6 +755,25 @@ export interface FailsafeConfig {
   hedge?: HedgePolicyConfig;
   consensus?: ConsensusPolicyConfig;
 }
+/**
+ * NetworkFailsafeConfig is the scope-specific alias for network-level
+ * failsafe policies. By convention, CircuitBreaker is not used at this
+ * scope (use upstream-scope breakers instead); validation enforces this.
+ */
+export type NetworkFailsafeConfig = FailsafeConfig;
+/**
+ * UpstreamFailsafeConfig is the scope-specific alias for per-upstream
+ * failsafe policies. By convention, Consensus is not used at this
+ * scope (consensus is a network-scope concern only); validation
+ * enforces this.
+ */
+export type UpstreamFailsafeConfig = FailsafeConfig;
+/**
+ * CacheFailsafeConfig is the scope-specific alias for cache-connector
+ * failsafe policies. Hedge.Quantile is not allowed here (no per-method
+ * quantile data on cache reads); validation enforces this.
+ */
+export type CacheFailsafeConfig = FailsafeConfig;
 export interface RetryPolicyConfig {
   maxAttempts: number /* int */;
   delay?: Duration;
@@ -617,15 +813,29 @@ export interface CircuitBreakerPolicyConfig {
   successThresholdCount: number /* uint */;
   successThresholdCapacity: number /* uint */;
 }
+/**
+ * TimeoutPolicyConfig is the timeout policy. Duration is the unified
+ * AdaptiveDuration — a scalar shorthand ("5s") or an object form
+ * ({base, quantile, min, max}) for adaptive caps driven by per-method
+ * latency quantiles.
+ * Wire format also accepts the legacy flat form
+ * (`duration: 5s, quantile: 0.99, minDuration: 200ms, maxDuration: 10s`)
+ * — siblings get folded into Duration at YAML/JSON unmarshal time.
+ */
 export interface TimeoutPolicyConfig {
-  duration?: Duration;
+  duration?: Duration | AdaptiveDuration;
 }
+/**
+ * HedgePolicyConfig is the hedge policy. Delay is the unified
+ * AdaptiveDuration — scalar shorthand ("100ms") or object form
+ * ({base, quantile, min, max}) for quantile-driven hedge timing.
+ * Wire format also accepts the legacy flat form
+ * (`delay: 100ms, quantile: 0.95, minDelay: 50ms, maxDelay: 2s`) —
+ * siblings get folded into Delay at YAML/JSON unmarshal time.
+ */
 export interface HedgePolicyConfig {
-  delay?: Duration;
+  delay?: Duration | AdaptiveDuration;
   maxCount: number /* int */;
-  quantile?: number /* float64 */;
-  minDelay?: Duration;
-  maxDelay?: Duration;
 }
 export type ConsensusLowParticipantsBehavior = string;
 export const ConsensusLowParticipantsBehaviorReturnError: ConsensusLowParticipantsBehavior = "returnError";
@@ -664,6 +874,52 @@ export interface ConsensusPolicyConfig {
    * Default is false (normal behavior - cancel remaining requests on short-circuit).
    */
   fireAndForget?: boolean;
+  /**
+   * MaxWaitOnResult caps how long consensus waits for additional participants
+   * AFTER at least one non-empty response has arrived. Use this to bound
+   * p99 latency when most upstreams are fast but one is a slow straggler:
+   * once a real answer is in hand, give the rest at most this long to
+   * confirm or dispute, then resolve with what we have.
+   * Accepts a duration scalar ("200ms") or an AdaptiveDuration object
+   * ({base, quantile, min, max}) for adaptive caps driven by per-method
+   * latency quantiles. Defaults are applied when consensus is configured
+   * but this field is omitted — see common/defaults.go.
+   */
+  maxWaitOnResult?: Duration | AdaptiveDuration;
+  /**
+   * MaxWaitOnEmpty caps how long consensus waits for additional participants
+   * AFTER the first response (of any kind — empty, error, or non-empty)
+   * has arrived. Typically set larger than MaxWaitOnResult because an
+   * operator is more patient when no useful data is in hand yet.
+   * Same shape as MaxWaitOnResult; defaults applied when consensus is set.
+   */
+  maxWaitOnEmpty?: Duration | AdaptiveDuration;
+  /**
+   * RequiredParticipants enforces a minimum number of consensus
+   * participants carrying a given tag. Each entry says "at least
+   * `minParticipants` of the upstreams that participate must match
+   * `tag`". The engine front-loads enough tag-matching upstreams into
+   * the participant set so the first `maxParticipants` drawn satisfy
+   * every entry — without changing `maxParticipants` itself.
+   * Best-effort and governed by the EXISTING consensus behaviors: if a
+   * required group has fewer healthy upstreams than requested (or the
+   * quotas can't all fit within `maxParticipants`), consensus simply
+   * runs with what it can promote and the resulting participation is
+   * handled by `lowParticipantsBehavior` / `agreementThreshold` exactly
+   * like any other low-participation tick. Empty (default) = disabled.
+   */
+  requiredParticipants?: (ConsensusRequiredParticipant | undefined)[];
+}
+/**
+ * ConsensusRequiredParticipant is one tag-quota entry for
+ * `consensus.requiredParticipants`. `Tag` is a glob pattern (`*`, `?`)
+ * matched against each upstream's `tags`; `MinParticipants` is the minimum
+ * number of matching upstreams that must be in the consensus participant
+ * set. A single upstream can satisfy multiple entries it matches.
+ */
+export interface ConsensusRequiredParticipant {
+  tag: string;
+  minParticipants: number /* int */;
 }
 export type MisbehaviorsDestinationType = string;
 export const MisbehaviorsDestinationTypeFile: MisbehaviorsDestinationType = "file";
@@ -763,9 +1019,6 @@ export interface ProxyPoolConfig {
   id: string;
   urls: string[];
 }
-export interface DeprecatedProjectHealthCheckConfig {
-  scoreMetricsWindowSize: Duration;
-}
 export interface MethodsConfig {
   preserveDefaultMethods?: boolean;
   definitions?: { [key: string]: CacheMethodConfig | undefined};
@@ -780,6 +1033,36 @@ export interface NetworkConfig {
   alias?: string;
   methods?: MethodsConfig;
   multiplexing?: boolean;
+  staticResponses?: (StaticResponseConfig | undefined)[];
+}
+/**
+ * StaticResponseConfig declares a canned JSON-RPC response for a specific
+ * (method, params) pair on a network. When an inbound request matches, the
+ * configured response is returned immediately and no upstream is contacted.
+ * Useful for chains that deviate from client assumptions (for example, chains
+ * whose genesis block is not 0) where probing upstreams would yield errors
+ * or inconsistent data.
+ */
+export interface StaticResponseConfig {
+  method: string;
+  params?: any[];
+  response?: StaticResponseBodyConfig;
+}
+/**
+ * StaticResponseBodyConfig holds the JSON-RPC payload to serve. Exactly one
+ * of Result or Error must be set.
+ */
+export interface StaticResponseBodyConfig {
+  result?: any;
+  error?: StaticResponseErrorConfig;
+}
+/**
+ * StaticResponseErrorConfig mirrors a JSON-RPC error object.
+ */
+export interface StaticResponseErrorConfig {
+  code: number /* int */;
+  message: string;
+  data?: any;
 }
 /**
  * Define a type alias to avoid recursion
@@ -793,6 +1076,7 @@ export interface DirectiveDefaultsConfig {
   skipCacheRead?: any;
   useUpstream?: string;
   skipInterpolation?: boolean;
+  skipConsensus?: boolean;
   /**
    * Validation: Block Integrity
    */
@@ -856,6 +1140,17 @@ export interface EvmNetworkConfig {
   getLogsSplitOnError?: boolean;
   getLogsSplitConcurrency?: number /* int */;
   /**
+   * TraceFilterSplitOnError controls reactive splitting for trace_filter and
+   * arbtrace_filter requests when the upstream returns a range-too-large error.
+   * Nil disables the feature.
+   */
+  traceFilterSplitOnError?: boolean;
+  /**
+   * TraceFilterSplitConcurrency caps in-flight sub-requests when a trace_filter
+   * or arbtrace_filter request is split. Zero falls back to 10.
+   */
+  traceFilterSplitConcurrency?: number /* int */;
+  /**
    * EnforceBlockAvailability controls whether the network should enforce per-upstream
    * block availability bounds (upper/lower) for methods by default. Method-level config may override.
    * When nil or true, enforcement is enabled.
@@ -877,6 +1172,22 @@ export interface EvmNetworkConfig {
    * Default includes common point-lookup methods like eth_getBlockByNumber, eth_getTransactionByHash, etc.
    */
   markEmptyAsErrorMethods?: string[];
+  /**
+   * DynamicBlockTimeDebounceMultiplier scales the EMA-estimated block time to derive
+   * the debounce interval for block polling. A value of 0.7 means debounce = 70% of
+   * the estimated block time, preferring fresher data at the cost of slightly more
+   * polling. Lower values reduce staleness risk; higher values reduce RPC calls.
+   * Default: 0.7 (30% under the estimated block time).
+   */
+  dynamicBlockTimeDebounceMultiplier?: number /* float64 */;
+  /**
+   * BlockUnavailableDelayMultiplier scales the EMA-estimated block time to derive
+   * the retry delay when all upstreams return ErrUpstreamBlockUnavailable. When the
+   * dynamic block time is known, the delay is blockTime * this multiplier.
+   * Falls back to the static RetryPolicyConfig.BlockUnavailableDelay when block time
+   * is not yet available. Default: 0.8.
+   */
+  blockUnavailableDelayMultiplier?: number /* float64 */;
   /**
    * IdempotentTransactionBroadcast enables idempotency handling for eth_sendRawTransaction.
    * When enabled (default), "already known" and verified "nonce too low" errors are converted
@@ -903,10 +1214,78 @@ export interface EvmIntegrityConfig {
    */
   enforceNonNullTaggedBlocks?: boolean;
 }
+/**
+ * EvalScope picks the grain at which the selection policy evaluates AND
+ * at which the health tracker stores per-upstream metrics. One knob
+ * covers what `evalPerMethod` + `evalPerFinality` used to cover as two
+ * bools — and pulls the tracker's metric grain in lockstep so a
+ * predicate like `errorRateAbove(0.5)` in a (method, finality)-grained
+ * slot sees genuinely (method, finality)-specific error rate, not the
+ * per-method aggregate.
+ * Values are kebab-case strings so they round-trip through YAML / JSON
+ * / Go enum literals cleanly. The TS SDK exports the same names in
+ * CAPITAL_SNAKE_CASE with these same string values, so `evalScope:
+ * NETWORK` in a TS config and `evalScope: network` in a YAML config
+ * produce identical Go state.
+ */
+export type EvalScope = string;
+/**
+ * EvalScopeNetwork — single slot per network. Methods + finalities
+ * share. Default. Lowest cardinality + lowest tracker memory.
+ */
+export const EvalScopeNetwork: EvalScope = "network";
+/**
+ * EvalScopeNetworkMethod — slot per (network, method). Finalities
+ * share. Useful when one upstream is fast on `eth_call` but slow on
+ * `trace_filter`.
+ */
+export const EvalScopeNetworkMethod: EvalScope = "network-method";
+/**
+ * EvalScopeNetworkFinality — slot per (network, finality). Methods
+ * share. Useful when realtime reads weight freshness differently
+ * from finalized reads.
+ */
+export const EvalScopeNetworkFinality: EvalScope = "network-finality";
+/**
+ * EvalScopeNetworkMethodFinality — slot per (network, method,
+ * finality). Most granular routing. Cardinality scales linearly;
+ * each slot's ticker only spins up after the first request for
+ * that bucket lands.
+ */
+export const EvalScopeNetworkMethodFinality: EvalScope = "network-method-finality";
+/**
+ * SelectionPolicyConfig declares the per-network upstream selection policy.
+ * The eval function is JavaScript that receives `upstreams` and `ctx` and
+ * returns the ordered list of upstreams that should serve traffic for the
+ * network/method scope. The chainable std-lib (see internal/policy/stdlib)
+ * provides the building blocks (sortByScore, removeByLag, stickyPrimary,
+ * probeExcluded, etc.) — see specs/selection-policy/feature.md.
+ */
 export interface SelectionPolicyConfig {
   evalInterval?: Duration;
-  evalFunction?: SelectionPolicyEvalFunction | undefined;
-  evalPerMethod?: boolean;
+  /**
+   * EvalScope picks the slot grain — and the matching tracker grain
+   * (see `EvalScope` doc). Default `network` (one slot per network).
+   * Tighter scopes let predicates like `errorRateAbove(0.5)` see
+   * genuinely (method, finality)-specific health.
+   */
+  evalScope?: EvalScope | "network" | "network-method" | "network-finality" | "network-method-finality";
+  evalTimeout?: Duration;
+  /**
+   * EvalFunc is the per-tick evaluation function. In YAML it's a JS
+   * source string; in TS configs it's a real arrow function compiled
+   * into `CompiledProgram` at config load.
+   * Signature: `(upstreams, ctx) => Upstream[]`.
+   * See specs/selection-policy/feature.md for the stdlib reference.
+   */
+  evalFunc?: SelectionPolicyEvalFunction | string;
+}
+/**
+ * LegacySelectionPolicyFields mirrors the deprecated keys that used to
+ * live on SelectionPolicyConfig. None survive translation.
+ */
+export interface LegacySelectionPolicyFields {
+  evalFunction?: string;
   resampleExcluded?: boolean;
   resampleInterval?: Duration;
   resampleCount?: number /* int */;
@@ -1004,6 +1383,20 @@ export interface MetricsConfig {
   port?: number /* int */;
   errorLabelMode?: LabelMode;
   histogramBuckets?: string;
+  /**
+   * HistogramDropLabels removes these labels from every histogram. Counters
+   * and gauges are unaffected. Useful to cap per-instance /metrics response
+   * size when high-cardinality labels (e.g. "user") push a scrape past the
+   * managed scraper's sample/body limits.
+   */
+  histogramDropLabels?: string[];
+  /**
+   * HistogramLabelOverrides re-adds labels for specific histograms even if
+   * they appear in HistogramDropLabels. Key is the metric Name (without the
+   * "erpc_" namespace prefix), e.g. "network_request_duration_seconds".
+   * Value is the list of label names to keep for that metric.
+   */
+  histogramLabelOverrides?: { [key: string]: string[]};
 }
 /**
  * RateLimitStoreConfig defines where rate limit counters are stored
@@ -1014,6 +1407,32 @@ export interface RateLimitStoreConfig {
   cacheKeyPrefix?: string;
   nearLimitRatio?: number /* float32 */;
 }
+/**
+ * tsFunctionSentinelPrefix marks a SelectionPolicy.EvalFunc whose actual
+ * implementation lives as a real sobek function in `globalThis.__erpcFns`
+ * (populated by running `Config.UserScript` inside the policy-engine pool
+ * runtime). The suffix is the function's lookup id. Sentinels NEVER hit
+ * `sobek.Compile` and the function is never stringified — when the engine
+ * needs to evaluate, it pulls the runtime-native function out of the
+ * registry and calls it directly. This preserves closures + module-level
+ * helpers that the user wrote in the TS config alongside the function.
+ */
+/**
+ * tsLoaderWalker is JS that runs INSIDE the user script. After the user's
+ * `createConfig(...)` builds the default export, the walker:
+ *   - assigns a stable sequential id to each function-typed leaf
+ *     in the default export's object tree;
+ *   - registers that function on `globalThis.__erpcFns[id]` so the
+ *     engine can look it up natively in this runtime;
+ *   - stamps `fn.__erpcFnId = id` on the function value so the
+ *     LOAD-time JSON.stringify replacer can substitute the sentinel
+ *     string `"__ts_fn__:<id>"` into the serialized form (which then
+ *     becomes the value of `SelectionPolicyConfig.EvalFunc` in Go).
+ * The walk is order-deterministic, so the same user script produces the
+ * same ids in every pool runtime that subsequently runs it. That's what
+ * keeps the load-time sentinel ids and the pool-runtime registry ids in
+ * lockstep without sharing state across runtimes.
+ */
 
 //////////
 // source: data.go
@@ -1040,6 +1459,16 @@ export const DataFinalityStateRealtime: DataFinalityState = 2;
  * Most often it is safe to cache this data for longer as they're access when block hash is provided directly.
  */
 export const DataFinalityStateUnknown: DataFinalityState = 3;
+/**
+ * DataFinalityStateAll is the internal wildcard sentinel used by the
+ * health tracker to key its cross-finality aggregate rollups. NOT a
+ * valid user-facing finality — never set on a request, never returned
+ * from `Finality()`. Lives here so the tracker (health/) and the
+ * policy engine (internal/policy/) can both reference it without a
+ * cycle. Negative-valued so it sorts before any real finality bucket
+ * and doesn't collide with the iota-based enum values.
+ */
+export const DataFinalityStateAll: DataFinalityState = -1;
 export type CacheEmptyBehavior = number /* int */;
 export const CacheEmptyBehaviorIgnore: CacheEmptyBehavior = 0;
 export const CacheEmptyBehaviorAllow: CacheEmptyBehavior = 1;
@@ -1069,6 +1498,158 @@ export type JsonRpcErrorExtractor = any;
 export type JsonRpcErrorExtractorFunc = any;
 
 //////////
+// source: exec_state.go
+
+/**
+ * UpstreamAttemptOutcome enumerates the possible per-attempt outcomes
+ * recorded against an upstream. The set is closed: every attempt ends
+ * in exactly one of these.
+ */
+export type UpstreamAttemptOutcome = string;
+export const UpstreamOutcomeSuccess: UpstreamAttemptOutcome = "success";
+export const UpstreamOutcomeEmpty: UpstreamAttemptOutcome = "empty";
+export const UpstreamOutcomeTransportError: UpstreamAttemptOutcome = "transport_error";
+export const UpstreamOutcomeServerError: UpstreamAttemptOutcome = "server_error";
+export const UpstreamOutcomeClientError: UpstreamAttemptOutcome = "client_error";
+export const UpstreamOutcomeRateLimited: UpstreamAttemptOutcome = "rate_limited";
+export const UpstreamOutcomeMissingData: UpstreamAttemptOutcome = "missing_data";
+export const UpstreamOutcomeExecRevert: UpstreamAttemptOutcome = "exec_revert";
+export const UpstreamOutcomeBlockUnavailable: UpstreamAttemptOutcome = "block_unavailable";
+export const UpstreamOutcomeBreakerOpen: UpstreamAttemptOutcome = "breaker_open";
+export const UpstreamOutcomeCancelled: UpstreamAttemptOutcome = "cancelled";
+export const UpstreamOutcomeTimeout: UpstreamAttemptOutcome = "timeout";
+export const UpstreamOutcomeSkipped: UpstreamAttemptOutcome = "skipped";
+/**
+ * UpstreamSelectionReason describes WHY a particular upstream was
+ * selected for a given attempt. Operators use this to debug skew in
+ * upstream-pick distribution (e.g. why is one upstream getting all
+ * the hedge fan-out?).
+ */
+export type UpstreamSelectionReason = string;
+export const SelectionReasonPrimary: UpstreamSelectionReason = "primary"; // initial pick
+export const SelectionReasonRetry: UpstreamSelectionReason = "retry"; // network-scope retry
+export const SelectionReasonHedge: UpstreamSelectionReason = "hedge"; // speculative hedge fan-out
+export const SelectionReasonConsensusSlot: UpstreamSelectionReason = "consensus_slot"; // one consensus participant
+export const SelectionReasonSweep: UpstreamSelectionReason = "sweep"; // try-all-upstreams iteration
+/**
+ * UpstreamAttempt is one (upstream, attempt) record. The executors
+ * append these as participants come and go so operators can answer
+ * "which upstreams were involved in this request, why were they
+ * chosen, and what happened to them?" without parsing trace data.
+ * Won is flipped to true by the executor when this attempt's response
+ * contributed to the final response returned to the client. For a
+ * non-consensus request that's exactly one attempt (the winning one);
+ * for consensus it's every participant whose vote landed in the
+ * winning agreement group.
+ */
+export interface UpstreamAttempt {
+  upstreamid: string;
+  vendorname: string;
+  startedat: any /* time.Time */;
+  duration: number /* time in nanoseconds (time.Duration) */;
+  outcome: UpstreamAttemptOutcome;
+  reason: UpstreamSelectionReason;
+  ishedge: boolean;
+  isretry: boolean;
+  won: boolean; // true when this attempt contributed to the response
+  attemptidx: number /* int */; // 0-based attempt index within the parent loop
+  errorcode: string; // ErrorCode string when Outcome is an error variant
+  errordetail: string; // free-form short description (truncated)
+}
+/**
+ * ExecState centralizes the per-request execution counters and the
+ * per-upstream attempt log. Created lazily on first access via
+ * (*NormalizedRequest).ExecState().
+ * All counters are atomic; the struct itself is safe for concurrent use.
+ * Counter model — every executor increments its OWN scope only.
+ * Snapshot derives the totals so "forgot to increment the total" is
+ * impossible by construction. The derivation is NOT a flat sum because
+ * the scopes are nested: each network rotation triggers exactly one
+ * upstream invocation chain, so summing both would double-count
+ * physical attempts.
+ * 	total Attempts = UpstreamAttempts + CacheAttempts
+ * 	    (every physical call is counted at the deepest scope that
+ * 	    actually performed it — upstreams for HTTP, cache for connector
+ * 	    reads. NetworkAttempts is a separate rotation-count signal,
+ * 	    exposed as its own counter but NOT summed into the total.)
+ * 	total Retries = sum of UpstreamRetries + NetworkRetries + CacheRetries
+ * 	total Hedges  = sum of UpstreamHedges  + NetworkHedges  + CacheHedges
+ * 	    (retries and hedges ARE different events at each scope — an
+ * 	    upstream-scope retry retries the SAME upstream, a network-scope
+ * 	    retry rotates to a NEW upstream. Summing is correct.)
+ * Scope semantics:
+ *   - UpstreamAttempts: physical Forward calls to a single upstream's
+ *     transport (primary + retries + hedges within one upstream).
+ *   - NetworkAttempts: rotations across upstreams driven by the
+ *     network executor's retry / hedge / consensus loop. Each rotation
+ *     triggers one upstream invocation chain. Not summed into total.
+ *   - CacheAttempts: cache-connector reads/writes including
+ *     within-connector retries and hedges.
+ */
+export interface ExecState {
+  /**
+   * Per-scope counters. Each executor owns its OWN counter set and
+   * MUST NOT touch another scope's counters.
+   */
+  upstreamattempts: any /* atomic.Int32 */;
+  upstreamretries: any /* atomic.Int32 */;
+  upstreamhedges: any /* atomic.Int32 */;
+  networkattempts: any /* atomic.Int32 */;
+  networkretries: any /* atomic.Int32 */;
+  networkhedges: any /* atomic.Int32 */;
+  cacheattempts: any /* atomic.Int32 */;
+  cacheretries: any /* atomic.Int32 */;
+  cachehedges: any /* atomic.Int32 */;
+  /**
+   * ConsensusSlots counts how many consensus participants ran.
+   */
+  consensusslots: any /* atomic.Int32 */;
+  /**
+   * ConsensusDisputes counts dispute events.
+   */
+  consensusdisputes: any /* atomic.Int32 */;
+  /**
+   * ConsensusLowParticipants counts low-participant events.
+   */
+  consensuslowparticipants: any /* atomic.Int32 */;
+  startedat: any /* time.Time */;
+}
+/**
+ * ExecStateSnapshot is a plain-int view of ExecState for log/span
+ * labeling — captured at a point in time. Total Attempts/Retries/Hedges
+ * are derived as the sum of per-scope counters at snapshot time.
+ */
+export interface ExecStateSnapshot {
+  /**
+   * Totals (derived: Upstream + Network + Cache).
+   */
+  attempts: number /* int */;
+  retries: number /* int */;
+  hedges: number /* int */;
+  /**
+   * Per-scope counters (each executor's own bookkeeping).
+   */
+  upstreamattempts: number /* int */;
+  upstreamretries: number /* int */;
+  upstreamhedges: number /* int */;
+  networkattempts: number /* int */;
+  networkretries: number /* int */;
+  networkhedges: number /* int */;
+  cacheattempts: number /* int */;
+  cacheretries: number /* int */;
+  cachehedges: number /* int */;
+  consensusslots: number /* int */;
+  consensusdisputes: number /* int */;
+  consensuslowparticipants: number /* int */;
+  startedat: any /* time.Time */;
+}
+/**
+ * execStateOnce is embedded on NormalizedRequest to lazy-init the
+ * ExecState struct without making every request pay the allocation when
+ * the field is never accessed.
+ */
+
+//////////
 // source: network.go
 
 export type NetworkArchitecture = string;
@@ -1076,6 +1657,15 @@ export const ArchitectureEvm: NetworkArchitecture = "evm";
 export type Network = any;
 export type QuantileTracker = any;
 export type TrackedMetrics = any;
+
+//////////
+// source: timeout_func.go
+
+/**
+ * TimeoutFunc computes the timeout for a request. Returns nil when no
+ * timeout applies (caller skips context.WithTimeout).
+ */
+export type TimeoutFunc = any;
 
 //////////
 // source: upstream.go
@@ -1093,7 +1683,12 @@ export const ScopeNetwork: Scope = "network";
 export const ScopeUpstream: Scope = "upstream";
 export type UpstreamType = string;
 /**
- * HealthTracker is an interface for tracking upstream health metrics
+ * HealthTracker is an interface for tracking upstream health metrics.
+ * `finality` is the DataFinalityState the request resolved to —
+ * `DataFinalityStateAll` when the caller can't determine finality
+ * (legacy call sites, internal probes, batch retries). Cordon/Uncordon
+ * stay finality-agnostic because cordoning is an admin-level decision
+ * about an entire (upstream, method) pair, not a per-finality bucket.
  */
 export type HealthTracker = any;
 export type Upstream = any;

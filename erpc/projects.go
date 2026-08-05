@@ -10,6 +10,7 @@ import (
 	"github.com/erpc/erpc/architecture/evm"
 	"github.com/erpc/erpc/auth"
 	"github.com/erpc/erpc/common"
+	"github.com/erpc/erpc/internal/policy"
 	"github.com/erpc/erpc/telemetry"
 	"github.com/erpc/erpc/upstream"
 	"github.com/erpc/erpc/util"
@@ -23,6 +24,7 @@ type PreparedProject struct {
 	consumerAuthRegistry *auth.AuthRegistry
 	rateLimitersRegistry *upstream.RateLimitersRegistry
 	upstreamsRegistry    *upstream.UpstreamsRegistry
+	policyEngine         *policy.Engine
 	cfgMu                sync.RWMutex
 }
 
@@ -108,7 +110,7 @@ func (p *PreparedProject) Forward(ctx context.Context, networkId string, nq *com
 	}
 	// Ensure project label is available for budget decision metrics by setting network on request early
 	nq.SetNetwork(network)
-	if err := p.acquireRateLimitPermit(ctx, nq); err != nil {
+	if err := p.AcquireRateLimitPermit(ctx, nq); err != nil {
 		common.SetTraceSpanError(span, err)
 		return nil, err
 	}
@@ -265,7 +267,7 @@ func (p *PreparedProject) doForward(ctx context.Context, network *Network, nq *c
 	return evm.HandleNetworkPostForward(ctx, network, nq, resp, err)
 }
 
-func (p *PreparedProject) acquireRateLimitPermit(ctx context.Context, req *common.NormalizedRequest) error {
+func (p *PreparedProject) AcquireRateLimitPermit(ctx context.Context, req *common.NormalizedRequest) error {
 	if p.Config.RateLimitBudget == "" {
 		return nil
 	}

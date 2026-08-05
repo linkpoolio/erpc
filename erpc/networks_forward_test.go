@@ -63,7 +63,7 @@ func TestNetwork_Forward_InfiniteLoopWithAllUpstreamsSkipping(t *testing.T) {
 		upsReg := upstream.NewUpstreamsRegistry(
 			ctx, logger, "testProject",
 			[]*common.UpstreamConfig{up1},
-			ssr, rlr, vr, pr, nil, mt, 1*time.Second, nil, nil,
+			ssr, rlr, vr, pr, nil, mt, nil,
 		)
 		upsReg.Bootstrap(ctx)
 		time.Sleep(100 * time.Millisecond)
@@ -76,6 +76,7 @@ func TestNetwork_Forward_InfiniteLoopWithAllUpstreamsSkipping(t *testing.T) {
 				Evm:          &common.EvmNetworkConfig{ChainId: 123},
 			},
 			rlr, upsReg, mt,
+			nil,
 		)
 		ntw.Bootstrap(ctx)
 		time.Sleep(100 * time.Millisecond)
@@ -146,7 +147,7 @@ func TestNetwork_Forward_InfiniteLoopWithAllUpstreamsSkipping(t *testing.T) {
 			Evm:           &common.EvmUpstreamConfig{ChainId: 123},
 		}
 
-		upr := upstream.NewUpstreamsRegistry(ctx, logger, "testProject", []*common.UpstreamConfig{up1}, ssr, rlr, vr, pr, nil, mt, 0, nil, nil)
+		upr := upstream.NewUpstreamsRegistry(ctx, logger, "testProject", []*common.UpstreamConfig{up1}, ssr, rlr, vr, pr, nil, mt, nil)
 		upr.Bootstrap(ctx)
 		time.Sleep(100 * time.Millisecond)
 		require.NoError(t, upr.PrepareUpstreamsForNetwork(ctx, util.EvmNetworkId(123)))
@@ -157,10 +158,11 @@ func TestNetwork_Forward_InfiniteLoopWithAllUpstreamsSkipping(t *testing.T) {
 				Architecture: common.ArchitectureEvm,
 				Evm:          &common.EvmNetworkConfig{ChainId: 123},
 				Failsafe: []*common.FailsafeConfig{
-					{Timeout: &common.TimeoutPolicyConfig{Duration: common.Duration(250 * time.Millisecond)}},
+					{Timeout: &common.TimeoutPolicyConfig{Duration: common.NewStaticDuration(250 * time.Millisecond)}},
 				},
 			},
 			rlr, upr, mt,
+			nil,
 		)
 		require.NoError(t, err)
 		require.NoError(t, ntw.Bootstrap(ctx))
@@ -265,8 +267,6 @@ func TestNetwork_Forward_InfiniteLoopWithAllUpstreamsSkipping(t *testing.T) {
 			pr,
 			nil,
 			mt,
-			1*time.Second,
-			nil,
 			nil,
 		)
 
@@ -291,7 +291,7 @@ func TestNetwork_Forward_InfiniteLoopWithAllUpstreamsSkipping(t *testing.T) {
 				Failsafe: []*common.FailsafeConfig{
 					{
 						Timeout: &common.TimeoutPolicyConfig{
-							Duration: common.Duration(1 * time.Second), // Timeout to prevent actual infinite loop
+							Duration: common.NewStaticDuration(1 * time.Second), // Timeout to prevent actual infinite loop
 						},
 					},
 				},
@@ -299,6 +299,7 @@ func TestNetwork_Forward_InfiniteLoopWithAllUpstreamsSkipping(t *testing.T) {
 			rlr,
 			upsReg,
 			mt,
+			nil,
 		)
 		require.NoError(t, err)
 
@@ -446,8 +447,6 @@ func TestNetwork_Forward_InfiniteLoopWithAllUpstreamsSkipping(t *testing.T) {
 			pr,
 			nil,
 			mt,
-			1*time.Second,
-			nil,
 			nil,
 		)
 
@@ -470,6 +469,7 @@ func TestNetwork_Forward_InfiniteLoopWithAllUpstreamsSkipping(t *testing.T) {
 			rlr,
 			upsReg,
 			mt,
+			nil,
 		)
 		require.NoError(t, err)
 

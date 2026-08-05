@@ -15,9 +15,16 @@ import (
 )
 
 const (
-	CompositeTypeNone               = "none"
-	CompositeTypeLogsSplitOnError   = "logs-split-on-error"
-	CompositeTypeLogsSplitProactive = "logs-split-proactive"
+	CompositeTypeNone                      = "none"
+	CompositeTypeLogsSplitOnError          = "logs-split-on-error"
+	CompositeTypeLogsSplitProactive        = "logs-split-proactive"
+	CompositeTypeTraceFilterSplitOnError   = "trace-filter-split-on-error"
+	CompositeTypeTraceFilterSplitProactive = "trace-filter-split-proactive"
+	CompositeTypeQueryBlocksShim           = "query-blocks-shim"
+	CompositeTypeQueryTransactionsShim     = "query-transactions-shim"
+	CompositeTypeQueryLogsShim             = "query-logs-shim"
+	CompositeTypeQueryTracesShim           = "query-traces-shim"
+	CompositeTypeQueryTransfersShim        = "query-transfers-shim"
 )
 
 const RequestContextKey ContextKey = "rq"
@@ -34,6 +41,7 @@ const (
 	headerDirectiveSkipCacheRead              = "X-ERPC-Skip-Cache-Read"
 	headerDirectiveUseUpstream                = "X-ERPC-Use-Upstream"
 	headerDirectiveSkipInterpolation          = "X-ERPC-Skip-Interpolation"
+	headerDirectiveSkipConsensus              = "X-ERPC-Skip-Consensus"
 	headerDirectiveEnforceHighestBlock        = "X-ERPC-Enforce-Highest-Block"
 	headerDirectiveEnforceGetLogsRange        = "X-ERPC-Enforce-GetLogs-Range"
 	headerDirectiveEnforceNonNullTaggedBlocks = "X-ERPC-Enforce-Non-Null-Tagged-Blocks"
@@ -59,6 +67,7 @@ const (
 	queryDirectiveSkipCacheRead              = "skip-cache-read"
 	queryDirectiveUseUpstream                = "use-upstream"
 	queryDirectiveSkipInterpolation          = "skip-interpolation"
+	queryDirectiveSkipConsensus              = "skip-consensus"
 	queryDirectiveEnforceHighestBlock        = "enforce-highest-block"
 	queryDirectiveEnforceGetLogsRange        = "enforce-getlogs-range"
 	queryDirectiveEnforceNonNullTaggedBlocks = "enforce-non-null-tagged-blocks"
@@ -84,6 +93,7 @@ var directiveKeyRegistry = []directiveKeyNames{
 	{header: headerDirectiveSkipCacheRead, query: queryDirectiveSkipCacheRead},
 	{header: headerDirectiveUseUpstream, query: queryDirectiveUseUpstream},
 	{header: headerDirectiveSkipInterpolation, query: queryDirectiveSkipInterpolation},
+	{header: headerDirectiveSkipConsensus, query: queryDirectiveSkipConsensus},
 	{header: headerDirectiveEnforceHighestBlock, query: queryDirectiveEnforceHighestBlock},
 	{header: headerDirectiveEnforceGetLogsRange, query: queryDirectiveEnforceGetLogsRange},
 	{header: headerDirectiveEnforceNonNullTaggedBlocks, query: queryDirectiveEnforceNonNullTaggedBlocks},
@@ -131,10 +141,24 @@ type RequestDirectives struct {
 	// Instruct the proxy to bypass method exclusion checks.
 	ByPassMethodExclusion bool `json:"-"`
 
+	// IsInternal flags a request as constructed by an internal subsystem
+	// (state poller, chainId probe, vendor detection). Internal requests
+	// bypass retry, hedge, and breaker policies; only the per-attempt
+	// timeout still applies. Never set from HTTP headers.
+	IsInternal bool `json:"-"`
+
 	// Instruct the normalization layer to avoid mutating JSON-RPC params for block tag interpolation.
 	// When true, the system will still compute and cache block references (for finality/metrics),
 	// but will NOT replace tags like "latest"/"finalized" with hex numbers in outbound requests.
 	SkipInterpolation bool `json:"skipInterpolation"`
+
+	// Instruct the proxy to bypass the consensus policy for this request and
+	// route through the standard retry+hedge+breaker+timeout path instead.
+	// Retry, hedge, breaker, and timeout policies still apply — only the
+	// consensus dispute / agreement step is skipped. Useful when the caller
+	// has its own correctness checks downstream and prefers first-response
+	// latency over multi-upstream agreement.
+	SkipConsensus bool `json:"skipConsensus"`
 
 	// Validation: Block Integrity
 	EnforceHighestBlock        bool `json:"enforceHighestBlock,omitempty"`
@@ -221,6 +245,7 @@ func (d *RequestDirectives) Clone() *RequestDirectives {
 		UseUpstream:                     d.UseUpstream,
 		ByPassMethodExclusion:           d.ByPassMethodExclusion,
 		SkipInterpolation:               d.SkipInterpolation,
+		SkipConsensus:                   d.SkipConsensus,
 		EnforceHighestBlock:             d.EnforceHighestBlock,
 		EnforceGetLogsBlockRange:        d.EnforceGetLogsBlockRange,
 		EnforceNonNullTaggedBlocks:      d.EnforceNonNullTaggedBlocks,
@@ -310,6 +335,13 @@ type NormalizedRequest struct {
 	upstreamList      []Upstream // Available upstreams for this request
 	ConsumedUpstreams *sync.Map  // Tracks upstreams that provided valid responses
 
+	// escalatedToFallbacks marks whether this request has already invoked the
+	// per-request fallback escape hatch (Network.Forward's inner loop appends
+	// cordoned fallback-group upstreams when the primary set is exhausted with
+	// retryable errors). Prevents escalation loops across failsafe retries
+	// and re-entries.
+	escalatedToFallbacks atomic.Bool
+
 	lastValidResponse atomic.Pointer[NormalizedResponse]
 	lastUpstream      atomic.Value
 	evmBlockRef       atomic.Value
@@ -327,6 +359,33 @@ type NormalizedRequest struct {
 
 	// Resolved client IP (set by HTTP ingress using trusted forwarders)
 	clientIP atomic.Value
+
+	// Per-request execution counters; lazy-init via execStateHolder.
+	execStateHolder execStateHolder
+}
+
+// ExecState returns the per-request execution counters. Lazy-init on
+// first access — callers may invoke this concurrently.
+func (r *NormalizedRequest) ExecState() *ExecState {
+	if r == nil {
+		return nil
+	}
+	return r.execStateHolder.get()
+}
+
+// IsInternal returns true when the request was constructed by an
+// internal subsystem (state poller, chainId probe, vendor detection).
+// Internal requests bypass retry, hedge, and breaker policies; only
+// the per-attempt timeout still applies.
+func (r *NormalizedRequest) IsInternal() bool {
+	if r == nil {
+		return false
+	}
+	d := r.Directives()
+	if d == nil {
+		return false
+	}
+	return d.IsInternal
 }
 
 func NewNormalizedRequest(body []byte) *NormalizedRequest {
@@ -503,6 +562,11 @@ func (r *NormalizedRequest) SetDirectives(directives *RequestDirectives) {
 }
 
 // ApplyDirectiveDefaults applies the default directives from the network configuration.
+// It is a no-op if directives have already been populated (by a prior call to
+// ApplyDirectiveDefaults, SetDirectives, or EnrichFromHttp). This prevents the
+// defensive call in Network.Forward() from overwriting directives that were
+// explicitly set via HTTP headers/query params between the http_server's
+// ApplyDirectiveDefaults and Network.Forward.
 func (r *NormalizedRequest) ApplyDirectiveDefaults(directiveDefaults *DirectiveDefaultsConfig) {
 	if directiveDefaults == nil {
 		return
@@ -510,9 +574,10 @@ func (r *NormalizedRequest) ApplyDirectiveDefaults(directiveDefaults *DirectiveD
 	r.Lock()
 	defer r.Unlock()
 
-	if r.directives == nil {
-		r.directives = &RequestDirectives{}
+	if r.directives != nil {
+		return
 	}
+	r.directives = &RequestDirectives{}
 
 	if directiveDefaults.RetryEmpty != nil {
 		r.directives.RetryEmpty = *directiveDefaults.RetryEmpty
@@ -533,6 +598,9 @@ func (r *NormalizedRequest) ApplyDirectiveDefaults(directiveDefaults *DirectiveD
 	}
 	if directiveDefaults.SkipInterpolation != nil {
 		r.directives.SkipInterpolation = *directiveDefaults.SkipInterpolation
+	}
+	if directiveDefaults.SkipConsensus != nil {
+		r.directives.SkipConsensus = *directiveDefaults.SkipConsensus
 	}
 
 	// Validation: Block Integrity
@@ -682,6 +750,9 @@ func (r *NormalizedRequest) EnrichFromHttp(headers http.Header, queryArgs url.Va
 	if hv := headers.Get(headerDirectiveSkipInterpolation); hv != "" {
 		r.directives.SkipInterpolation = strings.ToLower(strings.TrimSpace(hv)) == "true"
 	}
+	if hv := headers.Get(headerDirectiveSkipConsensus); hv != "" {
+		r.directives.SkipConsensus = strings.ToLower(strings.TrimSpace(hv)) == "true"
+	}
 
 	// Validation Headers
 	if hv := headers.Get(headerDirectiveEnforceHighestBlock); hv != "" {
@@ -762,6 +833,10 @@ func (r *NormalizedRequest) EnrichFromHttp(headers http.Header, queryArgs url.Va
 
 	if skipInterpolation := queryArgs.Get(queryDirectiveSkipInterpolation); skipInterpolation != "" {
 		r.directives.SkipInterpolation = strings.ToLower(strings.TrimSpace(skipInterpolation)) == "true"
+	}
+
+	if skipConsensus := queryArgs.Get(queryDirectiveSkipConsensus); skipConsensus != "" {
+		r.directives.SkipConsensus = strings.ToLower(strings.TrimSpace(skipConsensus)) == "true"
 	}
 
 	// Validation query parameters
@@ -982,6 +1057,14 @@ func (r *NormalizedRequest) ClientIP() string {
 	return "n/a"
 }
 
+// SetAgentName stores the agent name directly without HTTP-specific parsing
+func (r *NormalizedRequest) SetAgentName(name string) {
+	if r == nil || name == "" {
+		return
+	}
+	r.agentName.Store(name)
+}
+
 // TODO Move evm specific data to RequestMetadata struct so we can have multiple architectures besides evm
 func (r *NormalizedRequest) EvmBlockRef() interface{} {
 	if r == nil {
@@ -1172,6 +1255,42 @@ func (r *NormalizedRequest) UpstreamsCount() int {
 	r.upstreamMutex.Lock()
 	defer r.upstreamMutex.Unlock()
 	return len(r.upstreamList)
+}
+
+// Upstreams returns a snapshot copy of the ordered upstream list set for
+// this request. Safe for concurrent use; mutating the returned slice does
+// not affect the request (use SetUpstreams to install a new order).
+func (r *NormalizedRequest) Upstreams() []Upstream {
+	if r == nil {
+		return nil
+	}
+	r.upstreamMutex.Lock()
+	defer r.upstreamMutex.Unlock()
+	if len(r.upstreamList) == 0 {
+		return nil
+	}
+	out := make([]Upstream, len(r.upstreamList))
+	copy(out, r.upstreamList)
+	return out
+}
+
+// HasEscalatedToFallbacks reports whether the per-request fallback escape
+// hatch has already fired for this request. Used by Network.Forward's outer
+// loop to ensure the escape is attempted at most once per request.
+func (r *NormalizedRequest) HasEscalatedToFallbacks() bool {
+	if r == nil {
+		return false
+	}
+	return r.escalatedToFallbacks.Load()
+}
+
+// MarkEscalatedToFallbacks records that this request has invoked the
+// fallback escape hatch.
+func (r *NormalizedRequest) MarkEscalatedToFallbacks() {
+	if r == nil {
+		return
+	}
+	r.escalatedToFallbacks.Store(true)
 }
 
 // UserId returns the user ID from the user object, or "n/a" if not available

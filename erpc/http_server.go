@@ -14,6 +14,7 @@ import (
 	"os"
 	"path"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,11 +23,15 @@ import (
 	"github.com/bytedance/sonic"
 	"github.com/erpc/erpc/auth"
 	"github.com/erpc/erpc/common"
+	"github.com/erpc/erpc/indexer"
 	"github.com/erpc/erpc/telemetry"
 	"github.com/erpc/erpc/util"
+	"github.com/gorilla/websocket"
 	"github.com/rs/zerolog"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
 // Only compress responses larger than 1KB to save CPU on small responses
@@ -39,6 +44,7 @@ type HttpServer struct {
 	adminCfg                *common.AdminConfig
 	serverV4                *http.Server
 	serverV6                *http.Server
+	sharedGrpcServer        *GrpcServer
 	erpc                    *ERPC
 	logger                  *zerolog.Logger
 	healthCheckAuthRegistry *auth.AuthRegistry
@@ -48,6 +54,8 @@ type HttpServer struct {
 	trustedForwarderIPs     map[string]struct{}
 	trustedIPHeaders        []string
 	resolvedResponseHeaders map[string]string
+	subscriptionManager     *SubscriptionManager
+	activeWsConns           sync.Map // connId -> *WsConnection
 }
 
 func NewHttpServer(
@@ -56,6 +64,7 @@ func NewHttpServer(
 	cfg *common.ServerConfig,
 	healthCheckCfg *common.HealthCheckConfig,
 	adminCfg *common.AdminConfig,
+	indexerCfg *common.IndexerConfig,
 	erpc *ERPC,
 ) (*HttpServer, error) {
 	reqMaxTimeout := 150 * time.Second
@@ -80,15 +89,25 @@ func NewHttpServer(
 
 	gzipPool := util.NewGzipReaderPool()
 
+	subMgrLogger := logger.With().Str("component", "subscriptions").Logger()
+	indexerLogger := logger.With().Str("component", "indexer").Logger()
+	indexerOpts := indexer.Options{}
+	if indexerCfg != nil {
+		indexerOpts.CanonicalChainDepth = indexerCfg.CanonicalChainDepth
+		indexerOpts.DedupWindowSize = indexerCfg.DedupWindowSize
+	}
+	idx := indexer.New(&indexerLogger, indexerOpts)
+
 	srv := &HttpServer{
-		logger:         logger,
-		appCtx:         ctx,
-		serverCfg:      cfg,
-		healthCheckCfg: healthCheckCfg,
-		adminCfg:       adminCfg,
-		erpc:           erpc,
-		draining:       &draining,
-		gzipPool:       gzipPool,
+		logger:              logger,
+		appCtx:              ctx,
+		serverCfg:           cfg,
+		healthCheckCfg:      healthCheckCfg,
+		adminCfg:            adminCfg,
+		erpc:                erpc,
+		draining:            &draining,
+		gzipPool:            gzipPool,
+		subscriptionManager: NewSubscriptionManager(&subMgrLogger, idx),
 	}
 
 	if cfg != nil {
@@ -144,17 +163,38 @@ func NewHttpServer(
 	}
 
 	h := srv.createRequestHandler()
+
 	if cfg.EnableGzip != nil && *cfg.EnableGzip {
 		h = gzipHandler(h)
 	}
 
 	// Create handler with timeout
-	handlerWithTimeout := TimeoutHandler(logger, h, reqMaxTimeout)
+	httpHandler := TimeoutHandler(logger, h, reqMaxTimeout)
+	handlerV4 := httpHandler
+	handlerV6 := httpHandler
+
+	if grpcSharesHttpV4(cfg) {
+		sharedGrpcServer, err := NewGrpcServer(ctx, logger, cfg, erpc)
+		if err != nil {
+			return nil, err
+		}
+		srv.sharedGrpcServer = sharedGrpcServer
+		handlerV4 = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.ProtoMajor == 2 && strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "application/grpc") {
+				sharedGrpcServer.server.ServeHTTP(w, r)
+				return
+			}
+			httpHandler.ServeHTTP(w, r)
+		})
+		if cfg.TLS == nil || !cfg.TLS.Enabled {
+			handlerV4 = h2c.NewHandler(handlerV4, &http2.Server{})
+		}
+	}
 
 	// Create IPv4 server if configured
 	if cfg.ListenV4 != nil && *cfg.ListenV4 {
 		srv.serverV4 = &http.Server{
-			Handler:        handlerWithTimeout,
+			Handler:        handlerV4,
 			ReadTimeout:    readTimeout,
 			WriteTimeout:   writeTimeout,
 			IdleTimeout:    300 * time.Second,
@@ -165,7 +205,7 @@ func NewHttpServer(
 	// Create IPv6 server if configured
 	if cfg.ListenV6 != nil && *cfg.ListenV6 {
 		srv.serverV6 = &http.Server{
-			Handler:        handlerWithTimeout,
+			Handler:        handlerV6,
 			ReadTimeout:    readTimeout,
 			WriteTimeout:   writeTimeout,
 			IdleTimeout:    300 * time.Second,
@@ -252,6 +292,7 @@ func (s *HttpServer) createRequestHandler() http.Handler {
 				encoder,
 				writeFatalError,
 				&common.TRUE,
+				s.executionHeadersMode(),
 			)
 			return
 		}
@@ -292,6 +333,7 @@ func (s *HttpServer) createRequestHandler() http.Handler {
 				encoder,
 				writeFatalError,
 				s.serverCfg.IncludeErrorDetails,
+				s.executionHeadersMode(),
 			)
 			return
 		}
@@ -308,6 +350,7 @@ func (s *HttpServer) createRequestHandler() http.Handler {
 				encoder,
 				writeFatalError,
 				&common.TRUE,
+				s.executionHeadersMode(),
 			)
 			return
 		}
@@ -316,6 +359,12 @@ func (s *HttpServer) createRequestHandler() http.Handler {
 			if !s.handleCORS(httpCtx, w, r, project.Config.CORS) || r.Method == http.MethodOptions {
 				return
 			}
+		}
+
+		// WebSocket upgrade: handle before body reading since WS upgrades don't have a JSON body
+		if websocket.IsWebSocketUpgrade(r) {
+			s.handleWebSocket(httpCtx, w, r, &lg, project, architecture, chainId)
+			return
 		}
 
 		// Handle gzipped request bodies
@@ -333,6 +382,7 @@ func (s *HttpServer) createRequestHandler() http.Handler {
 					encoder,
 					writeFatalError,
 					&common.TRUE,
+					s.executionHeadersMode(),
 				)
 				return
 			}
@@ -360,6 +410,7 @@ func (s *HttpServer) createRequestHandler() http.Handler {
 				encoder,
 				writeFatalError,
 				&common.TRUE,
+				s.executionHeadersMode(),
 			)
 			return
 		}
@@ -388,6 +439,7 @@ func (s *HttpServer) createRequestHandler() http.Handler {
 					encoder,
 					writeFatalError,
 					&common.TRUE,
+					s.executionHeadersMode(),
 				)
 				common.SetTraceSpanError(parseRequestsSpan, err)
 				parseRequestsSpan.End()
@@ -511,7 +563,8 @@ func (s *HttpServer) createRequestHandler() http.Handler {
 							"code":    int(common.JsonRpcErrorUnsupportedException),
 							"message": fmt.Sprintf("method not supported: %s", method),
 						},
-						Cause: nil,
+						Cause:   nil,
+						Request: nq,
 					}
 					common.EndRequestSpan(requestCtx, nil, nil)
 					return
@@ -581,18 +634,20 @@ func (s *HttpServer) createRequestHandler() http.Handler {
 				var networkId string
 
 				if architecture == "" || chainId == "" {
-					var req map[string]interface{}
-					if err := common.SonicCfg.Unmarshal(rawReq, &req); err != nil {
-						responses[index] = processErrorBody(&rlg, &startedAt, nq, common.NewErrInvalidRequest(err), &common.TRUE)
-						common.EndRequestSpan(requestCtx, nil, err)
-						return
-					}
-					if networkIdFromBody, ok := req["networkId"].(string); ok {
-						networkId = networkIdFromBody
-						parts := strings.Split(networkId, ":")
-						if len(parts) == 2 {
-							architecture = parts[0]
-							chainId = parts[1]
+					if bodyBytes := nq.Body(); len(bodyBytes) > 0 {
+						var req map[string]interface{}
+						if err := common.SonicCfg.Unmarshal(bodyBytes, &req); err != nil {
+							responses[index] = processErrorBody(&rlg, &startedAt, nq, common.NewErrInvalidRequest(err), &common.TRUE)
+							common.EndRequestSpan(requestCtx, nil, err)
+							return
+						}
+						if networkIdFromBody, ok := req["networkId"].(string); ok {
+							networkId = networkIdFromBody
+							parts := strings.Split(networkId, ":")
+							if len(parts) == 2 {
+								architecture = parts[0]
+								chainId = parts[1]
+							}
 						}
 					}
 				} else {
@@ -667,7 +722,6 @@ func (s *HttpServer) createRequestHandler() http.Handler {
 		common.InjectHTTPResponseTraceContext(httpCtx, w)
 
 		if isBatch {
-			// JSON-RPC 2.0 over HTTP should always return 200 OK at transport level
 			w.WriteHeader(http.StatusOK)
 
 			bw := NewBatchResponseWriter(responses)
@@ -687,7 +741,8 @@ func (s *HttpServer) createRequestHandler() http.Handler {
 			common.EnrichHTTPServerSpan(httpCtx, http.StatusOK, nil)
 		} else {
 			res := responses[0]
-			setResponseHeaders(httpCtx, res, w)
+			setResponseHeaders(httpCtx, res, w, s.executionHeadersMode())
+
 			// Determine HTTP status code - defaults to 200 for JSON-RPC responses,
 			// but transport-level errors (auth, rate limit, etc.) get appropriate status codes
 			statusCode := determineResponseStatusCode(res)
@@ -964,7 +1019,7 @@ func (s *HttpServer) parseUrlPath(
 		return "", "", "", false, false, common.NewErrInvalidUrlPath("architecture is not valid (must be 'evm')", ps)
 	}
 
-	if !isPost && !isOptions {
+	if !isPost && !isOptions && r.Header.Get("Upgrade") != "websocket" {
 		isHealthCheck = true
 	}
 
@@ -1042,21 +1097,118 @@ func (s *HttpServer) handleCORS(httpCtx context.Context, w http.ResponseWriter, 
 	return true
 }
 
-func setResponseHeaders(ctx context.Context, res interface{}, w http.ResponseWriter) {
-	var rm common.ResponseMetadata
-	var ok bool
-	rm, ok = res.(common.ResponseMetadata)
-	if !ok {
-		if jrsp, ok := res.(map[string]interface{}); ok {
-			if err, ok := jrsp["cause"]; ok {
-				if ser, ok := err.(error); ok {
-					rm = common.LookupResponseMetadata(ser)
-				}
-			}
-		} else if hjrsp, ok := res.(*HttpJsonRpcErrorResponse); ok {
-			rm = common.LookupResponseMetadata(hjrsp.Cause)
+// executionHeadersMode returns the configured per-request diagnostic
+// header mode, defaulting to "all" when unset.
+func (s *HttpServer) executionHeadersMode() common.ExecutionHeadersMode {
+	if s == nil || s.serverCfg == nil || s.serverCfg.ExecutionHeaders == nil {
+		return common.ExecutionHeadersAll
+	}
+	return *s.serverCfg.ExecutionHeaders
+}
+
+// setResponseHeaders emits the full X-ERPC-* diagnostic surface for a
+// single response — success OR error. Defensive: any nil piece is
+// silently skipped so headers stay consistent across paths. Called
+// from every response-write path the server exposes.
+//
+// The function composes three independent header groups:
+//  1. Counter headers (always emitted when ExecState exists): totals
+//     + per-scope (Upstream-/Network-/Cache-) + consensus.
+//  2. Response-metadata headers (cache HIT/MISS, winning upstream id,
+//     duration ms) — only present when we have a real response.
+//  3. Per-attempt trace headers (Upstreams-Tried/Outcomes/...) — only
+//     when ExecutionHeaders is "all" (skipped in "summary" mode).
+//
+// All three groups are driven from a single source of truth — the
+// request's ExecState — so totals can never drift from per-scope
+// counts and operators see the same numbers in headers, metrics, and
+// spans.
+func setResponseHeaders(ctx context.Context, res interface{}, w http.ResponseWriter, mode common.ExecutionHeadersMode) {
+	if mode == common.ExecutionHeadersOff {
+		return
+	}
+
+	req := extractRequest(res)
+	var st *common.ExecState
+	if req != nil {
+		st = req.ExecState()
+	}
+
+	// 1. Counter headers (always when ExecState exists).
+	writeCounterHeaders(st, w)
+
+	// 2. Response-derived headers (cache, winner, duration).
+	writeResponseMetadataHeaders(ctx, res, w)
+
+	// 3. Per-attempt trace headers (skipped in "summary" mode to keep
+	// header bytes minimal for bandwidth-constrained clients).
+	if mode != common.ExecutionHeadersSummary {
+		writeUpstreamTraceHeaders(st, w)
+	}
+}
+
+// extractRequest walks the response payload to find the originating
+// NormalizedRequest. Returns nil only for very-early errors (URL parse,
+// project lookup) where no request was ever constructed.
+func extractRequest(res interface{}) *common.NormalizedRequest {
+	switch v := res.(type) {
+	case *common.NormalizedResponse:
+		if v != nil {
+			return v.Request()
+		}
+	case *HttpJsonRpcErrorResponse:
+		if v != nil {
+			return v.Request
 		}
 	}
+	return nil
+}
+
+// writeCounterHeaders emits the request-wide attempt total plus the
+// per-scope retry/hedge breakdowns. Always called with a non-nil
+// writer; st may be nil — in which case counters are emitted as "0"
+// so clients can rely on header presence as a contract.
+//
+// Header contract:
+//   - X-ERPC-Attempts: total physical operations across the request
+//     (Upstream + Cache). NetworkAttempts is a rotation count, exposed
+//     per-scope but NOT summed into this total to avoid double-counting.
+//   - Retries / Hedges are emitted PER SCOPE only — operators see
+//     where retry/hedge activity happened rather than an aggregate
+//     that hides which layer was responsible.
+func writeCounterHeaders(st *common.ExecState, w http.ResponseWriter) {
+	snap := st.Snapshot() // nil-safe: returns zero snapshot
+	setInt(w, "X-ERPC-Attempts", snap.Attempts)
+	setInt(w, "X-ERPC-Upstream-Attempts", snap.UpstreamAttempts)
+	setInt(w, "X-ERPC-Upstream-Retries", snap.UpstreamRetries)
+	setInt(w, "X-ERPC-Upstream-Hedges", snap.UpstreamHedges)
+	setInt(w, "X-ERPC-Network-Attempts", snap.NetworkAttempts)
+	setInt(w, "X-ERPC-Network-Retries", snap.NetworkRetries)
+	setInt(w, "X-ERPC-Network-Hedges", snap.NetworkHedges)
+	// Cache + consensus are conditional — they only appear when the
+	// scope was actually exercised, to keep the header footprint small
+	// on the common path.
+	if snap.CacheAttempts > 0 || snap.CacheRetries > 0 || snap.CacheHedges > 0 {
+		setInt(w, "X-ERPC-Cache-Attempts", snap.CacheAttempts)
+		setInt(w, "X-ERPC-Cache-Retries", snap.CacheRetries)
+		setInt(w, "X-ERPC-Cache-Hedges", snap.CacheHedges)
+	}
+	if snap.ConsensusSlots > 0 {
+		setInt(w, "X-ERPC-Consensus-Slots", snap.ConsensusSlots)
+	}
+	if snap.ConsensusDisputes > 0 {
+		setInt(w, "X-ERPC-Consensus-Disputes", snap.ConsensusDisputes)
+	}
+	if snap.ConsensusLowParticipants > 0 {
+		setInt(w, "X-ERPC-Consensus-Low-Participants", snap.ConsensusLowParticipants)
+	}
+}
+
+// writeResponseMetadataHeaders emits X-ERPC-Cache, X-ERPC-Upstream,
+// X-ERPC-Duration — fields that depend on having a final response with
+// metadata. Silently skipped when no metadata is available.
+func writeResponseMetadataHeaders(ctx context.Context, res interface{}, w http.ResponseWriter) {
+	rm := lookupResponseMetadata(res)
 	if rm != nil && !rm.IsObjectNull(ctx) {
 		if rm.FromCache() {
 			w.Header().Set("X-ERPC-Cache", "HIT")
@@ -1066,14 +1218,82 @@ func setResponseHeaders(ctx context.Context, res interface{}, w http.ResponseWri
 		if ups := rm.UpstreamId(); ups != "" {
 			w.Header().Set("X-ERPC-Upstream", ups)
 		}
-		w.Header().Set("X-ERPC-Attempts", fmt.Sprintf("%d", rm.Attempts()))
-		w.Header().Set("X-ERPC-Retries", fmt.Sprintf("%d", rm.Retries()))
-		w.Header().Set("X-ERPC-Hedges", fmt.Sprintf("%d", rm.Hedges()))
 	}
-	if resp, ok := res.(*common.NormalizedResponse); ok {
-		w.Header().Set("X-ERPC-Duration", fmt.Sprintf("%d", resp.Duration().Milliseconds()))
+	if resp, ok := res.(*common.NormalizedResponse); ok && resp != nil {
+		setInt64(w, "X-ERPC-Duration", resp.Duration().Milliseconds())
 	}
 }
+
+// lookupResponseMetadata pulls a ResponseMetadata view out of any
+// supported response shape (success or error). Returns nil when the
+// payload doesn't carry metadata (very-early error paths).
+func lookupResponseMetadata(res interface{}) common.ResponseMetadata {
+	if rm, ok := res.(common.ResponseMetadata); ok {
+		return rm
+	}
+	if jrsp, ok := res.(map[string]interface{}); ok {
+		if cause, ok := jrsp["cause"]; ok {
+			if ser, ok := cause.(error); ok {
+				return common.LookupResponseMetadata(ser)
+			}
+		}
+	}
+	if hjrsp, ok := res.(*HttpJsonRpcErrorResponse); ok && hjrsp != nil {
+		return common.LookupResponseMetadata(hjrsp.Cause)
+	}
+	return nil
+}
+
+// writeUpstreamTraceHeaders emits the per-attempt participation log as
+// a single compact header. Each segment is one physical attempt:
+//
+//	<upstreamId>=<reason>:<outcome>:<duration>ms[:won]
+//
+// Segments are joined with `;`. The `:won` suffix marks attempts whose
+// response contributed to the final response — for a single-winner
+// request that's one segment, for consensus it's every participant in
+// the winning agreement group.
+//
+// Example:
+//
+//	X-ERPC-Upstreams: alchemy=primary:success:50ms:won;quicknode=hedge:timeout:5000ms;drpc=consensus_slot:exec_revert:20ms
+func writeUpstreamTraceHeaders(st *common.ExecState, w http.ResponseWriter) {
+	if st == nil {
+		return
+	}
+	attempts := st.UpstreamAttemptLog()
+	if len(attempts) == 0 {
+		return
+	}
+	segments := make([]string, len(attempts))
+	for i, a := range attempts {
+		segments[i] = formatUpstreamAttempt(a)
+	}
+	w.Header().Set("X-ERPC-Upstreams", strings.Join(segments, ";"))
+}
+
+// formatUpstreamAttempt formats one attempt for the X-ERPC-Upstreams
+// header. Kept as a free function so the format is testable in isolation
+// and the same shape can be reused in span attributes / log fields.
+func formatUpstreamAttempt(a common.UpstreamAttempt) string {
+	var b strings.Builder
+	b.Grow(64)
+	b.WriteString(a.UpstreamId)
+	b.WriteByte('=')
+	b.WriteString(string(a.Reason))
+	b.WriteByte(':')
+	b.WriteString(string(a.Outcome))
+	b.WriteByte(':')
+	b.WriteString(strconv.FormatInt(a.Duration.Milliseconds(), 10))
+	b.WriteString("ms")
+	if a.Won {
+		b.WriteString(":won")
+	}
+	return b.String()
+}
+
+func setInt(w http.ResponseWriter, name string, v int)      { w.Header().Set(name, strconv.Itoa(v)) }
+func setInt64(w http.ResponseWriter, name string, v int64)  { w.Header().Set(name, strconv.FormatInt(v, 10)) }
 
 // determineResponseStatusCode extracts any error from a response and determines
 // the appropriate HTTP status code. Defaults to 200 for JSON-RPC responses,
@@ -1104,9 +1324,6 @@ func determineResponseStatusCode(res interface{}) int {
 	// 404 Not Found - resource not found
 	case common.HasErrorCode(err, common.ErrCodeProjectNotFound, common.ErrCodeNetworkNotFound, common.ErrCodeNetworkNotSupported):
 		return http.StatusNotFound
-	// 413 Request Entity Too Large
-	case common.HasErrorCode(err, common.ErrCodeEndpointRequestTooLarge):
-		return http.StatusRequestEntityTooLarge
 	// 429 Too Many Requests - rate limiting
 	case common.HasErrorCode(err,
 		common.ErrCodeAuthRateLimitRuleExceeded,
@@ -1125,6 +1342,10 @@ type HttpJsonRpcErrorResponse struct {
 	Id      interface{} `json:"id"`
 	Error   interface{} `json:"error"`
 	Cause   error       `json:"-"`
+	// Request is the originating NormalizedRequest (when available).
+	// Used by setResponseHeaders to emit X-ERPC-* counter/trace headers
+	// on error paths via the request's ExecState.
+	Request *common.NormalizedRequest `json:"-"`
 }
 
 func (r *HttpJsonRpcErrorResponse) MarshalZerologObject(e *zerolog.Event) {
@@ -1237,6 +1458,7 @@ func buildErrorResponseBody(nq *common.NormalizedRequest, err, origErr error, in
 			Id:      reqId,
 			Error:   errObj,
 			Cause:   err,
+			Request: nq,
 		}
 	}
 
@@ -1263,6 +1485,7 @@ func handleErrorResponse(
 	encoder sonic.Encoder,
 	writeFatalError func(ctx context.Context, statusCode int, body error),
 	includeErrorDetails *bool,
+	mode common.ExecutionHeadersMode,
 ) {
 	resp := processErrorBody(logger, startedAt, nq, err, includeErrorDetails)
 	// Transport defaults to 200 for JSON-RPC, with limited exceptions.
@@ -1279,9 +1502,6 @@ func handleErrorResponse(
 	// 404 Not Found - resource not found at HTTP level
 	case common.HasErrorCode(err, common.ErrCodeProjectNotFound, common.ErrCodeNetworkNotFound, common.ErrCodeNetworkNotSupported):
 		statusCode = http.StatusNotFound
-	// 413 Request Entity Too Large
-	case common.HasErrorCode(err, common.ErrCodeEndpointRequestTooLarge):
-		statusCode = http.StatusRequestEntityTooLarge
 	// 429 Too Many Requests - rate limiting (critical for client retry logic)
 	case common.HasErrorCode(err,
 		common.ErrCodeAuthRateLimitRuleExceeded,
@@ -1290,6 +1510,11 @@ func handleErrorResponse(
 		common.ErrCodeEndpointCapacityExceeded):
 		statusCode = http.StatusTooManyRequests
 	}
+	// Emit X-ERPC-* headers BEFORE WriteHeader — once WriteHeader fires
+	// the header map is sealed. processErrorBody attaches `nq` to the
+	// returned HttpJsonRpcErrorResponse so the counter/trace headers
+	// flow even when the response body is an error.
+	setResponseHeaders(httpCtx, resp, w, mode)
 	w.WriteHeader(statusCode)
 	span := trace.SpanFromContext(httpCtx)
 	span.AddEvent("http.response_write_start")
@@ -1435,6 +1660,11 @@ func (s *HttpServer) createTLSConfig() (*tls.Config, error) {
 func (s *HttpServer) Shutdown(logger *zerolog.Logger) error {
 	logger.Info().Msg("stopping http servers...")
 
+	// Close all active WebSocket connections first with GoingAway status.
+	// This sends a close frame to clients so they know to reconnect,
+	// and cleans up all subscriptions before the HTTP server stops.
+	s.shutdownWebSockets(logger)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -1476,6 +1706,48 @@ func (s *HttpServer) Shutdown(logger *zerolog.Logger) error {
 	}
 
 	return lastErr
+}
+
+// shutdownWebSockets closes all active WebSocket connections with a GoingAway
+// close frame and waits for subscription cleanup to complete.
+func (s *HttpServer) shutdownWebSockets(logger *zerolog.Logger) {
+	count := 0
+	s.activeWsConns.Range(func(key, value interface{}) bool {
+		count++
+		return true
+	})
+
+	if count == 0 {
+		return
+	}
+
+	logger.Info().Int("connections", count).Msg("closing active WebSocket connections...")
+
+	var wg sync.WaitGroup
+	s.activeWsConns.Range(func(key, value interface{}) bool {
+		wsc := value.(*WsConnection)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			wsc.CloseWithGoingAway()
+		}()
+		s.activeWsConns.Delete(key)
+		return true
+	})
+
+	// Wait for all connections to close with a timeout
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		logger.Info().Int("connections", count).Msg("all WebSocket connections closed")
+	case <-time.After(10 * time.Second):
+		logger.Warn().Int("connections", count).Msg("timed out waiting for WebSocket connections to close")
+	}
 }
 
 // conditionalGzipWriter wraps ResponseWriter and decides whether to compress
@@ -1555,6 +1827,16 @@ func gzipHandler(next http.Handler) http.Handler {
 	var gzPool = util.NewGzipWriterPool()
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// WebSocket upgrades need Hijack() on the real ResponseWriter.
+		// conditionalGzipWriter does not implement http.Hijacker, so wrapping
+		// breaks gorilla's Upgrade (500: "response does not implement http.Hijacker").
+		// Cloudflare always sends Accept-Encoding: gzip, which previously
+		// forced the wrap on every proxied WS handshake.
+		if websocket.IsWebSocketUpgrade(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		// Check if client accepts gzip encoding
 		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 			next.ServeHTTP(w, r)

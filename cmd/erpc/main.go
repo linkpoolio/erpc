@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/url"
@@ -12,7 +13,9 @@ import (
 	"syscall"
 
 	"github.com/erpc/erpc/common"
+	"github.com/erpc/erpc/common/legacy"
 	"github.com/erpc/erpc/erpc"
+	"github.com/erpc/erpc/internal/policy"
 	"github.com/erpc/erpc/util"
 	"github.com/joho/godotenv"
 	"github.com/rs/zerolog"
@@ -20,10 +23,20 @@ import (
 	"github.com/spf13/afero"
 	"github.com/urfave/cli/v3"
 	"google.golang.org/grpc/grpclog"
+	yaml "gopkg.in/yaml.v3"
 )
 
 func init() {
 	grpclog.SetLoggerV2(grpclog.NewLoggerV2(io.Discard, io.Discard, os.Stderr))
+
+	// Wire the legacy → modern config migration hook. Done here (init
+	// of cmd/erpc) rather than in common so that the common package
+	// itself stays free of the common/legacy dependency. Tests that
+	// exercise legacy YAML can mirror this assignment in TestMain.
+	common.LegacyTranslateFn = legacy.TranslateFromConfig
+	common.LegacyTranslateLogger = func(w string) {
+		log.Warn().Str("source", "config-migration").Msg(w)
+	}
 
 	// Load .env file if it exists
 	if err := godotenv.Load(); err != nil {
@@ -128,6 +141,62 @@ func main() {
 		},
 	}
 
+	// Define the dump command
+	dumpCmd := &cli.Command{
+		Name:  "dump",
+		Usage: "Parse a config file (TS, JS, or YAML) and dump the exact configuration eRPC would run with — selectionPolicy filled with the effective policy per network, TS function sentinels resolved to source",
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:  "format",
+				Usage: "Output format: yaml|json",
+				Value: "yaml",
+			},
+		},
+		Action: func(ctx context.Context, cmd *cli.Command) error {
+			zerolog.SetGlobalLevel(zerolog.Disabled)
+
+			cfg, err := getConfig(logger, cmd)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "error: failed to load config: %v\n", err)
+				util.OsExit(1)
+				return nil
+			}
+
+			// Make each network's effective selectionPolicy explicit — the
+			// rich default for nil, the upgrade for the trivial placeholder,
+			// and best-effort TS source resolution. Mirrors what the engine
+			// applies at register-time, so the dump matches what `erpc start`
+			// would actually run.
+			policy.ResolveEffectiveSelectionPolicies(cfg)
+
+			format := cmd.String("format")
+			switch format {
+			case "json":
+				out, err := json.MarshalIndent(cfg, "", "  ")
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "error: failed to marshal config to JSON: %v\n", err)
+					util.OsExit(1)
+					return nil
+				}
+				fmt.Println(string(out))
+			case "yaml", "yml":
+				out, err := yaml.Marshal(cfg)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "error: failed to marshal config to YAML: %v\n", err)
+					util.OsExit(1)
+					return nil
+				}
+				fmt.Print(string(out))
+			default:
+				fmt.Fprintf(os.Stderr, "error: unsupported format %q (use yaml or json)\n", format)
+				util.OsExit(1)
+				return nil
+			}
+
+			return nil
+		},
+	}
+
 	// Define the start command
 	startCmd := &cli.Command{
 		Name:  "start",
@@ -166,10 +235,11 @@ func main() {
 				logger,
 			)
 		}),
-		// sub command for start / validation
+		// sub command for start / validation / dump
 		Commands: []*cli.Command{
 			startCmd,
 			validateCmd,
+			dumpCmd,
 		},
 	}
 	if err := cmd.Run(ctx, os.Args); err != nil {

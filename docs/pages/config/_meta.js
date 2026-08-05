@@ -2,20 +2,14 @@ module.exports = {
 	"example": {
 		title: "erpc.yaml/ts",
 	},
+	"server": {
+		title: "Server",
+	},
 	"projects": {
 		title: "Projects",
 	},
 	failsafe: {
 		title: "Failsafe",
-		children: [
-			{name: "Circuit breaker", href: "/config/failsafe#circuitbreaker-policy"},
-			{name: "Hedge", href: "/config/failsafe#hedge-policy"},
-			{name: "Retry", href: "/config/failsafe#retry-policy"},
-			{name: "Timeout", href: "/config/failsafe#timeout-policy"},
-			{name: "Integrity", href: "/config/failsafe/integrity"},
-			{name: "Empty/missing data", href: "/config/failsafe/integrity#empty-or-missing-data-handling"},
-			{name: "Consensus", href: "/config/failsafe/consensus"},
-		],
 	},
 	database: {
 		title: "Database",

@@ -31,6 +31,38 @@ func init() {
 // This test reproduces the race condition described in https://github.com/erpc/erpc/pull/615
 // where cleanupMultiplexer would acquire the lock before followers could copy the response,
 // causing followers to see nil response and make their own upstream requests.
+func TestMethodSkipMultiplexing(t *testing.T) {
+	cases := []struct {
+		method string
+		skip   bool
+	}{
+		// Tx broadcasts must not multiplex: a retry of the same signed
+		// payload is the caller's way of asking us to re-submit, not a
+		// duplicate that can wait on an in-flight attempt.
+		{"eth_sendRawTransaction", true},
+		{"eth_sendTransaction", true},
+		// Reads are the multiplexer's intended workload: concurrent
+		// identical lookups share one upstream call.
+		{"eth_call", false},
+		{"eth_getBlockByNumber", false},
+		{"eth_getLogs", false},
+		{"eth_chainId", false},
+		{"net_version", false},
+		// Unknown methods default to multiplex-eligible. Skipping the
+		// dedup is a behaviour change, so the safer default for methods
+		// we haven't classified is to keep dedup on — the only cost is
+		// occasional redundant work coalescing into one request.
+		{"some_unknown_method", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		got := methodSkipMultiplexing(tc.method)
+		if got != tc.skip {
+			t.Errorf("methodSkipMultiplexing(%q) = %v, want %v", tc.method, got, tc.skip)
+		}
+	}
+}
+
 func TestNetwork_Multiplexer_FollowersReceiveResponse(t *testing.T) {
 	t.Run("ConcurrentFollowers_AllReceiveLeaderResponse", func(t *testing.T) {
 		util.ResetGock()
@@ -418,8 +450,6 @@ func setupTestNetworkForMultiplexer(t *testing.T, ctx context.Context) *Network 
 		pr,
 		nil,
 		metricsTracker,
-		1*time.Second,
-		nil,
 		nil,
 	)
 
@@ -431,6 +461,7 @@ func setupTestNetworkForMultiplexer(t *testing.T, ctx context.Context) *Network 
 		rateLimitersRegistry,
 		upstreamsRegistry,
 		metricsTracker,
+		nil,
 	)
 	require.NoError(t, err)
 
@@ -442,6 +473,7 @@ func setupTestNetworkForMultiplexer(t *testing.T, ctx context.Context) *Network 
 
 	err = network.Bootstrap(ctx)
 	require.NoError(t, err)
+	network.PinUpstreamOrderForTest()
 
 	// Set up state pollers
 	upsList := upstreamsRegistry.GetNetworkUpstreams(ctx, util.EvmNetworkId(123))
@@ -453,7 +485,8 @@ func setupTestNetworkForMultiplexer(t *testing.T, ctx context.Context) *Network 
 	}
 	time.Sleep(50 * time.Millisecond)
 
-	upstream.ReorderUpstreams(upstreamsRegistry)
+	// TODO(phase-10): migrate to policy.OverrideAllForTest(<engine>); was: upstream.ReorderUpstreams(upstreamsRegistry)
+	upstreamsRegistry.OverrideOrderForTest(util.EvmNetworkId(123))
 	time.Sleep(100 * time.Millisecond)
 
 	return network

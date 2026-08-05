@@ -28,6 +28,8 @@ func HandleProjectPreForward(ctx context.Context, network common.Network, nq *co
 		return projectPreForward_eth_chainId(ctx, network, nq)
 	case "eth_getlogs":
 		return projectPreForward_eth_getLogs(ctx, network, nq)
+	case "trace_filter", "arbtrace_filter":
+		return projectPreForward_trace_filter(ctx, network, nq)
 	default:
 		return false, nil, nil
 	}
@@ -49,6 +51,8 @@ func HandleNetworkPreForward(ctx context.Context, network common.Network, upstre
 		return networkPreForward_eth_getLogs(ctx, network, upstreams, nq)
 	case "eth_chainid":
 		return networkPreForward_eth_chainId(ctx, network, upstreams, nq)
+	case "trace_filter", "arbtrace_filter":
+		return networkPreForward_trace_filter(ctx, network, upstreams, nq)
 	default:
 		return false, nil, nil
 	}
@@ -70,6 +74,10 @@ func HandleNetworkPostForward(ctx context.Context, network common.Network, nq *c
 		return networkPostForward_eth_getBlockByNumber(ctx, network, nq, nr, re)
 	case "eth_getlogs":
 		return networkPostForward_eth_getLogs(ctx, network, nq, nr, re)
+	case "eth_sendrawtransaction":
+		return networkPostForward_eth_sendRawTransaction(ctx, network, nq, nr, re)
+	case "trace_filter", "arbtrace_filter":
+		return networkPostForward_trace_filter(ctx, network, nq, nr, re)
 	default:
 		return nr, re
 	}
@@ -91,6 +99,8 @@ func HandleUpstreamPreForward(ctx context.Context, n common.Network, u common.Up
 		return upstreamPreForward_eth_chainId(ctx, n, u, r)
 	case "trace_filter", "arbtrace_filter":
 		return upstreamPreForward_trace_filter(ctx, n, u, r)
+	case "eth_queryblocks", "eth_querytransactions", "eth_querylogs", "eth_querytraces", "eth_querytransfers":
+		return upstreamPreForward_eth_query(ctx, n, u, r)
 	default:
 		return false, nil, nil
 	}
@@ -148,6 +158,9 @@ func HandleUpstreamPostForward(ctx context.Context, n common.Network, u common.U
 		}
 		// Then apply directive-based validation
 		rs, validationErr = upstreamPostForward_eth_getBlockByNumber(ctx, n, u, rq, rs, re)
+
+	case "trace_filter", "arbtrace_filter":
+		rs, validationErr = upstreamPostForward_trace_filter(ctx, n, u, rq, rs, re)
 
 	default:
 		// For other methods, only apply the mark empty check if configured

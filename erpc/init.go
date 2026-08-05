@@ -42,11 +42,15 @@ func Init(
 	}
 
 	//
-	// 2) Set the right histogram buckets
+	// 2) Set the right histogram buckets and label filter
 	//
 	bucketStr := ""
-	if cfg.Metrics != nil && cfg.Metrics.HistogramBuckets != "" {
-		bucketStr = cfg.Metrics.HistogramBuckets
+	if cfg.Metrics != nil {
+		if cfg.Metrics.HistogramBuckets != "" {
+			bucketStr = cfg.Metrics.HistogramBuckets
+		}
+		// Must run before SetHistogramBuckets so the new Vecs are built with the filter applied.
+		telemetry.SetHistogramLabelFilter(cfg.Metrics.HistogramDropLabels, cfg.Metrics.HistogramLabelOverrides)
 	}
 	if err := telemetry.SetHistogramBuckets(bucketStr); err != nil {
 		logger.Warn().Err(err).Msg("failed to set histogram buckets, using defaults")
@@ -85,7 +89,7 @@ func Init(
 	//
 	logger.Info().Msg("initializing transports")
 	if cfg.Server != nil {
-		httpServer, err := NewHttpServer(appCtx, &logger, cfg.Server, cfg.HealthCheck, cfg.Admin, erpcInstance)
+		httpServer, err := NewHttpServer(appCtx, &logger, cfg.Server, cfg.HealthCheck, cfg.Admin, cfg.Indexer, erpcInstance)
 		if err != nil {
 			return err
 		}
@@ -95,6 +99,18 @@ func Init(
 					logger.Error().Msgf("failed to start http server: %v", err)
 					util.OsExit(util.ExitCodeHttpServerFailed)
 				}
+			}
+		}()
+	}
+	if cfg.Server != nil && cfg.Server.GrpcEnabled != nil && *cfg.Server.GrpcEnabled && !grpcSharesHttpV4(cfg.Server) {
+		grpcServer, err := NewGrpcServer(appCtx, &logger, cfg.Server, erpcInstance)
+		if err != nil {
+			return err
+		}
+		go func() {
+			if err := grpcServer.Start(&logger); err != nil {
+				logger.Error().Msgf("failed to start gRPC server: %v", err)
+				util.OsExit(util.ExitCodeHttpServerFailed)
 			}
 		}()
 	}

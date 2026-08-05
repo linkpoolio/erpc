@@ -85,24 +85,30 @@ func ExtractJsonRpcError(r *http.Response, nr *common.NormalizedResponse, jr *co
 			strings.Contains(msg, "limit the query to") ||
 			strings.Contains(msg, "maximum block range") ||
 			strings.Contains(msg, "range limit exceeded") ||
+			strings.Contains(msg, "too many results") ||
+			strings.Contains(msg, "try paginating") ||
 			(strings.Contains(msg, "maximum") && strings.Contains(msg, "blocks distance")) ||
 			strings.Contains(msg, "eth_getLogs is limited") {
 			return common.NewErrEndpointRequestTooLarge(
 				common.NewErrJsonRpcExceptionInternal(
 					int(code),
 					common.JsonRpcErrorEvmLargeRange,
-					fmt.Sprintf("getLogs request exceeded max allowed range: %s", err.Message),
+					fmt.Sprintf("request exceeded max allowed range: %s", err.Message),
 					nil,
 					details,
 				),
 				common.EvmBlockRangeTooLarge,
 			)
-		} else if strings.Contains(msg, "specify less number of address") {
+		} else if strings.Contains(msg, "specify less number of address") ||
+			// Alchemy/DRPC: "exceed max addresses or topics per search position"
+			strings.Contains(msg, "addresses or topics per search position") ||
+			// Infura: "This query contains N filters. The current limit is 5000."
+			(strings.Contains(msg, "filters") && strings.Contains(msg, "current limit is")) {
 			return common.NewErrEndpointRequestTooLarge(
 				common.NewErrJsonRpcExceptionInternal(
 					int(code),
 					common.JsonRpcErrorEvmLargeRange,
-					fmt.Sprintf("getLogs request exceeded max allowed addresses: %s", err.Message),
+					fmt.Sprintf("request exceeded max allowed addresses: %s", err.Message),
 					nil,
 					details,
 				),
@@ -303,7 +309,9 @@ func ExtractJsonRpcError(r *http.Response, nr *common.NormalizedResponse, jr *co
 			strings.Contains(ml, "already in the mempool") ||
 			strings.Contains(ml, "transaction already exists") ||
 			strings.Contains(ml, "already have transaction") ||
-			strings.Contains(ml, "already exists in mempool") {
+			strings.Contains(ml, "already exists in mempool") ||
+			strings.Contains(ml, "tx_replay_attack") ||
+			strings.Contains(ml, "replay attack") {
 			// These indicate the exact same transaction is already known - idempotent success case
 			return common.NewErrEndpointNonceException(
 				common.NewErrJsonRpcExceptionInternal(
@@ -335,13 +343,31 @@ func ExtractJsonRpcError(r *http.Response, nr *common.NormalizedResponse, jr *co
 		}
 
 		//----------------------------------------------------------------
-		// "Transaction rejected" or "Insufficient funds" or "out of gas" errors
-		// Note: This comes AFTER nonce/duplicate detection to avoid masking those errors
+		// "Insufficient funds / balance" errors
+		// Note: This comes AFTER nonce/duplicate detection to avoid masking those errors.
+		// For eth_sendRawTransaction these are treated as deterministic client-side state
+		// failures, so they should not be retried across upstreams by default.
+		//----------------------------------------------------------------
+
+		if strings.Contains(msg, "insufficient funds") ||
+			strings.Contains(msg, "insufficient balance") {
+			return common.NewErrEndpointExecutionException(
+				common.NewErrJsonRpcExceptionInternal(
+					int(code),
+					common.JsonRpcErrorTransactionRejected,
+					err.Message,
+					nil,
+					details,
+				),
+			)
+		}
+
+		//----------------------------------------------------------------
+		// "Transaction rejected" or "out of gas" errors
+		// Note: This comes AFTER nonce/duplicate detection to avoid masking those errors.
 		//----------------------------------------------------------------
 
 		if code == common.JsonRpcErrorTransactionRejected ||
-			strings.Contains(msg, "insufficient funds") ||
-			strings.Contains(msg, "insufficient balance") ||
 			strings.Contains(msg, "out of gas") ||
 			strings.Contains(msg, "gas too low") ||
 			strings.Contains(msg, "IntrinsicGas") {

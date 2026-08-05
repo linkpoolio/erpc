@@ -11,10 +11,11 @@ import (
 
 	"github.com/erpc/erpc/architecture/evm"
 	"github.com/erpc/erpc/common"
+	"github.com/erpc/erpc/consensus"
 	"github.com/erpc/erpc/health"
+	"github.com/erpc/erpc/internal/policy"
 	"github.com/erpc/erpc/upstream"
 	"github.com/erpc/erpc/util"
-	"github.com/failsafe-go/failsafe-go"
 	"github.com/rs/zerolog"
 )
 
@@ -25,6 +26,7 @@ type NetworksRegistry struct {
 	metricsTracker       *health.Tracker
 	evmJsonRpcCache      *evm.EvmJsonRpcCache
 	rateLimitersRegistry *upstream.RateLimitersRegistry
+	policyEngine         *policy.Engine
 	preparedNetworks     sync.Map // map[string]*Network
 	aliasToNetworkId     map[string]aliasEntry
 	aliasMu              *sync.RWMutex
@@ -44,6 +46,7 @@ func NewNetworksRegistry(
 	metricsTracker *health.Tracker,
 	evmJsonRpcCache *evm.EvmJsonRpcCache,
 	rateLimitersRegistry *upstream.RateLimitersRegistry,
+	policyEngine *policy.Engine,
 	logger *zerolog.Logger,
 ) *NetworksRegistry {
 	lg := logger.With().Str("component", "networksRegistry").Logger()
@@ -54,6 +57,7 @@ func NewNetworksRegistry(
 		metricsTracker:       metricsTracker,
 		evmJsonRpcCache:      evmJsonRpcCache,
 		rateLimitersRegistry: rateLimitersRegistry,
+		policyEngine:         policyEngine,
 		preparedNetworks:     sync.Map{},
 		aliasToNetworkId:     map[string]aliasEntry{},
 		aliasMu:              &sync.RWMutex{},
@@ -84,10 +88,11 @@ func NewNetwork(
 	rateLimitersRegistry *upstream.RateLimitersRegistry,
 	upstreamsRegistry *upstream.UpstreamsRegistry,
 	metricsTracker *health.Tracker,
+	policyEngine *policy.Engine,
 ) (*Network, error) {
 	lg := logger.With().Str("component", "proxy").Str("networkId", nwCfg.NetworkId()).Logger()
 
-	key := fmt.Sprintf("%s/%s", projectId, nwCfg.NetworkId())
+	_ = projectId // network executor scope is per-network; project label comes from the metrics tracker.
 
 	// Build a provider that resolves the dynamic block-unavailable retry delay
 	// from the network's EMA-estimated block time. Returns 0 before warmup so
@@ -107,51 +112,30 @@ func NewNetwork(
 		}
 	}
 
-	// Create failsafe executors from configs
-	var failsafeExecutors []*FailsafeExecutor
+	// Build one networkExecutor per Failsafe config entry, plus a no-op
+	// catch-all so unmatched (method, finality) pairs always resolve.
+	var failsafeExecutors []*networkExecutor
 	if len(nwCfg.Failsafe) > 0 {
 		for _, fsCfg := range nwCfg.Failsafe {
-			pls, err := upstream.CreateFailSafePolicies(appCtx, &lg, common.ScopeNetwork, key, fsCfg, dynamicBlockUnavailableDelay)
+			var cons consensusRunner
+			if fsCfg.Consensus != nil {
+				c, err := consensus.NewConsensus(fsCfg.Consensus, &lg)
+				if err != nil {
+					return nil, err
+				}
+				cons = c
+			}
+			ex, err := NewNetworkExecutor(fsCfg, &lg, cons, dynamicBlockUnavailableDelay)
 			if err != nil {
 				return nil, err
 			}
-			policyArray := upstream.ToPolicyArray(pls, "timeout", "consensus", "retry", "hedge")
-
-			var timeoutDuration *time.Duration
-			if fsCfg.Timeout != nil {
-				timeoutDuration = fsCfg.Timeout.Duration.DurationPtr()
-			}
-
-			method := fsCfg.MatchMethod
-			if method == "" {
-				method = "*"
-			}
-
-			emptyAccept := common.DefaultEmptyResultAccept()
-			if fsCfg.Retry != nil && fsCfg.Retry.EmptyResultAccept != nil {
-				emptyAccept = fsCfg.Retry.EmptyResultAccept
-			}
-
-			failsafeExecutors = append(failsafeExecutors, &FailsafeExecutor{
-				method:                 method,
-				finalities:             fsCfg.MatchFinality,
-				executor:               failsafe.NewExecutor(policyArray...),
-				timeout:                timeoutDuration,
-				consensusPolicyEnabled: fsCfg.Consensus != nil,
-				emptyResultAccept:      emptyAccept,
-			})
+			failsafeExecutors = append(failsafeExecutors, ex)
 		}
 	}
 
-	// Create a default executor if no failsafe config is provided or matched
-	failsafeExecutors = append(failsafeExecutors, &FailsafeExecutor{
-		method:                 "*",
-		finalities:             nil,
-		executor:               failsafe.NewExecutor[*common.NormalizedResponse](),
-		timeout:                nil,
-		consensusPolicyEnabled: false,
-		emptyResultAccept:      common.DefaultEmptyResultAccept(),
-	})
+	// Catch-all no-op executor.
+	noop, _ := NewNetworkExecutor(nil, &lg, nil, dynamicBlockUnavailableDelay)
+	failsafeExecutors = append(failsafeExecutors, noop)
 
 	lg.Debug().Interface("config", nwCfg.Failsafe).Msgf("created %d failsafe executors", len(failsafeExecutors))
 
@@ -174,6 +158,7 @@ func NewNetwork(
 		upstreamsRegistry:    upstreamsRegistry,
 		metricsTracker:       metricsTracker,
 		rateLimitersRegistry: rateLimitersRegistry,
+		policyEngine:         policyEngine,
 
 		bootstrapOnce:     sync.Once{},
 		inFlightRequests:  &sync.Map{},
@@ -183,6 +168,22 @@ func NewNetwork(
 
 	if nwCfg.Architecture == "" {
 		nwCfg.Architecture = common.ArchitectureEvm
+	}
+
+	// Cross-pod monotonic block counters. Tolerates up to 1024-block rollbacks
+	// (same threshold as per-upstream state pollers) so a rare deep reorg can
+	// still correct the value, but routine per-upstream jitter cannot.
+	if upstreamsRegistry != nil {
+		if ssr := upstreamsRegistry.SharedStateRegistry(); ssr != nil {
+			network.latestBlockShared = ssr.GetCounterInt64(
+				fmt.Sprintf("network/%s/latestBlock", netId),
+				evm.DefaultToleratedBlockHeadRollback,
+			)
+			network.finalizedBlockShared = ssr.GetCounterInt64(
+				fmt.Sprintf("network/%s/finalizedBlock", netId),
+				evm.DefaultToleratedBlockHeadRollback,
+			)
+		}
 	}
 
 	return network, nil
@@ -301,6 +302,7 @@ func (nr *NetworksRegistry) prepareNetwork(nwCfg *common.NetworkConfig) (*Networ
 		nr.rateLimitersRegistry,
 		nr.upstreamsRegistry,
 		nr.metricsTracker,
+		nr.policyEngine,
 	)
 	if err != nil {
 		return nil, err

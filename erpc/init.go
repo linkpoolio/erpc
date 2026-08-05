@@ -127,7 +127,7 @@ func Init(
 				return appCtx
 			},
 			Addr:              fmt.Sprintf(":%d", *cfg.Metrics.Port),
-			Handler:           promhttp.Handler(),
+			Handler:           newMetricsHandler(),
 			ReadHeaderTimeout: 10 * time.Second,
 		}
 		go func() {
@@ -157,4 +157,26 @@ func Init(
 	}
 
 	return nil
+}
+
+// newMetricsHandler serves Prometheus on /metrics (and / for back-compat) and a
+// cheap /healthz|/health that does not Gather the registry.
+//
+// Historically promhttp.Handler() was mounted as the root handler, so every
+// path — including kubelet probes hitting /healthz — returned the full
+// exposition. On hot pods that payload is tens of MB and Gather contends with
+// scrapes; probe timeoutSeconds: 5 then fails and kubelet restarts the pod.
+func newMetricsHandler() http.Handler {
+	mux := http.NewServeMux()
+	metrics := promhttp.Handler()
+	ok := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	})
+	mux.Handle("/healthz", ok)
+	mux.Handle("/health", ok)
+	mux.Handle("/metrics", metrics)
+	mux.Handle("/", metrics)
+	return mux
 }

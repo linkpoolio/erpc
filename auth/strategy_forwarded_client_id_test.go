@@ -26,12 +26,43 @@ func TestNewPayloadFromHttp_PathSecret(t *testing.T) {
 	require.Equal(t, common.AuthTypeSecret, ap.Type)
 	require.NotNil(t, ap.Secret)
 	require.Equal(t, "my-secret-key", ap.Secret.Value)
+
+	// Trailing slash is cleaned to a single segment.
+	ap, err = NewPayloadFromHttp("eth_blockNumber", "1.2.3.4:1234", http.Header{}, url.Values{}, "/my-secret-key/")
+	require.NoError(t, err)
+	require.Equal(t, common.AuthTypeSecret, ap.Type)
+	require.Equal(t, "my-secret-key", ap.Secret.Value)
 }
 
 func TestNewPayloadFromHttp_PathSecretIgnoredForMultiSegment(t *testing.T) {
 	ap, err := NewPayloadFromHttp("eth_blockNumber", "1.2.3.4:1234", http.Header{}, url.Values{}, "/main/evm/1")
 	require.NoError(t, err)
 	require.Equal(t, common.AuthTypeNetwork, ap.Type)
+}
+
+func TestNewPayloadFromHttp_PathSecretIgnoredForReserved(t *testing.T) {
+	for _, seg := range []string{"/admin", "/healthcheck", "/metrics"} {
+		ap, err := NewPayloadFromHttp("eth_blockNumber", "1.2.3.4:1234", http.Header{}, url.Values{}, seg)
+		require.NoError(t, err)
+		require.Equal(t, common.AuthTypeNetwork, ap.Type, "path %s", seg)
+	}
+}
+
+func TestSecretStrategy_RejectsEmpty(t *testing.T) {
+	s := NewSecretStrategy(&common.SecretStrategyConfig{Id: "cl-no-01", Value: ""})
+	_, err := s.Authenticate(context.Background(), nil, &AuthPayload{
+		Type:   common.AuthTypeSecret,
+		Secret: &SecretPayload{Value: ""},
+	})
+	require.Error(t, err)
+
+	s = NewSecretStrategy(&common.SecretStrategyConfig{Id: "cl-no-01", Value: "real-secret"})
+	user, err := s.Authenticate(context.Background(), nil, &AuthPayload{
+		Type:   common.AuthTypeSecret,
+		Secret: &SecretPayload{Value: "real-secret"},
+	})
+	require.NoError(t, err)
+	require.Equal(t, "cl-no-01", user.Id)
 }
 
 func TestNewPayloadFromHttp_ApiKeyQueryAndHeader(t *testing.T) {

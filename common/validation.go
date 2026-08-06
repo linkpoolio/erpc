@@ -784,7 +784,13 @@ func (s *NetworkStrategyConfig) Validate() error {
 }
 
 func (s *SecretStrategyConfig) Validate() error {
-	if s.Value == "" {
+	if s == nil {
+		return fmt.Errorf("auth.*.secret is required")
+	}
+	if strings.TrimSpace(s.Id) == "" {
+		return fmt.Errorf("auth.*.secret.id is required")
+	}
+	if strings.TrimSpace(s.Value) == "" {
 		return fmt.Errorf("auth.*.secret.value is required")
 	}
 	return nil

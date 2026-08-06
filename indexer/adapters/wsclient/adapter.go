@@ -270,18 +270,30 @@ func (a *Adapter) runWriter(sub *clientSub) {
 				// Drain us when the peer is truly gone.
 				continue
 			}
-			network := sub.labels.Network
-			if network == "" {
-				network = sub.networkID
-			}
-			telemetry.MetricWsSubscriptionEventsTotal.WithLabelValues(
-				sub.labels.Project,
-				network,
-				sub.kind.String(),
-				sub.labels.User,
-				sub.labels.AgentName,
-			).Inc()
+			incWsSubscriptionEvent(sub, false)
 		}
+	}
+}
+
+func subscriptionNetworkLabel(sub *clientSub) string {
+	if sub.labels.Network != "" {
+		return sub.labels.Network
+	}
+	return sub.networkID
+}
+
+func incWsSubscriptionEvent(sub *clientSub, dropped bool) {
+	labels := []string{
+		sub.labels.Project,
+		subscriptionNetworkLabel(sub),
+		sub.kind.String(),
+		sub.labels.User,
+		sub.labels.AgentName,
+	}
+	if dropped {
+		telemetry.MetricWsSubscriptionEventsDroppedTotal.WithLabelValues(labels...).Inc()
+	} else {
+		telemetry.MetricWsSubscriptionEventsTotal.WithLabelValues(labels...).Inc()
 	}
 }
 
@@ -296,30 +308,10 @@ func enqueue(sub *clientSub, payload json.RawMessage) {
 			// Buffer full; drop oldest to make room.
 			select {
 			case <-sub.notify:
-				network := sub.labels.Network
-				if network == "" {
-					network = sub.networkID
-				}
-				telemetry.MetricWsSubscriptionEventsDroppedTotal.WithLabelValues(
-					sub.labels.Project,
-					network,
-					sub.kind.String(),
-					sub.labels.User,
-					sub.labels.AgentName,
-				).Inc()
+				incWsSubscriptionEvent(sub, true)
 			default:
 				// Concurrent drain won the race — drop this message.
-				network := sub.labels.Network
-				if network == "" {
-					network = sub.networkID
-				}
-				telemetry.MetricWsSubscriptionEventsDroppedTotal.WithLabelValues(
-					sub.labels.Project,
-					network,
-					sub.kind.String(),
-					sub.labels.User,
-					sub.labels.AgentName,
-				).Inc()
+				incWsSubscriptionEvent(sub, true)
 				return
 			}
 		}

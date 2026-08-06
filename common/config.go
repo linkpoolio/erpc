@@ -2418,9 +2418,12 @@ type AuthStrategyConfig struct {
 // ForwardedClientIdStrategyConfig trusts a non-secret client identity header
 // injected by an upstream gateway after API-key auth (e.g. Envoy
 // apiKeyAuth.forwardClientIDHeader → X-Client-Id). Must only be enabled
-// behind a gateway that strips client-supplied values of that header.
+// behind a gateway that overwrites/strips client-supplied values of that header.
 type ForwardedClientIdStrategyConfig struct {
-	// Header is the request header carrying the client id. Default: "X-Client-Id".
+	// Header documents the expected gateway identity header (default conceptually
+	// "X-Client-Id"). Payload extraction in auth.NewPayloadFromHttp currently
+	// always reads X-Client-Id via case-insensitive Header.Get; this field is
+	// not yet used to select the header name at runtime.
 	Header string `yaml:"header,omitempty" json:"header,omitempty"`
 	// RateLimitBudget, if set, is applied to the authenticated user.
 	RateLimitBudget string `yaml:"rateLimitBudget,omitempty" json:"rateLimitBudget,omitempty"`

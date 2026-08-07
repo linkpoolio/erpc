@@ -152,7 +152,7 @@ func (sm *SubscriptionManager) Subscribe(
 	reqFinality := nq.Finality(ctx)
 	telemetry.CounterHandle(telemetry.MetricNetworkRequestsReceived,
 		project.Config.Id, nw.Label(), method,
-		reqFinality.String(), nq.UserId(), nq.AgentName(),
+		reqFinality.String(), nq.UserId(), nq.AgentName(), nq.Transport(),
 	).Inc()
 
 	jrReq, err := nq.JsonRpcRequest()
@@ -231,7 +231,7 @@ func (sm *SubscriptionManager) Unsubscribe(
 	reqFinality := nq.Finality(ctx)
 	telemetry.CounterHandle(telemetry.MetricNetworkRequestsReceived,
 		project.Config.Id, nw.Label(), method,
-		reqFinality.String(), nq.UserId(), nq.AgentName(),
+		reqFinality.String(), nq.UserId(), nq.AgentName(), nq.Transport(),
 	).Inc()
 
 	jrReq, err := nq.JsonRpcRequest()

@@ -224,6 +224,7 @@ func (wsc *WsConnection) handleMessage(raw []byte) {
 
 func (wsc *WsConnection) handleSingleRequest(raw []byte, startedAt *time.Time) {
 	nq := common.NewNormalizedRequest(raw)
+	nq.SetTransport("ws")
 	nq.ForwardHeaders = make(http.Header)
 
 	requestCtx := common.StartRequestSpan(wsc.appCtx, nq)
@@ -427,6 +428,7 @@ func (wsc *WsConnection) handleBatch(raw []byte, startedAt *time.Time) {
 // connection context.
 func (wsc *WsConnection) handleBatchItem(index int, reqRaw json.RawMessage, startedAt *time.Time, responses []interface{}) {
 	nq := common.NewNormalizedRequest(reqRaw)
+	nq.SetTransport("ws")
 	nq.ForwardHeaders = make(http.Header)
 	requestCtx := common.StartRequestSpan(wsc.appCtx, nq)
 

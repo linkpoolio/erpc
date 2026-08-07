@@ -360,6 +360,10 @@ type NormalizedRequest struct {
 	// Resolved client IP (set by HTTP ingress using trusted forwarders)
 	clientIP atomic.Value
 
+	// Client transport that delivered this request ("http" or "ws").
+	// Defaults to "http" when unset so HTTP ingress needs no explicit set.
+	transport atomic.Value
+
 	// Per-request execution counters; lazy-init via execStateHolder.
 	execStateHolder execStateHolder
 }
@@ -1320,6 +1324,27 @@ func (r *NormalizedRequest) AgentName() string {
 
 	// If not cached, return unknown (EnrichFromHttp should be called to populate this)
 	return "unknown"
+}
+
+// SetTransport records the client ingress transport ("http" or "ws").
+func (r *NormalizedRequest) SetTransport(transport string) {
+	if r == nil || transport == "" {
+		return
+	}
+	r.transport.Store(transport)
+}
+
+// Transport returns the client ingress transport. Defaults to "http".
+func (r *NormalizedRequest) Transport() string {
+	if r == nil {
+		return "http"
+	}
+	if v := r.transport.Load(); v != nil {
+		if s, ok := v.(string); ok && s != "" {
+			return s
+		}
+	}
+	return "http"
 }
 
 // getUserAgent returns the user agent string, with query parameter taking precedence over header

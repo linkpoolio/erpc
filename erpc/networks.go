@@ -1392,6 +1392,17 @@ func (n *Network) prepareRequest(ctx context.Context, nr *common.NormalizedReque
 			)
 		}
 		evm.NormalizeHttpJsonRpc(ctx, nr, jsonRpcReq)
+	case common.ArchitectureJsonRpc:
+		// Passthrough: parse/validate JSON-RPC envelope only — no EVM method hooks.
+		if _, err := nr.JsonRpcRequest(ctx); err != nil {
+			return common.NewErrJsonRpcExceptionInternal(
+				0,
+				common.JsonRpcErrorParseException,
+				"failed to unmarshal json-rpc request",
+				err,
+				nil,
+			)
+		}
 	default:
 		return common.NewErrJsonRpcExceptionInternal(
 			0,

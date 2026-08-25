@@ -474,6 +474,8 @@ func (u *UpstreamsRegistry) buildUpstreamBootstrapTask(upsCfg *common.UpstreamCo
 	taskName := fmt.Sprintf("upstream/%s", cfg.Id)
 	if cfg.Evm != nil && cfg.Evm.ChainId > 0 {
 		taskName = fmt.Sprintf("network/%s/upstream/%s", util.EvmNetworkId(cfg.Evm.ChainId), cfg.Id)
+	} else if cfg.Type == common.UpstreamTypeJsonRpc && cfg.JsonRpc != nil && cfg.JsonRpc.NetworkId != "" {
+		taskName = fmt.Sprintf("network/%s/upstream/%s", util.JsonRpcNetworkId(cfg.JsonRpc.NetworkId), cfg.Id)
 	}
 	return util.NewBootstrapTask(
 		taskName,

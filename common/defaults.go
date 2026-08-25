@@ -1646,8 +1646,17 @@ func (u *UpstreamConfig) SetDefaults(defaults *UpstreamConfig) error {
 		}
 	}
 	if u.Type == "" {
-		// TODO make actual calls to detect other types (solana, btc, etc)?
-		u.Type = UpstreamTypeEvm
+		if u.JsonRpc != nil && u.JsonRpc.NetworkId != "" {
+			u.Type = UpstreamTypeJsonRpc
+		} else {
+			// TODO make actual calls to detect other types (solana, btc, etc)?
+			u.Type = UpstreamTypeEvm
+		}
+	}
+	if u.Type == UpstreamTypeJsonRpc {
+		if u.JsonRpc == nil {
+			u.JsonRpc = &JsonRpcUpstreamConfig{}
+		}
 	}
 
 	if len(u.Failsafe) > 0 {
@@ -1940,12 +1949,20 @@ func (n *NetworkConfig) SetDefaults(upstreams []*UpstreamConfig, defaults *Netwo
 
 	if n.Architecture == "" {
 		if n.Evm != nil {
-			n.Architecture = "evm"
+			n.Architecture = ArchitectureEvm
+		} else if n.JsonRpc != nil && n.JsonRpc.Id != "" {
+			n.Architecture = ArchitectureJsonRpc
 		}
 	}
 
-	if n.Architecture == "evm" && n.Evm == nil {
+	if n.Architecture == ArchitectureEvm && n.Evm == nil {
 		n.Evm = &EvmNetworkConfig{}
+	}
+	if n.Architecture == ArchitectureJsonRpc && n.JsonRpc == nil {
+		n.JsonRpc = &JsonRpcNetworkConfig{}
+	}
+	if n.Architecture == ArchitectureJsonRpc && n.JsonRpc.Id == "" && n.Alias != "" {
+		n.JsonRpc.Id = n.Alias
 	}
 
 	// Apply methods defaults

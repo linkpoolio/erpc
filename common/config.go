@@ -1123,6 +1123,9 @@ type JsonRpcUpstreamConfig struct {
 	EnableGzip    *bool             `yaml:"enableGzip,omitempty" json:"enableGzip"`
 	Headers       map[string]string `yaml:"headers,omitempty" json:"headers"`
 	ProxyPool     string            `yaml:"proxyPool,omitempty" json:"proxyPool"`
+	// NetworkId binds this upstream to architecture jsonrpc (slug only, e.g. solana-mainnet).
+	// Required when type is jsonrpc; skipped for EVM upstreams that already use jsonRpc for batch/headers.
+	NetworkId string `yaml:"networkId,omitempty" json:"networkId,omitempty"`
 }
 
 func (c *JsonRpcUpstreamConfig) Copy() *JsonRpcUpstreamConfig {
@@ -2013,6 +2016,7 @@ type NetworkConfig struct {
 	RateLimitBudget   string                   `yaml:"rateLimitBudget,omitempty" json:"rateLimitBudget"`
 	Failsafe          []*FailsafeConfig        `yaml:"failsafe,omitempty" json:"failsafe"`
 	Evm               *EvmNetworkConfig        `yaml:"evm,omitempty" json:"evm"`
+	JsonRpc           *JsonRpcNetworkConfig    `yaml:"jsonRpc,omitempty" json:"jsonRpc"`
 	SelectionPolicy   *SelectionPolicyConfig   `yaml:"selectionPolicy,omitempty" json:"selectionPolicy"`
 	DirectiveDefaults *DirectiveDefaultsConfig `yaml:"directiveDefaults,omitempty" json:"directiveDefaults"`
 	Alias             string                   `yaml:"alias,omitempty" json:"alias"`
@@ -2562,13 +2566,21 @@ type RateLimitStoreConfig struct {
 }
 
 func (c *NetworkConfig) NetworkId() string {
-	if c.Architecture == "" || c.Evm == nil {
+	if c.Architecture == "" {
 		return ""
 	}
 
 	switch c.Architecture {
-	case "evm":
+	case ArchitectureEvm:
+		if c.Evm == nil {
+			return ""
+		}
 		return util.EvmNetworkId(c.Evm.ChainId)
+	case ArchitectureJsonRpc:
+		if c.JsonRpc == nil || c.JsonRpc.Id == "" {
+			return ""
+		}
+		return util.JsonRpcNetworkId(c.JsonRpc.Id)
 	default:
 		return ""
 	}

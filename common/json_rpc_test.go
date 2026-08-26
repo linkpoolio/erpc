@@ -219,8 +219,21 @@ func TestJsonRpcRequest_MarshalParams(t *testing.T) {
 		})
 		assert.NoError(t, err)
 
-		expectedRawReq := `{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}`
+		// Empty params omitted — required for Stellar / some non-EVM nodes
+		// that reject "params":[] (expect absent field or object).
+		expectedRawReq := `{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber"}`
 		assert.Equal(t, expectedRawReq, string(rawReq))
+	})
+
+	t.Run("Nil", func(t *testing.T) {
+		rawReq, err := SonicCfg.Marshal(JsonRpcRequest{
+			JSONRPC: "2.0",
+			ID:      1,
+			Method:  "getLatestLedger",
+			Params:  nil,
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, `{"jsonrpc":"2.0","id":1,"method":"getLatestLedger"}`, string(rawReq))
 	})
 
 	t.Run("Value", func(t *testing.T) {
@@ -235,6 +248,20 @@ func TestJsonRpcRequest_MarshalParams(t *testing.T) {
 		expectedRawReq := `{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":["0xcafecafecafecafecafecafecafecafecafecafe"]}`
 		assert.Equal(t, expectedRawReq, string(rawReq))
 	})
+}
+
+func TestJsonRpcResponse_ErrorNullIsSuccess(t *testing.T) {
+	// Bitcoin-family (dogecoind/litecoind) returns "error":null on success.
+	raw := `{"result":67851510,"error":null,"id":1}`
+	r := &JsonRpcResponse{}
+	err := r.ParseFromStream(nil, bytes.NewReader([]byte(raw)), len(raw))
+	require.NoError(t, err)
+	assert.Nil(t, r.Error)
+	assert.Equal(t, "67851510", string(r.result))
+
+	r2 := &JsonRpcResponse{}
+	require.NoError(t, r2.ParseError("null"))
+	assert.Nil(t, r2.Error)
 }
 
 func TestJsonRpcResponse_CanonicalHash_EmptyishNormalization(t *testing.T) {

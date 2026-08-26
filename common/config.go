@@ -2088,6 +2088,7 @@ func (n *NetworkConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		RateLimitBudget   string                   `yaml:"rateLimitBudget,omitempty"`
 		Failsafe          *FailsafeConfig          `yaml:"failsafe,omitempty"`
 		Evm               *EvmNetworkConfig        `yaml:"evm,omitempty"`
+		JsonRpc           *JsonRpcNetworkConfig    `yaml:"jsonRpc,omitempty"`
 		SelectionPolicy   *SelectionPolicyConfig   `yaml:"selectionPolicy,omitempty"`
 		DirectiveDefaults *DirectiveDefaultsConfig `yaml:"directiveDefaults,omitempty"`
 		Alias             string                   `yaml:"alias,omitempty"`
@@ -2106,6 +2107,7 @@ func (n *NetworkConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	n.Architecture = old.Architecture
 	n.RateLimitBudget = old.RateLimitBudget
 	n.Evm = old.Evm
+	n.JsonRpc = old.JsonRpc
 	n.SelectionPolicy = old.SelectionPolicy
 	n.DirectiveDefaults = old.DirectiveDefaults
 	n.Alias = old.Alias

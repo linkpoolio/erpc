@@ -536,8 +536,10 @@ func (n *Network) EvmLowestFinalizedBlockNumber(ctx context.Context) int64 {
 // latest tip. Fallback-tier upstreams are ignored while any primary is up —
 // otherwise tip re-fetch pins UseUpstream to a cordoned fallback that is not
 // in the ordered primary list. TipHW may still advance from fallback WS
-// (fan-out invariant); unconstrained tip re-fetch + emptyish escape reaches
-// those fallbacks when primaries miss.
+// (fan-out invariant). Tip re-fetch sets SkipFallbackEscape so empty tip
+// races on healthy primaries refuse-stale instead of burning pay-per-call
+// fallbacks; real HA still reaches fallbacks via selectionPolicy when
+// primaries are down.
 func (n *Network) EvmLeaderUpstream(ctx context.Context) common.Upstream {
 	var leader, fallbackLeader common.Upstream
 	var leaderLastBlock, fallbackLastBlock int64
@@ -1091,8 +1093,32 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 			//     couldn't serve; try a different one" — exactly the escape's job.
 			//   - Consensus requires strict per-upstream semantics; don't modify
 			//     the candidate set mid-execution.
+			//   - SkipFallbackEscape (TipHW tip re-fetch) blocks escape so tip
+			//     races on healthy primaries refuse-stale instead of fanning
+			//     out to pay-per-call tier:fallback upstreams.
+			dirs := effectiveReq.Directives()
+			skipFallbackEscape := dirs != nil && dirs.SkipFallbackEscape
+			if !skipFallbackEscape {
+				// Tip-race miss: the requested block is at or one ahead of the
+				// primary leader's poller — primaries import it within ~a block
+				// time (sibling lag, measured 100-200ms), so escaping to
+				// pay-per-call fallbacks buys nothing. Let the failsafe retry
+				// (emptyResultDelay / blockUnavailableDelay) re-visit primaries.
+				// Blocks further ahead (primaries stuck), older-block data gaps,
+				// and block-less methods (receipts) escape as before.
+				if bn, ok := effectiveReq.EvmBlockNumber().(int64); ok && bn > 0 {
+					if leader, ok2 := n.EvmLeaderUpstream(execSpanCtx).(common.EvmUpstream); ok2 && leader != nil {
+						if sp := leader.EvmStatePoller(); sp != nil && !sp.IsObjectNull() {
+							if l := sp.LatestBlock(); l > 0 && bn >= l && bn <= l+1 {
+								skipFallbackEscape = true
+							}
+						}
+					}
+				}
+			}
 			bestRespEmptyish := bestResp != nil && bestResp.IsResultEmptyish()
 			if (bestResp == nil || bestRespEmptyish) &&
+				!skipFallbackEscape &&
 				!effectiveReq.HasEscalatedToFallbacks() &&
 				lastErr != nil &&
 				n.cfg.Failover != nil && n.cfg.Failover.Enabled() &&

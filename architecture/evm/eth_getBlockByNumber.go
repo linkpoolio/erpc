@@ -231,19 +231,37 @@ func enforceHighestBlock(ctx context.Context, network common.Network, nq *common
 		// local pollers lag inside their debounce window, force-poll
 		// the leader once before deciding. Fall back to excluding the
 		// stale responder when no local poller has caught up yet.
-		useUpstream := ""
-		if leader := network.EvmLeaderUpstream(ctx); leader != nil {
-			if eu, ok := leader.(common.EvmUpstream); ok {
-				if sp := eu.EvmStatePoller(); sp != nil && !sp.IsObjectNull() {
-					if sp.LatestBlock() < highestBlockNumber {
-						_, _ = sp.PollLatestBlockNumberNow(ctx)
-					}
-					if sp.LatestBlock() >= highestBlockNumber {
-						useUpstream = leader.Id()
-					}
-				}
+		var leaderId string
+		var leaderLatest int64
+		resolveLeaderPin := func() string {
+			leader := network.EvmLeaderUpstream(ctx)
+			if leader == nil {
+				leaderId = ""
+				leaderLatest = 0
+				return ""
 			}
+			leaderId = leader.Id()
+			eu, ok := leader.(common.EvmUpstream)
+			if !ok {
+				leaderLatest = 0
+				return ""
+			}
+			sp := eu.EvmStatePoller()
+			if sp == nil || sp.IsObjectNull() {
+				leaderLatest = 0
+				return ""
+			}
+			if sp.LatestBlock() < highestBlockNumber {
+				_, _ = sp.PollLatestBlockNumberNow(ctx)
+			}
+			leaderLatest = sp.LatestBlock()
+			if leaderLatest >= highestBlockNumber {
+				return leader.Id()
+			}
+			return ""
 		}
+		useUpstream := resolveLeaderPin()
+		firstPinnedToLeader := useUpstream != ""
 		if useUpstream == "" && respBlockNumber > 0 {
 			useUpstream = fmt.Sprintf("!%s", nr.UpstreamId())
 		}
@@ -251,29 +269,75 @@ func enforceHighestBlock(ctx context.Context, network common.Network, nq *common
 		// Do not use pickHighestBlock against the stale "latest" response —
 		// that helper fail-opens to stale when the tip re-fetch misses, which
 		// is exactly the MultiNode FOOS / EnforceRepeatableRead trigger.
-		nnr, ferr := forwardGetBlockByNumber(ctx, network, nq, highestBlockNumber, itx, useUpstream)
+		// SkipFallbackEscape: empty tip races must refuse-stale rather than
+		// escape to pay-per-call tier:fallback upstreams (Infura etc.).
+		nnr, ferr := forwardGetBlockByNumber(ctx, network, nq, highestBlockNumber, itx, useUpstream, true)
 		if meetsTipFloor(ctx, nnr, highestBlockNumber) {
 			if nr != nil {
 				nr.Release()
 			}
 			return nnr, nil
 		}
+		pin1Upstream := ""
+		pin1Empty := true
 		if nnr != nil {
+			pin1Upstream = nnr.UpstreamId()
+			pin1Empty = nnr.IsResultEmptyish()
 			nnr.Release()
 		}
 
-		// Pinned / excluded re-fetch missed the tip (sibling fullnode
-		// lag, WS JSON-RPC miss, etc.). Retry with no UseUpstream pin
-		// so every upstream (including fallbacks via escape) can serve
-		// the concrete TipHW block.
-		nnr2, ferr2 := forwardGetBlockByNumber(ctx, network, nq, highestBlockNumber, itx, "")
+		// First re-fetch missed the tip. If it was NOT leader-pinned (the
+		// leader poller had not caught up to TipHW at resolve time — e.g.
+		// TipHW arrived via Redis before the local WS delivery), resolve
+		// the leader again: it has had the first Forward's retry budget
+		// plus a forced poll to catch up, and the node that delivered the
+		// head serves it immediately (same-node WS→HTTP gap is ~0ms).
+		// If the first re-fetch WAS leader-pinned and still missed, the
+		// leader genuinely cannot serve — sweep the remaining primaries
+		// unpinned instead (fallback escape stays suppressed either way).
+		pin2 := ""
+		if !firstPinnedToLeader {
+			pin2 = resolveLeaderPin()
+		}
+		staleUpstream := ""
+		if nr != nil {
+			staleUpstream = nr.UpstreamId()
+		}
+		logger.Warn().
+			Int64("tipHW", highestBlockNumber).
+			Int64("staleBlockNumber", respBlockNumber).
+			Str("staleUpstream", staleUpstream).
+			Str("leaderId", leaderId).
+			Int64("leaderLatest", leaderLatest).
+			Bool("firstPinnedToLeader", firstPinnedToLeader).
+			Str("pin1", useUpstream).
+			Str("pin1Upstream", pin1Upstream).
+			Bool("pin1Empty", pin1Empty).
+			Err(ferr).
+			Str("pin2", pin2).
+			Msg("tip re-fetch miss after first attempt")
+
+		nnr2, ferr2 := forwardGetBlockByNumber(ctx, network, nq, highestBlockNumber, itx, pin2, true)
 		if meetsTipFloor(ctx, nnr2, highestBlockNumber) {
+			servedBy := ""
+			if nnr2 != nil {
+				servedBy = nnr2.UpstreamId()
+			}
+			logger.Warn().
+				Int64("tipHW", highestBlockNumber).
+				Str("leaderId", leaderId).
+				Bool("firstPinnedToLeader", firstPinnedToLeader).
+				Str("pin2", pin2).
+				Str("servedBy", servedBy).
+				Msg("tip re-fetch recovered on second attempt")
 			if nr != nil {
 				nr.Release()
 			}
 			return nnr2, nil
 		}
+		pin2Upstream := ""
 		if nnr2 != nil {
+			pin2Upstream = nnr2.UpstreamId()
 			nnr2.Release()
 		}
 
@@ -281,6 +345,13 @@ func enforceHighestBlock(ctx context.Context, network common.Network, nq *common
 		logger.Warn().
 			Int64("highestBlockNumber", highestBlockNumber).
 			Int64("staleBlockNumber", respBlockNumber).
+			Str("staleUpstream", staleUpstream).
+			Str("leaderId", leaderId).
+			Int64("leaderLatest", leaderLatest).
+			Bool("firstPinnedToLeader", firstPinnedToLeader).
+			Str("pin1", useUpstream).
+			Str("pin2", pin2).
+			Str("pin2Upstream", pin2Upstream).
 			Err(ferr2).
 			Msg("tip re-fetch could not reach TipHW; refusing stale latest")
 		if nr != nil {
@@ -330,7 +401,9 @@ func enforceHighestBlock(ctx context.Context, network common.Network, nq *common
 		if respBlockNumber > 0 {
 			useUpstream = fmt.Sprintf("!%s", nr.UpstreamId())
 		}
-		nnr, err := forwardGetBlockByNumber(ctx, network, nq, highestBlockNumber, itx, useUpstream)
+		// Finalized re-fetch keeps fallback escape available for HA —
+		// SkipFallbackEscape is tip/latest-only (paid tip-race burn).
+		nnr, err := forwardGetBlockByNumber(ctx, network, nq, highestBlockNumber, itx, useUpstream, false)
 		return pickHighestBlock(ctx, nnr, nr, err)
 	default:
 		return nr, re
@@ -392,6 +465,7 @@ func forwardGetBlockByNumber(
 	blockNumber int64,
 	includeTx bool,
 	useUpstream string,
+	skipFallbackEscape bool,
 ) (*common.NormalizedResponse, error) {
 	request, err := BuildGetBlockByNumberRequest(blockNumber, includeTx)
 	if err != nil {
@@ -404,6 +478,7 @@ func forwardGetBlockByNumber(
 	dr := original.Directives().Clone()
 	dr.SkipCacheRead = "true"
 	dr.UseUpstream = useUpstream
+	dr.SkipFallbackEscape = skipFallbackEscape
 	newReq.SetDirectives(dr)
 	newReq.SetNetwork(network)
 	newReq.CopyHttpContextFrom(original)

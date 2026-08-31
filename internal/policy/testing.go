@@ -19,18 +19,12 @@ import (
 // the duration of the test should set `EvalInterval: 0` on the network's
 // SelectionPolicy.
 func OverrideOrderForTest(e *Engine, networkID string, ids ...string) {
-	e.mu.RLock()
-	slot, ok := e.slots[slotKey{networkID, "*", "*"}]
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	reg := e.networks[networkID]
-	e.mu.RUnlock()
-	if !ok || reg == nil {
+	if reg == nil {
 		return
 	}
-	// Stop the ticker for the lifetime of this override — tests that pin
-	// don't want background re-eval clobbering their cache mid-test, and
-	// thousands of test fixtures running at 1s tick each pushes the
-	// race-detector CI suite past its 20-minute budget.
-	slot.stop()
 	ups := reg.upstreamsFn()
 	index := make(map[string]common.Upstream, len(ups))
 	for _, u := range ups {
@@ -49,7 +43,21 @@ func OverrideOrderForTest(e *Engine, networkID string, ids ...string) {
 			ordered = append(ordered, u)
 		}
 	}
-	slot.cache.Store(&ordered)
+	// Pin every slot for this network (wildcard + method/finality-narrow).
+	// GetOrdered prefers a populated narrow slot over the wildcard, so
+	// overriding only ("*", "*") left tip-re-fetch tests selecting
+	// cordoned fallbacks from a stale eth_getBlockByNumber cache.
+	for k, slot := range e.slots {
+		if k.network != networkID {
+			continue
+		}
+		// Stop the ticker for the lifetime of this override — tests that pin
+		// don't want background re-eval clobbering their cache mid-test, and
+		// thousands of test fixtures running at 1s tick each pushes the
+		// race-detector CI suite past its 20-minute budget.
+		slot.stop()
+		slot.cache.Store(&ordered)
+	}
 }
 
 // OverrideAllForTest applies OverrideOrderForTest to EVERY network this

@@ -76,6 +76,22 @@ projects:
       - architecture: evm
         evm:
           chainId: 1
+          # Finality-stall detection: a primary whose `finalized` freezes (a
+          # node-software finality bug) while its `latest` keeps advancing is
+          # demoted as a SOURCE OF FINALIZED and the network fails over to a
+          # healthy fallback. A primary trips ONLY when BOTH hold: finalized has
+          # not advanced for `finalityStallWindow`, AND latest is more than
+          # `finalityStallMargin` blocks ahead of finalized. Requiring both
+          # avoids demoting a chain with legitimately deep-but-advancing finality
+          # — set the margin comfortably above the chain's normal
+          # latest-minus-finalized gap (raise it for very fast block times).
+          # Set either to 0 to disable. Defaults: 90s window, 8192-block margin.
+          finalityStallWindow: 90s
+          finalityStallMargin: 8192
+          # Rogue-high guard when adopting a fallback's finalized during an
+          # outage: reject any fallback finalized above `fallbackLatest - N`.
+          # 0 (default) means "cap at the corroborating fallback's own latest".
+          finalizedCorroborationReorgWindow: 0
         failsafe:
           timeout:
             duration: 30s

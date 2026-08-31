@@ -390,6 +390,12 @@ func (p *Prober) mirror(req *common.NormalizedRequest, u common.Upstream, cfg *P
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	// Mark this as a selection-recovery probe so the upstream executor treats
+	// it as breaker-ineligible: the probe must reach an excluded upstream even
+	// while its breaker is open, otherwise the breaker-open denial is recorded
+	// as a probe failure and the upstream stays excluded forever. We tag the
+	// ctx (not req) because req is shared with live client traffic.
+	ctx = common.WithSelectionProbe(ctx)
 
 	method, _ := req.Method()
 	finality := req.Finality(ctx)

@@ -729,6 +729,13 @@ func (s *AuthStrategyConfig) Validate() error {
 		if err := s.Database.Validate(); err != nil {
 			return err
 		}
+	case AuthTypeForwardedClientId:
+		if s.ForwardedClientId == nil {
+			return fmt.Errorf("auth.*.forwardedClientId is required for forwardedClientId strategy")
+		}
+		if err := s.ForwardedClientId.Validate(); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("auth.*.type '%s' is invalid must be one of: %v", s.Type, []AuthType{
 			AuthTypeNetwork,
@@ -736,7 +743,15 @@ func (s *AuthStrategyConfig) Validate() error {
 			AuthTypeJwt,
 			AuthTypeSiwe,
 			AuthTypeDatabase,
+			AuthTypeForwardedClientId,
 		})
+	}
+	return nil
+}
+
+func (s *ForwardedClientIdStrategyConfig) Validate() error {
+	if s == nil {
+		return fmt.Errorf("auth.*.forwardedClientId is required")
 	}
 	return nil
 }
@@ -769,7 +784,13 @@ func (s *NetworkStrategyConfig) Validate() error {
 }
 
 func (s *SecretStrategyConfig) Validate() error {
-	if s.Value == "" {
+	if s == nil {
+		return fmt.Errorf("auth.*.secret is required")
+	}
+	if strings.TrimSpace(s.Id) == "" {
+		return fmt.Errorf("auth.*.secret.id is required")
+	}
+	if strings.TrimSpace(s.Value) == "" {
 		return fmt.Errorf("auth.*.secret.value is required")
 	}
 	return nil
@@ -834,6 +855,14 @@ func (u *ProviderConfig) Validate(c *Config) error {
 func (u *UpstreamConfig) Validate(c *Config, skipEndpointCheck bool) error {
 	if !skipEndpointCheck && u.Endpoint == "" {
 		return fmt.Errorf("upstream.*.endpoint is required")
+	}
+	if u.Type == UpstreamTypeJsonRpc {
+		if u.JsonRpc == nil || u.JsonRpc.NetworkId == "" {
+			return fmt.Errorf("upstream.*.jsonRpc.networkId is required for type jsonrpc")
+		}
+		if !util.IsValidIdentifier(u.JsonRpc.NetworkId) {
+			return fmt.Errorf("upstream.*.jsonRpc.networkId '%s' is invalid", u.JsonRpc.NetworkId)
+		}
 	}
 	if u.Evm != nil {
 		if err := u.Evm.Validate(u); err != nil {
@@ -1253,8 +1282,16 @@ func (n *NetworkConfig) Validate(c *Config) error {
 	if n.Architecture == "" {
 		return fmt.Errorf("network.*.architecture is required")
 	}
-	if n.Architecture == "evm" && n.Evm == nil {
+	if n.Architecture == ArchitectureEvm && n.Evm == nil {
 		return fmt.Errorf("network.*.evm is required for evm networks")
+	}
+	if n.Architecture == ArchitectureJsonRpc {
+		if n.JsonRpc == nil || n.JsonRpc.Id == "" {
+			return fmt.Errorf("network.*.jsonRpc.id is required for jsonrpc networks")
+		}
+		if !util.IsValidIdentifier(n.JsonRpc.Id) {
+			return fmt.Errorf("network.*.jsonRpc.id '%s' must contain only alphanumeric characters, dash, or underscore", n.JsonRpc.Id)
+		}
 	}
 	if n.Evm != nil {
 		if err := n.Evm.Validate(); err != nil {

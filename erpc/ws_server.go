@@ -224,6 +224,7 @@ func (wsc *WsConnection) handleMessage(raw []byte) {
 
 func (wsc *WsConnection) handleSingleRequest(raw []byte, startedAt *time.Time) {
 	nq := common.NewNormalizedRequest(raw)
+	nq.SetTransport("ws")
 	nq.ForwardHeaders = make(http.Header)
 
 	requestCtx := common.StartRequestSpan(wsc.appCtx, nq)
@@ -342,7 +343,7 @@ func (wsc *WsConnection) authenticate(requestCtx context.Context, nq *common.Nor
 		return nil
 	}
 
-	ap, err := auth.NewPayloadFromHttp(method, wsc.httpReq.RemoteAddr, wsc.httpReq.Header, wsc.httpReq.URL.Query())
+	ap, err := auth.NewPayloadFromHttp(method, wsc.httpReq.RemoteAddr, wsc.httpReq.Header, wsc.httpReq.URL.Query(), wsc.httpReq.URL.Path)
 	if err != nil {
 		return err
 	}
@@ -427,6 +428,7 @@ func (wsc *WsConnection) handleBatch(raw []byte, startedAt *time.Time) {
 // connection context.
 func (wsc *WsConnection) handleBatchItem(index int, reqRaw json.RawMessage, startedAt *time.Time, responses []interface{}) {
 	nq := common.NewNormalizedRequest(reqRaw)
+	nq.SetTransport("ws")
 	nq.ForwardHeaders = make(http.Header)
 	requestCtx := common.StartRequestSpan(wsc.appCtx, nq)
 
@@ -455,7 +457,7 @@ func (wsc *WsConnection) handleBatchItem(index int, reqRaw json.RawMessage, star
 	}
 
 	if wsc.project != nil {
-		ap, err := auth.NewPayloadFromHttp(method, wsc.httpReq.RemoteAddr, wsc.httpReq.Header, wsc.httpReq.URL.Query())
+		ap, err := auth.NewPayloadFromHttp(method, wsc.httpReq.RemoteAddr, wsc.httpReq.Header, wsc.httpReq.URL.Query(), wsc.httpReq.URL.Path)
 		if err != nil {
 			responses[index] = processErrorBody(wsc.logger, startedAt, nq, err, &common.TRUE)
 			common.EndRequestSpan(requestCtx, nil, err)

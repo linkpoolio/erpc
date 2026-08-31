@@ -152,7 +152,7 @@ func (sm *SubscriptionManager) Subscribe(
 	reqFinality := nq.Finality(ctx)
 	telemetry.CounterHandle(telemetry.MetricNetworkRequestsReceived,
 		project.Config.Id, nw.Label(), method,
-		reqFinality.String(), nq.UserId(), nq.AgentName(),
+		reqFinality.String(), nq.UserId(), nq.AgentName(), nq.Transport(),
 	).Inc()
 
 	jrReq, err := nq.JsonRpcRequest()
@@ -174,7 +174,12 @@ func (sm *SubscriptionManager) Subscribe(
 		return nil, err
 	}
 
-	conn.adapter.AddSubscription(clientSubID, networkId, kind, filterHash)
+	conn.adapter.AddSubscription(clientSubID, networkId, kind, filterHash, wsclient.SubscriptionLabels{
+		Project:   project.Config.Id,
+		Network:   nw.Label(),
+		User:      nq.UserId(),
+		AgentName: nq.AgentName(),
+	})
 	sm.bySubID.Store(clientSubID, &subRecord{
 		clientSubID: clientSubID,
 		connID:      wsc.id,
@@ -226,7 +231,7 @@ func (sm *SubscriptionManager) Unsubscribe(
 	reqFinality := nq.Finality(ctx)
 	telemetry.CounterHandle(telemetry.MetricNetworkRequestsReceived,
 		project.Config.Id, nw.Label(), method,
-		reqFinality.String(), nq.UserId(), nq.AgentName(),
+		reqFinality.String(), nq.UserId(), nq.AgentName(), nq.Transport(),
 	).Inc()
 
 	jrReq, err := nq.JsonRpcRequest()

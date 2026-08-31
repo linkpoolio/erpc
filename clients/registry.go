@@ -96,7 +96,9 @@ func (manager *ClientRegistry) CreateClient(appCtx context.Context, ups common.U
 		var c ClientInterface
 		var cerr error
 		switch cfg.Type {
-		case common.UpstreamTypeEvm:
+		case common.UpstreamTypeEvm, common.UpstreamTypeJsonRpc:
+			// jsonrpc architecture reuses the generic HTTP/WS JSON-RPC clients
+			// (passthrough; no EVM chainId/state poller). gRPC BDS remains EVM-only.
 			switch parsedUrl.Scheme {
 			case "http", "https":
 				c, cerr = NewGenericHttpJsonRpcClient(
@@ -126,6 +128,10 @@ func (manager *ClientRegistry) CreateClient(appCtx context.Context, ups common.U
 					cerr = fmt.Errorf("failed to create WebSocket client for upstream %v: %w", cfg.Id, cerr)
 				}
 			case "grpc", "grpc+bds":
+				if cfg.Type == common.UpstreamTypeJsonRpc {
+					cerr = fmt.Errorf("unsupported endpoint scheme: %v for upstream type jsonrpc: %v", parsedUrl.Scheme, cfg.Id)
+					break
+				}
 				c, cerr = NewGrpcBdsClient(
 					appCtx,
 					&lg,

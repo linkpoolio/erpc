@@ -86,7 +86,7 @@ func (s *HttpServer) handleHealthCheck(
 		headers := r.Header
 		queryArgs := r.URL.Query()
 
-		ap, err := auth.NewPayloadFromHttp("healthcheck", r.RemoteAddr, headers, queryArgs)
+		ap, err := auth.NewPayloadFromHttp("healthcheck", r.RemoteAddr, headers, queryArgs, r.URL.Path)
 		if err != nil {
 			handleErrorResponse(ctx, &logger, startedAt, nil, err, w, encoder, writeFatalError, &common.TRUE, s.executionHeadersMode())
 			return

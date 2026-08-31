@@ -1487,6 +1487,14 @@ func (u *Upstream) detectFeatures(ctx context.Context) error {
 
 		// TODO evm: check trace methods availability (by engine? erigon/geth/etc)
 		// TODO evm: detect max eth_getLogs max block range
+	} else if cfg.Type == common.UpstreamTypeJsonRpc {
+		if cfg.JsonRpc == nil || cfg.JsonRpc.NetworkId == "" {
+			return common.NewTaskFatal(fmt.Errorf("upstream.*.jsonRpc.networkId is required for type jsonrpc"))
+		}
+		if !util.IsValidIdentifier(cfg.JsonRpc.NetworkId) {
+			return common.NewTaskFatal(fmt.Errorf("upstream.*.jsonRpc.networkId '%s' is invalid", cfg.JsonRpc.NetworkId))
+		}
+		u.networkId.Store(util.JsonRpcNetworkId(cfg.JsonRpc.NetworkId))
 	} else {
 		return fmt.Errorf("upstream type not supported: %s", cfg.Type)
 	}

@@ -63,6 +63,11 @@ func NewAuthorizer(appCtx context.Context, logger *zerolog.Logger, projectId str
 		if err != nil {
 			return nil, err
 		}
+	case common.AuthTypeForwardedClientId:
+		if cfg.ForwardedClientId == nil {
+			return nil, common.NewErrInvalidConfig("forwardedClientId strategy config is nil")
+		}
+		strategy = NewForwardedClientIdStrategy(cfg.ForwardedClientId)
 	default:
 		return nil, common.NewErrInvalidConfig(fmt.Sprintf("unknown auth strategy type: %s", cfg.Type))
 	}

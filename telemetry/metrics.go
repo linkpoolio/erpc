@@ -88,6 +88,22 @@ var (
 		Help:      "Whether the upstream WebSocket connection is currently established (1) or down/wedged (0).",
 	}, []string{"project", "vendor", "network", "upstream"})
 
+	// Client-facing WebSocket subscription push events (newHeads / logs /
+	// pending txs) successfully written to a downstream client. Internal
+	// ops metric — CLL rpc_ws_event_count_total maps to request_received
+	// with transport="ws", not these pushes.
+	MetricWsSubscriptionEventsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "erpc",
+		Name:      "ws_subscription_events_total",
+		Help:      "Subscription notifications successfully written to a client WebSocket.",
+	}, []string{"project", "network", "kind", "user", "agent_name"})
+
+	MetricWsSubscriptionEventsDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "erpc",
+		Name:      "ws_subscription_events_dropped_total",
+		Help:      "Subscription notifications dropped due to slow-client buffer overflow.",
+	}, []string{"project", "network", "kind", "user", "agent_name"})
+
 	MetricUpstreamCordoned = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "erpc",
 		Name:      "upstream_cordoned",
@@ -335,7 +351,7 @@ var (
 		Namespace: "erpc",
 		Name:      "network_request_received_total",
 		Help:      "Total number of requests received for a network.",
-	}, []string{"project", "network", "category", "finality", "user", "agent_name"})
+	}, []string{"project", "network", "category", "finality", "user", "agent_name", "transport"})
 
 	MetricNetworkMultiplexedRequests = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "erpc",

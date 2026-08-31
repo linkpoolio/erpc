@@ -12,7 +12,8 @@ import (
 type NetworkArchitecture string
 
 const (
-	ArchitectureEvm NetworkArchitecture = "evm"
+	ArchitectureEvm     NetworkArchitecture = "evm"
+	ArchitectureJsonRpc NetworkArchitecture = "jsonrpc"
 )
 
 type Network interface {
@@ -33,7 +34,12 @@ type Network interface {
 }
 
 func IsValidArchitecture(architecture string) bool {
-	return architecture == string(ArchitectureEvm) // TODO add more architectures when they are supported
+	switch NetworkArchitecture(architecture) {
+	case ArchitectureEvm, ArchitectureJsonRpc:
+		return true
+	default:
+		return false
+	}
 }
 
 func IsValidNetwork(network string) bool {
@@ -43,6 +49,10 @@ func IsValidNetwork(network string) bool {
 			return false
 		}
 		return chainId > 0
+	}
+	if strings.HasPrefix(network, "jsonrpc:") {
+		id := strings.TrimPrefix(network, "jsonrpc:")
+		return id != "" && !strings.Contains(id, ":")
 	}
 
 	return false

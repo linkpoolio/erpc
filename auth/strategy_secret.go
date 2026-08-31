@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"strings"
 
 	"github.com/erpc/erpc/common"
 )
@@ -21,6 +22,14 @@ func (s *SecretStrategy) Supports(ap *AuthPayload) bool {
 }
 
 func (s *SecretStrategy) Authenticate(ctx context.Context, req *common.NormalizedRequest, ap *AuthPayload) (*common.User, error) {
+	if ap == nil || ap.Secret == nil {
+		return nil, common.NewErrAuthUnauthorized("secret", "missing secret")
+	}
+	// Reject empty configured or presented secrets so a missing env expansion
+	// (value="") can never authenticate an empty path/query credential.
+	if strings.TrimSpace(s.cfg.Value) == "" || strings.TrimSpace(ap.Secret.Value) == "" {
+		return nil, common.NewErrAuthUnauthorized("secret", "invalid secret")
+	}
 	if ap.Secret.Value != s.cfg.Value {
 		return nil, common.NewErrAuthUnauthorized("secret", "invalid secret")
 	}

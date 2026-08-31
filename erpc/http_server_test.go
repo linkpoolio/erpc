@@ -4112,7 +4112,7 @@ func TestHttpServer_HandleHealthCheck(t *testing.T) {
 				pp.networksRegistry = NewNetworksRegistry(pp, ctx, pp.upstreamsRegistry, mtk, nil, nil, nil, logger)
 
 				authReg, _ := auth.NewAuthRegistry(ctx, logger, "test", &common.AuthConfig{Strategies: []*common.AuthStrategyConfig{
-					{Type: common.AuthTypeSecret, Secret: &common.SecretStrategyConfig{Value: "test-secret"}},
+					{Type: common.AuthTypeSecret, Secret: &common.SecretStrategyConfig{Id: "test-user", Value: "test-secret"}},
 				}}, nil)
 
 				return &HttpServer{

@@ -121,7 +121,7 @@ func (p *PreparedProject) Forward(ctx context.Context, networkId string, nq *com
 	reqFinality := nq.Finality(ctx)
 
 	telemetry.CounterHandle(telemetry.MetricNetworkRequestsReceived,
-		p.Config.Id, network.Label(), method, reqFinality.String(), nq.UserId(), nq.AgentName(),
+		p.Config.Id, network.Label(), method, reqFinality.String(), nq.UserId(), nq.AgentName(), nq.Transport(),
 	).Inc()
 	lg := p.Logger.With().
 		Str("component", "proxy").

@@ -12,6 +12,10 @@ func EvmNetworkId(chainId interface{}) string {
 	return fmt.Sprintf("evm:%d", chainId)
 }
 
+func JsonRpcNetworkId(id string) string {
+	return fmt.Sprintf("jsonrpc:%s", id)
+}
+
 var validIdentifierRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 func IsValidIdentifier(s string) bool {
@@ -22,6 +26,10 @@ func IsValidNetworkId(s string) bool {
 	if strings.HasPrefix(s, "evm:") {
 		_, err := strconv.Atoi(s[4:])
 		return err == nil
+	}
+	if strings.HasPrefix(s, "jsonrpc:") {
+		id := s[len("jsonrpc:"):]
+		return id != "" && IsValidIdentifier(id)
 	}
 	return false
 }

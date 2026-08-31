@@ -309,10 +309,12 @@ func (nr *NetworksRegistry) prepareNetwork(nwCfg *common.NetworkConfig) (*Networ
 	}
 
 	switch nwCfg.Architecture {
-	case "evm":
+	case common.ArchitectureEvm:
 		if nr.evmJsonRpcCache != nil {
 			network.cacheDal = nr.evmJsonRpcCache.WithProjectId(nr.project.Config.Id)
 		}
+	case common.ArchitectureJsonRpc:
+		// No architecture-specific cache yet; failsafe + metrics still apply.
 	default:
 		return nil, errors.New("unknown network architecture")
 	}
@@ -363,6 +365,11 @@ func (nr *NetworksRegistry) resolveNetworkConfig(networkId string) (*common.Netw
 				return nil, e
 			}
 			nwCfg.Evm = &common.EvmNetworkConfig{ChainId: int64(c)}
+		case common.ArchitectureJsonRpc:
+			if !util.IsValidIdentifier(s[1]) {
+				return nil, fmt.Errorf("invalid jsonrpc network id: %s", networkId)
+			}
+			nwCfg.JsonRpc = &common.JsonRpcNetworkConfig{Id: s[1]}
 		}
 		if err := nwCfg.SetDefaults(prj.Config.Upstreams, prj.Config.NetworkDefaults); err != nil {
 			return nil, fmt.Errorf("failed to set defaults for network config: %w", err)

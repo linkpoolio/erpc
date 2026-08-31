@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 
 	"github.com/erpc/erpc/indexer"
+	"github.com/erpc/erpc/telemetry"
 	"github.com/rs/zerolog"
 )
 
@@ -61,12 +62,23 @@ type routeKey struct {
 	filterHash string
 }
 
+// SubscriptionLabels are frozen at eth_subscribe time for per-client metrics
+// on delivered / dropped notification events.
+type SubscriptionLabels struct {
+	Project   string
+	// Network is the metrics network label (alias if configured, else network id).
+	Network   string
+	User      string
+	AgentName string
+}
+
 type clientSub struct {
 	id        string
 	kind      indexer.EventKind
 	networkID string
 	// filterHash is "" for newHeads.
 	filterHash string
+	labels     SubscriptionLabels
 
 	notify chan json.RawMessage
 	done   chan struct{}
@@ -129,13 +141,23 @@ func (a *Adapter) Deliver(ev indexer.IndexedEvent) {
 // AddSubscription registers a client subscription on this connection and
 // starts its writer goroutine. clientSubId is the erpc-generated opaque
 // ID the caller already returned to the client. filterHash is "" for
-// newHeads.
-func (a *Adapter) AddSubscription(clientSubID, networkID string, kind indexer.EventKind, filterHash string) {
+// newHeads. labels are used for Prometheus counters on deliver/drop.
+func (a *Adapter) AddSubscription(clientSubID, networkID string, kind indexer.EventKind, filterHash string, labels SubscriptionLabels) {
+	if labels.Project == "" {
+		labels.Project = "n/a"
+	}
+	if labels.User == "" {
+		labels.User = "n/a"
+	}
+	if labels.AgentName == "" {
+		labels.AgentName = "unknown"
+	}
 	sub := &clientSub{
 		id:         clientSubID,
 		kind:       kind,
 		networkID:  networkID,
 		filterHash: filterHash,
+		labels:     labels,
 		notify:     make(chan json.RawMessage, clientNotifyBufferSize),
 		done:       make(chan struct{}),
 	}
@@ -246,8 +268,32 @@ func (a *Adapter) runWriter(sub *clientSub) {
 					Msg("failed to write subscription notification")
 				// Errors are per-sub; the connection-close path will
 				// Drain us when the peer is truly gone.
+				continue
 			}
+			incWsSubscriptionEvent(sub, false)
 		}
+	}
+}
+
+func subscriptionNetworkLabel(sub *clientSub) string {
+	if sub.labels.Network != "" {
+		return sub.labels.Network
+	}
+	return sub.networkID
+}
+
+func incWsSubscriptionEvent(sub *clientSub, dropped bool) {
+	labels := []string{
+		sub.labels.Project,
+		subscriptionNetworkLabel(sub),
+		sub.kind.String(),
+		sub.labels.User,
+		sub.labels.AgentName,
+	}
+	if dropped {
+		telemetry.MetricWsSubscriptionEventsDroppedTotal.WithLabelValues(labels...).Inc()
+	} else {
+		telemetry.MetricWsSubscriptionEventsTotal.WithLabelValues(labels...).Inc()
 	}
 }
 
@@ -262,8 +308,10 @@ func enqueue(sub *clientSub, payload json.RawMessage) {
 			// Buffer full; drop oldest to make room.
 			select {
 			case <-sub.notify:
+				incWsSubscriptionEvent(sub, true)
 			default:
 				// Concurrent drain won the race — drop this message.
+				incWsSubscriptionEvent(sub, true)
 				return
 			}
 		}

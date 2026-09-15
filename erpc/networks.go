@@ -730,10 +730,19 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 	// (typically the WS ingress that SuggestLatestBlock advanced) so the
 	// first attempt hits the node that already has the head — same idea as
 	// EnforceHighestBlock's tip re-fetch pin, but for direct client tip reads.
+	//
+	// Moving-tag latest-state reads (eth_call("latest"), etc.) resolve to
+	// blockNumber 0, so the concrete-bn path above never runs. Partition by
+	// TipHW instead so near-tip peers are tried first; the lag hard-gate in
+	// checkUpstreamBlockAvailability then skips peers that are too far behind.
 	if n.Architecture() == common.ArchitectureEvm {
 		if bn := requestBlockNumber(ctx, req); bn > 0 {
 			upsList = partitionUpstreamsByLatestBlock(upsList, bn)
 			n.pinNearTipGetBlockToLeader(ctx, req, method, bn)
+		} else if isLatestStateReadMethod(method) && isMovingLatestOrPendingTag(ctx, req) {
+			if tip := n.EvmHighestLatestBlockNumber(ctx); tip > 0 {
+				upsList = partitionUpstreamsByLatestBlock(upsList, tip)
+			}
 		}
 	}
 
@@ -1690,6 +1699,85 @@ func (n *Network) recordHedgeDiscard(
 	common.SetTraceSpanError(span, common.NewErrUpstreamHedgeCancelled(u.Id(), err))
 }
 
+// defaultMaxLatestStateLagBlocks matches the common selection-policy threshold
+// blockNumberLagAbove(16): peers farther behind TipHW than this must not serve
+// moving-tag latest-state reads (eth_call("latest"), etc.).
+const defaultMaxLatestStateLagBlocks int64 = 16
+
+// isLatestStateReadMethod reports whether method returns chain state at a
+// caller-chosen block tag. Stale answers from a lagging upstream look like
+// success for these methods, so they need a TipHW lag hard-gate.
+func isLatestStateReadMethod(method string) bool {
+	switch method {
+	case "eth_call", "eth_estimateGas", "eth_getBalance", "eth_getCode", "eth_getStorageAt", "eth_getTransactionCount":
+		return true
+	default:
+		return false
+	}
+}
+
+// isMovingLatestOrPendingTag is true when the request targets the moving tip
+// (explicit "latest"/"pending", or eth_call with an omitted/empty block arg).
+// Concrete hex blocks and other tags (finalized/safe/earliest) are excluded.
+func isMovingLatestOrPendingTag(ctx context.Context, req *common.NormalizedRequest) bool {
+	if req == nil {
+		return false
+	}
+	ref, bn, err := evm.ExtractBlockReferenceFromRequest(ctx, req)
+	if err != nil || bn > 0 {
+		return false
+	}
+	// Block-hash object refs resolve to a 0x… hash with bn=0 — not a moving tip.
+	if strings.HasPrefix(ref, "0x") && len(ref) >= 66 {
+		return false
+	}
+	switch strings.ToLower(ref) {
+	case "", "latest", "pending":
+		return true
+	default:
+		return false
+	}
+}
+
+// checkLatestStateLagSkip skips an upstream whose poller head lags network TipHW
+// by more than maxLag when serving a moving-tag latest-state read. Unlike the
+// numeric-block path below, "latest"/"pending" resolve to bn=0 and would otherwise
+// fail-open — which is exactly how a stalled WS peer can answer eth_call with
+// stale state while TipHW is thousands of blocks ahead.
+func (n *Network) checkLatestStateLagSkip(ctx context.Context, u common.Upstream, req *common.NormalizedRequest, method string) (error, bool) {
+	if !isLatestStateReadMethod(method) || !isMovingLatestOrPendingTag(ctx, req) {
+		return nil, false
+	}
+	eu, ok := u.(common.EvmUpstream)
+	if !ok {
+		return nil, false
+	}
+	sp := eu.EvmStatePoller()
+	if sp == nil || sp.IsObjectNull() {
+		return nil, false
+	}
+	tip := n.EvmHighestLatestBlockNumber(ctx)
+	upsLatest := sp.LatestBlock()
+	if tip <= 0 || upsLatest <= 0 {
+		return nil, false
+	}
+	lag := tip - upsLatest
+	if lag <= defaultMaxLatestStateLagBlocks {
+		return nil, false
+	}
+	finalized := sp.FinalizedBlock()
+	n.logger.Debug().
+		Str("upstreamId", u.Id()).
+		Str("method", method).
+		Int64("networkTip", tip).
+		Int64("pollerLatest", upsLatest).
+		Int64("lag", lag).
+		Int64("maxLag", defaultMaxLatestStateLagBlocks).
+		Msg("skipping lagging upstream for latest-state read")
+	// Retryable: another near-tip peer may still serve; treat like block-unavailable.
+	return common.NewErrUpstreamBlockUnavailable(u.Id(), tip, upsLatest, finalized), true
+}
+
 // checkUpstreamBlockAvailability performs per-upstream gating for the request based on block availability.
 // It is invoked just before forwarding to an upstream to avoid copying/filtering the list.
 // Returns (nil, false) if upstream has the block available.
@@ -1707,6 +1795,11 @@ func (n *Network) recordHedgeDiscard(
 func (n *Network) checkUpstreamBlockAvailability(ctx context.Context, u common.Upstream, req *common.NormalizedRequest, method string) (error, bool) {
 	if n.cfg.Architecture != common.ArchitectureEvm {
 		return nil, false
+	}
+	// Hard gate for moving-tag latest-state reads — always on, independent of
+	// EnforceBlockAvailability (those methods succeed with stale state otherwise).
+	if skipErr, retryable := n.checkLatestStateLagSkip(ctx, u, req, method); skipErr != nil {
+		return skipErr, retryable
 	}
 	if !n.resolveEnforceBlockAvailability(method, u) {
 		return nil, false

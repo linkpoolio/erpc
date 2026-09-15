@@ -23,18 +23,31 @@ func init() {
 	util.ConfigureTestLogger()
 }
 
-// TestNetwork_EthCallLatest_SkipsLaggingUpstream covers the Priority Pool
-// totalQueued incident: a stalled WS peer answered eth_call("latest") with
-// stale state while TipHW was thousands of blocks ahead. The lag hard-gate
-// must skip the lagging peer and serve from a near-tip sibling.
+// TestNetwork_EthCallLatest_SkipsLaggingUpstream is the regression for the
+// Priority Pool totalQueued incident:
+//
+//	contract-events-slack → eRPC eth_call("latest") totalQueued()
+//	selected stalled internal-eth-mainnet-reth-ws-0 (~8k behind TipHW)
+//	→ returned 16355 instead of ~692
+//
+// Setup mirrors that failure mode: selection order prefers the lagging peer
+// (rpc1), which would answer successfully with the stale ABI uint256, while a
+// near-tip sibling (rpc2) has the correct tip-state value. The lag hard-gate
+// must skip rpc1 and return rpc2's result.
 func TestNetwork_EthCallLatest_SkipsLaggingUpstream(t *testing.T) {
 	util.ResetGock()
 	defer util.ResetGock()
 	util.SetupMocksForEvmStatePoller()
 	defer util.AssertNoPendingMocks(t, 0)
 
-	// rpc1 must NOT receive eth_call — it will be tip-lagged. Times(0)
-	// ensures AssertNoPendingMocks fails if the gate fails open.
+	// ABI-encoded uint256 totalQueued values from the incident.
+	const (
+		staleTotalQueued = "0x0000000000000000000000000000000000000000000000000000000000003fe3" // 16355
+		tipTotalQueued   = "0x00000000000000000000000000000000000000000000000000000000000002b4" // 692
+	)
+
+	// rpc1 must NOT receive eth_call — it is tip-lagged like reth-ws-0.
+	// Times(0) fails the test if the gate fails open and routes here.
 	gock.New("http://rpc1.localhost").
 		Post("").
 		Filter(func(r *http.Request) bool {
@@ -45,7 +58,7 @@ func TestNetwork_EthCallLatest_SkipsLaggingUpstream(t *testing.T) {
 		JSON(map[string]interface{}{
 			"jsonrpc": "2.0",
 			"id":      1,
-			"result":  "0xSTALE",
+			"result":  staleTotalQueued,
 		})
 
 	gock.New("http://rpc2.localhost").
@@ -58,13 +71,14 @@ func TestNetwork_EthCallLatest_SkipsLaggingUpstream(t *testing.T) {
 		JSON(map[string]interface{}{
 			"jsonrpc": "2.0",
 			"id":      1,
-			"result":  "0xNEAR_TIP",
+			"result":  tipTotalQueued,
 		})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	network := setupLatestStateLagTestNetwork(t, ctx)
+	// Prefer the stalled peer first — same trap as selection picking reth-ws-0.
 	network.PinUpstreamOrderForTest("rpc1", "rpc2")
 
 	upsList := network.upstreamsRegistry.GetNetworkUpstreams(ctx, util.EvmNetworkId(123))
@@ -73,13 +87,15 @@ func TestNetwork_EthCallLatest_SkipsLaggingUpstream(t *testing.T) {
 	for _, u := range upsList {
 		byID[u.Config().Id] = u
 	}
-	// TipHW ≈ 1000 via rpc2; rpc1 sits 100 behind (> defaultMaxLatestStateLagBlocks=16).
-	byID["rpc1"].EvmStatePoller().SuggestLatestBlock(900)
-	byID["rpc2"].EvmStatePoller().SuggestLatestBlock(1000)
+	// ~8k blocks behind TipHW (incident scale); well above max lag of 16.
+	const tipHW int64 = 21_000_000
+	byID["rpc1"].EvmStatePoller().SuggestLatestBlock(tipHW - 8000)
+	byID["rpc2"].EvmStatePoller().SuggestLatestBlock(tipHW)
 	time.Sleep(50 * time.Millisecond)
 
+	// Priority Pool totalQueued() selector (0xa4baa10c) at "latest".
 	req := common.NewNormalizedRequest([]byte(
-		`{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":"0x123"},"latest"]}`,
+		`{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":"0x362fa9d0bca5d19f743db50738345ce2b40ec99f","data":"0xa4baa10c"},"latest"]}`,
 	))
 	req.SetNetwork(network)
 
@@ -89,11 +105,14 @@ func TestNetwork_EthCallLatest_SkipsLaggingUpstream(t *testing.T) {
 	defer resp.Release()
 
 	require.NotNil(t, resp.Upstream())
-	assert.Equal(t, "rpc2", resp.Upstream().Id(), "lagging rpc1 must be skipped for eth_call(latest)")
+	assert.Equal(t, "rpc2", resp.Upstream().Id(),
+		"lagging rpc1 (reth-ws-0 stand-in) must be skipped for eth_call(latest)")
 
 	jrr, err := resp.JsonRpcResponse()
 	require.NoError(t, err)
-	assert.Contains(t, jrr.GetResultString(), "0xNEAR_TIP")
+	got := jrr.GetResultString()
+	assert.Contains(t, got, tipTotalQueued, "must return tip-state totalQueued (~692), not stale 16355")
+	assert.NotContains(t, got, staleTotalQueued, "must not return stalled-peer totalQueued 16355")
 }
 
 // TestNetwork_EthCallConcreteBlock_AllowsLaggingArchive ensures the lag gate

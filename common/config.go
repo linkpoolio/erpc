@@ -2220,6 +2220,18 @@ type EvmNetworkConfig struct {
 	// Default: 128 blocks.
 	MaxRetryableBlockDistance *int64 `yaml:"maxRetryableBlockDistance,omitempty" json:"maxRetryableBlockDistance,omitempty"`
 
+	// MaxLatestStateLagBlocks controls the hard gate that skips upstreams whose
+	// head lags the network's highest known latest block (TipHW) when serving
+	// latest-state read methods at a moving tag ("latest"/"pending", or an
+	// omitted block arg — e.g. eth_call, eth_getBalance). Upstreams lagging by
+	// more than this many blocks are skipped so a stalled node never serves
+	// stale state as a successful response. Set to 0 or a negative value to
+	// disable the gate. On fast chains (sub-second blocks) consider raising
+	// this so state-poller cadence can keep every upstream within the window.
+	// Default: 16 blocks — matches the default selection policy's
+	// blockNumberLagAbove(16) exclusion.
+	MaxLatestStateLagBlocks *int64 `yaml:"maxLatestStateLagBlocks,omitempty" json:"maxLatestStateLagBlocks,omitempty"`
+
 	// MarkEmptyAsErrorMethods lists methods for which an empty/null result from an upstream
 	// should be treated as a "missing data" error, triggering retry on other upstreams.
 	// This is useful for point-lookups (blocks, transactions, receipts, traces) where an

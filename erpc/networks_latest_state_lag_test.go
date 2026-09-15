@@ -81,17 +81,9 @@ func TestNetwork_EthCallLatest_SkipsLaggingUpstream(t *testing.T) {
 	// Prefer the stalled peer first — same trap as selection picking reth-ws-0.
 	network.PinUpstreamOrderForTest("rpc1", "rpc2")
 
-	upsList := network.upstreamsRegistry.GetNetworkUpstreams(ctx, util.EvmNetworkId(123))
-	require.Len(t, upsList, 2)
-	byID := map[string]*upstream.Upstream{}
-	for _, u := range upsList {
-		byID[u.Config().Id] = u
-	}
-	// ~8k blocks behind TipHW (incident scale); well above max lag of 16.
-	const tipHW int64 = 21_000_000
-	byID["rpc1"].EvmStatePoller().SuggestLatestBlock(tipHW - 8000)
-	byID["rpc2"].EvmStatePoller().SuggestLatestBlock(tipHW)
-	time.Sleep(50 * time.Millisecond)
+	// Lag comes from the standard poller mocks: rpc1's head is 0x11118888
+	// while rpc2 (TipHW) is at 0x22228888 — rpc1 lags by 286,326,784 blocks,
+	// far beyond defaultMaxLatestStateLagBlocks=16 (incident: ~8k behind).
 
 	// Priority Pool totalQueued() selector (0xa4baa10c) at "latest".
 	req := common.NewNormalizedRequest([]byte(
@@ -143,16 +135,8 @@ func TestNetwork_EthCallConcreteBlock_AllowsLaggingArchive(t *testing.T) {
 	network := setupLatestStateLagTestNetwork(t, ctx)
 	network.PinUpstreamOrderForTest("rpc1", "rpc2")
 
-	upsList := network.upstreamsRegistry.GetNetworkUpstreams(ctx, util.EvmNetworkId(123))
-	byID := map[string]*upstream.Upstream{}
-	for _, u := range upsList {
-		byID[u.Config().Id] = u
-	}
-	byID["rpc1"].EvmStatePoller().SuggestLatestBlock(900)
-	byID["rpc2"].EvmStatePoller().SuggestLatestBlock(1000)
-	time.Sleep(50 * time.Millisecond)
-
-	// Concrete historical block well below both poller heads.
+	// rpc1 lags TipHW by ~286M blocks per the standard poller mocks; a
+	// concrete historical block must still be servable by the lagging peer.
 	req := common.NewNormalizedRequest([]byte(
 		`{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":"0x123"},"0x100"]}`,
 	))
@@ -171,7 +155,102 @@ func TestNetwork_EthCallConcreteBlock_AllowsLaggingArchive(t *testing.T) {
 	assert.Contains(t, jrr.GetResultString(), "0xARCHIVE")
 }
 
-func setupLatestStateLagTestNetwork(t *testing.T, ctx context.Context) *Network {
+// TestNetwork_EthCallLatest_ConfigurableLagThreshold verifies that
+// evm.maxLatestStateLagBlocks overrides the default 16-block hard gate:
+// with the threshold raised above the actual lag, the lagging (but
+// selection-preferred) peer is allowed to serve again.
+func TestNetwork_EthCallLatest_ConfigurableLagThreshold(t *testing.T) {
+	util.ResetGock()
+	defer util.ResetGock()
+	util.SetupMocksForEvmStatePoller()
+	defer util.AssertNoPendingMocks(t, 0)
+
+	gock.New("http://rpc1.localhost").
+		Post("").
+		Filter(func(r *http.Request) bool {
+			return strings.Contains(util.SafeReadBody(r), "eth_call")
+		}).
+		Times(1).
+		Reply(200).
+		JSON(map[string]interface{}{
+			"jsonrpc": "2.0",
+			"id":      1,
+			"result":  "0xLAGGED_OK",
+		})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// The standard poller mocks pin rpc1 at 0x11118888 and rpc2 (TipHW) at
+	// 0x22228888 — rpc1 lags by 0x11110000 = 286,326,784 blocks. A threshold
+	// above that lag must let rpc1 (selection-preferred) serve again.
+	network := setupLatestStateLagTestNetwork(t, ctx, func(cfg *common.NetworkConfig) {
+		cfg.Evm.MaxLatestStateLagBlocks = i64(300_000_000)
+	})
+	network.PinUpstreamOrderForTest("rpc1", "rpc2")
+
+	req := common.NewNormalizedRequest([]byte(
+		`{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":"0x123"},"latest"]}`,
+	))
+	req.SetNetwork(network)
+
+	resp, err := network.Forward(ctx, req)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	defer resp.Release()
+
+	require.NotNil(t, resp.Upstream())
+	assert.Equal(t, "rpc1", resp.Upstream().Id(),
+		"lag 100 within configured threshold 200 must not be gated")
+}
+
+// TestNetwork_EthCallLatest_LagGateDisabled verifies that a non-positive
+// evm.maxLatestStateLagBlocks disables the hard gate entirely.
+func TestNetwork_EthCallLatest_LagGateDisabled(t *testing.T) {
+	util.ResetGock()
+	defer util.ResetGock()
+	util.SetupMocksForEvmStatePoller()
+	defer util.AssertNoPendingMocks(t, 0)
+
+	gock.New("http://rpc1.localhost").
+		Post("").
+		Filter(func(r *http.Request) bool {
+			return strings.Contains(util.SafeReadBody(r), "eth_call")
+		}).
+		Times(1).
+		Reply(200).
+		JSON(map[string]interface{}{
+			"jsonrpc": "2.0",
+			"id":      1,
+			"result":  "0xGATE_OFF",
+		})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// rpc1 lags TipHW by ~286M blocks per the standard poller mocks; with the
+	// gate disabled it must still serve (pre-fix fail-open behavior).
+	network := setupLatestStateLagTestNetwork(t, ctx, func(cfg *common.NetworkConfig) {
+		cfg.Evm.MaxLatestStateLagBlocks = i64(-1)
+	})
+	network.PinUpstreamOrderForTest("rpc1", "rpc2")
+
+	req := common.NewNormalizedRequest([]byte(
+		`{"jsonrpc":"2.0","id":1,"method":"eth_call","params":[{"to":"0x123"},"latest"]}`,
+	))
+	req.SetNetwork(network)
+
+	resp, err := network.Forward(ctx, req)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	defer resp.Release()
+
+	require.NotNil(t, resp.Upstream())
+	assert.Equal(t, "rpc1", resp.Upstream().Id(),
+		"disabled gate (≤0) must restore pre-fix fail-open routing")
+}
+
+func setupLatestStateLagTestNetwork(t *testing.T, ctx context.Context, cfgMut ...func(*common.NetworkConfig)) *Network {
 	t.Helper()
 
 	upstreamConfigs := []*common.UpstreamConfig{
@@ -202,6 +281,9 @@ func setupLatestStateLagTestNetwork(t *testing.T, ctx context.Context) *Network 
 		Evm: &common.EvmNetworkConfig{
 			ChainId: 123,
 		},
+	}
+	for _, mut := range cfgMut {
+		mut(networkConfig)
 	}
 
 	rateLimitersRegistry, err := upstream.NewRateLimitersRegistry(context.Background(), &common.RateLimiterConfig{}, &log.Logger)

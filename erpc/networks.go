@@ -1701,8 +1701,20 @@ func (n *Network) recordHedgeDiscard(
 
 // defaultMaxLatestStateLagBlocks matches the common selection-policy threshold
 // blockNumberLagAbove(16): peers farther behind TipHW than this must not serve
-// moving-tag latest-state reads (eth_call("latest"), etc.).
+// moving-tag latest-state reads (eth_call("latest"), etc.). Override per
+// network via evm.maxLatestStateLagBlocks (≤0 disables the gate).
 const defaultMaxLatestStateLagBlocks int64 = 16
+
+// maxLatestStateLagBlocks resolves the effective lag threshold for the
+// latest-state hard gate: the network's evm.maxLatestStateLagBlocks when set,
+// otherwise defaultMaxLatestStateLagBlocks. Follows the same read-site default
+// pattern as MaxRetryableBlockDistance.
+func (n *Network) maxLatestStateLagBlocks() int64 {
+	if n.cfg != nil && n.cfg.Evm != nil && n.cfg.Evm.MaxLatestStateLagBlocks != nil {
+		return *n.cfg.Evm.MaxLatestStateLagBlocks
+	}
+	return defaultMaxLatestStateLagBlocks
+}
 
 // isLatestStateReadMethod reports whether method returns chain state at a
 // caller-chosen block tag. Stale answers from a lagging upstream look like
@@ -1745,6 +1757,11 @@ func isMovingLatestOrPendingTag(ctx context.Context, req *common.NormalizedReque
 // fail-open — which is exactly how a stalled WS peer can answer eth_call with
 // stale state while TipHW is thousands of blocks ahead.
 func (n *Network) checkLatestStateLagSkip(ctx context.Context, u common.Upstream, req *common.NormalizedRequest, method string) (error, bool) {
+	maxLag := n.maxLatestStateLagBlocks()
+	if maxLag <= 0 {
+		// Gate disabled via evm.maxLatestStateLagBlocks.
+		return nil, false
+	}
 	if !isLatestStateReadMethod(method) || !isMovingLatestOrPendingTag(ctx, req) {
 		return nil, false
 	}
@@ -1762,7 +1779,7 @@ func (n *Network) checkLatestStateLagSkip(ctx context.Context, u common.Upstream
 		return nil, false
 	}
 	lag := tip - upsLatest
-	if lag <= defaultMaxLatestStateLagBlocks {
+	if lag <= maxLag {
 		return nil, false
 	}
 	finalized := sp.FinalizedBlock()
@@ -1772,7 +1789,7 @@ func (n *Network) checkLatestStateLagSkip(ctx context.Context, u common.Upstream
 		Int64("networkTip", tip).
 		Int64("pollerLatest", upsLatest).
 		Int64("lag", lag).
-		Int64("maxLag", defaultMaxLatestStateLagBlocks).
+		Int64("maxLag", maxLag).
 		Msg("skipping lagging upstream for latest-state read")
 	// Retryable: another near-tip peer may still serve; treat like block-unavailable.
 	return common.NewErrUpstreamBlockUnavailable(u.Id(), tip, upsLatest, finalized), true

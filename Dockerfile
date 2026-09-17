@@ -35,12 +35,12 @@ RUN go build -v -ldflags="$LDFLAGS" -a -installsuffix cgo -o erpc-server ./cmd/e
 
 # Global typescript related image
 FROM node:20-alpine@sha256:09e2b3d9726018aecf269bd35325f46bf75046a643a66d28360ec71132750ec8 AS ts-core
-RUN npm install -g pnpm
+RUN npm install -g pnpm@9.15.9
 
 # Stage where we will install dev dependencies + compile sdk
 FROM ts-core AS ts-dev
 RUN mkdir -p /temp/dev/typescript
-RUN npm install -g pnpm
+RUN npm install -g pnpm@9.15.9
 
 # Copy only the TypeScript package files
 COPY typescript/config /temp/dev/typescript/config
@@ -48,7 +48,7 @@ COPY pnpm* /temp/dev/
 COPY package.json /temp/dev/package.json
 
 # Install everything and build
-RUN --mount=type=cache,id=pnpm,target=/pnpm/store cd /temp/dev &&  pnpm install --frozen-lockfile
+RUN --mount=type=cache,id=pnpm,target=/pnpm/store cd /temp/dev &&  pnpm install --frozen-lockfile --config.manage-package-manager-versions=false
 RUN cd /temp/dev && pnpm build
 
 # Stage where we will install prod dependencies only
@@ -60,7 +60,7 @@ COPY pnpm* /temp/prod/
 COPY package.json /temp/prod/package.json
 
 # Install every prod dependencies
-RUN --mount=type=cache,id=pnpm,target=/pnpm/store cd /temp/prod && pnpm install --prod --frozen-lockfile
+RUN --mount=type=cache,id=pnpm,target=/pnpm/store cd /temp/prod && pnpm install --prod --frozen-lockfile --config.manage-package-manager-versions=false
 
 # Create symlink stage (for backwards compatibility with earlier image file structure)
 FROM alpine:latest@sha256:25109184c71bdad752c8312a8623239686a9a2071e8825f20acb8f2198c3f659 AS symlink

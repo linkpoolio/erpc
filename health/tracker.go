@@ -750,6 +750,17 @@ func (t *Tracker) getMetadata(mtdKey metadataKey) *NetworkMetadata {
 }
 
 // getUpsMetrics fetches or creates *TrackedMetrics from sync.Map
+// loadOrStoreUpsMetrics is like getUpsMetrics but does not register the key in
+// the upstreamsByNetwork index. Use for buckets (e.g. the {*,All} wildcard
+// aggregate) that must not appear as iterable index entries.
+func (t *Tracker) loadOrStoreUpsMetrics(k upstreamKey) *TrackedMetrics {
+	if v, ok := t.upsMetrics.Load(k); ok {
+		return v.(*TrackedMetrics)
+	}
+	v, _ := t.upsMetrics.LoadOrStore(k, newTrackedMetrics(t.logger))
+	return v.(*TrackedMetrics)
+}
+
 func (t *Tracker) getUpsMetrics(k upstreamKey) *TrackedMetrics {
 	if v, ok := t.upsMetrics.Load(k); ok {
 		return v.(*TrackedMetrics)
@@ -1182,6 +1193,7 @@ func (t *Tracker) updateNetworkLagMetrics(
 			}
 			lag := networkValue - upsValue
 			setLag(tm, lag)
+			setLag(t.loadOrStoreUpsMetrics(upstreamKey{k.ups, "*", common.DataFinalityStateAll}), lag)
 			gauge := getGauge(t.projectId, k.ups.VendorName(), k.ups.NetworkLabel(), k.ups.Id())
 			gauge.Set(float64(lag))
 			return true
@@ -1205,6 +1217,7 @@ func (t *Tracker) updateNetworkLagMetrics(
 				}
 				lag := networkValue - upsValue
 				setLag(tm, lag)
+				setLag(t.loadOrStoreUpsMetrics(upstreamKey{k.ups, "*", common.DataFinalityStateAll}), lag)
 				gauge := getGauge(t.projectId, k.ups.VendorName(), k.ups.NetworkLabel(), k.ups.Id())
 				gauge.Set(float64(lag))
 			}
@@ -1234,6 +1247,7 @@ func (t *Tracker) updateSingleUpstreamLag(
 			if k.ups.Id() == id && k.ups.NetworkId() == net {
 				tm := value.(*TrackedMetrics)
 				setLag(tm, lag)
+				setLag(t.loadOrStoreUpsMetrics(upstreamKey{k.ups, "*", common.DataFinalityStateAll}), lag)
 			}
 			return true
 		})
@@ -1244,6 +1258,7 @@ func (t *Tracker) updateSingleUpstreamLag(
 				if v, ok := t.upsMetrics.Load(k); ok {
 					tm := v.(*TrackedMetrics)
 					setLag(tm, lag)
+					setLag(t.loadOrStoreUpsMetrics(upstreamKey{k.ups, "*", common.DataFinalityStateAll}), lag)
 				}
 			}
 		}
@@ -1340,6 +1355,8 @@ func (t *Tracker) SetLatestBlockNumber(upstream common.Upstream, blockNumber int
 			func(tm *TrackedMetrics, lag int64) { tm.BlockHeadLag.Store(lag) },
 		)
 	}
+
+	t.loadOrStoreUpsMetrics(upstreamKey{upstream, "*", common.DataFinalityStateAll}).BlockHeadLag.Store(upsLag)
 }
 
 func (t *Tracker) SetLatestBlockNumberForNetwork(network string, blockNumber int64) {
@@ -1513,6 +1530,8 @@ func (t *Tracker) SetFinalizedBlockNumber(upstream common.Upstream, blockNumber 
 			func(tm *TrackedMetrics, lag int64) { tm.FinalizationLag.Store(lag) },
 		)
 	}
+
+	t.loadOrStoreUpsMetrics(upstreamKey{upstream, "*", common.DataFinalityStateAll}).FinalizationLag.Store(upsLag)
 }
 
 func (t *Tracker) RecordBlockHeadLargeRollback(upstream common.Upstream, finality string, currentVal, newVal int64) {

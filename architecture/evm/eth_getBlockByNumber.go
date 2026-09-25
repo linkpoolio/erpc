@@ -222,14 +222,15 @@ func enforceHighestBlock(ctx context.Context, network common.Network, nq *common
 		}
 		// fall through to tip re-fetch / refuse-stale (logger already emitted)
 		if respBlockNumber > 0 {
-			vendor, upsId := staleResponseLabels(nr)
-			telemetry.MetricUpstreamStaleLatestBlock.WithLabelValues(
-				network.ProjectId(),
-				vendor,
-				network.Label(),
-				upsId,
-				"eth_getBlockByNumber",
-			).Inc()
+			if ups := nr.Upstream(); ups != nil {
+				telemetry.MetricUpstreamStaleLatestBlock.WithLabelValues(
+					network.ProjectId(),
+					ups.VendorName(),
+					network.Label(),
+					ups.Id(),
+					"eth_getBlockByNumber",
+				).Inc()
+			}
 		}
 
 		// Prefer the upstream whose poller already owns this tip
@@ -326,13 +327,14 @@ func enforceHighestBlock(ctx context.Context, network common.Network, nq *common
 			Interface("respBlockNumber", respBlockNumber).
 			Msg("enforcing highest finalized block")
 		if respBlockNumber > 0 {
-			vendor, upsId := staleResponseLabels(nr)
-			telemetry.MetricUpstreamStaleFinalizedBlock.WithLabelValues(
-				network.ProjectId(),
-				vendor,
-				network.Label(),
-				upsId,
-			).Inc()
+			if ups := nr.Upstream(); ups != nil {
+				telemetry.MetricUpstreamStaleFinalizedBlock.WithLabelValues(
+					network.ProjectId(),
+					ups.VendorName(),
+					network.Label(),
+					ups.Id(),
+				).Inc()
+			}
 		}
 		useUpstream := ""
 		if respBlockNumber > 0 {
@@ -343,16 +345,6 @@ func enforceHighestBlock(ctx context.Context, network common.Network, nq *common
 	default:
 		return nr, re
 	}
-}
-
-// staleResponseLabels returns the vendor/upstream metric labels for a stale
-// block response. Cached responses carry no upstream, so they are labelled
-// "cache" instead of dereferencing a nil upstream.
-func staleResponseLabels(nr *common.NormalizedResponse) (string, string) {
-	if ups := nr.Upstream(); ups != nil {
-		return ups.VendorName(), ups.Id()
-	}
-	return "n/a", "cache"
 }
 
 // enforceNonNullBlock checks if the block result is null/empty and returns an appropriate error

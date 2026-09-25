@@ -222,12 +222,12 @@ func enforceHighestBlock(ctx context.Context, network common.Network, nq *common
 		}
 		// fall through to tip re-fetch / refuse-stale (logger already emitted)
 		if respBlockNumber > 0 {
-			ups := nr.Upstream()
+			vendor, upsId := staleResponseLabels(nr)
 			telemetry.MetricUpstreamStaleLatestBlock.WithLabelValues(
 				network.ProjectId(),
-				ups.VendorName(),
+				vendor,
 				network.Label(),
-				ups.Id(),
+				upsId,
 				"eth_getBlockByNumber",
 			).Inc()
 		}
@@ -326,12 +326,12 @@ func enforceHighestBlock(ctx context.Context, network common.Network, nq *common
 			Interface("respBlockNumber", respBlockNumber).
 			Msg("enforcing highest finalized block")
 		if respBlockNumber > 0 {
-			ups := nr.Upstream()
+			vendor, upsId := staleResponseLabels(nr)
 			telemetry.MetricUpstreamStaleFinalizedBlock.WithLabelValues(
 				network.ProjectId(),
-				ups.VendorName(),
+				vendor,
 				network.Label(),
-				ups.Id(),
+				upsId,
 			).Inc()
 		}
 		useUpstream := ""
@@ -343,6 +343,16 @@ func enforceHighestBlock(ctx context.Context, network common.Network, nq *common
 	default:
 		return nr, re
 	}
+}
+
+// staleResponseLabels returns the vendor/upstream metric labels for a stale
+// block response. Cached responses carry no upstream, so they are labelled
+// "cache" instead of dereferencing a nil upstream.
+func staleResponseLabels(nr *common.NormalizedResponse) (string, string) {
+	if ups := nr.Upstream(); ups != nil {
+		return ups.VendorName(), ups.Id()
+	}
+	return "n/a", "cache"
 }
 
 // enforceNonNullBlock checks if the block result is null/empty and returns an appropriate error

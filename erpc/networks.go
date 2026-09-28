@@ -104,10 +104,8 @@ type Network struct {
 // notification to any client. Otherwise a concurrent HTTP
 // eth_getBlockByNumber("latest") / eth_blockNumber can race and return a
 // lower tip than a head already (or about to be) served on the subscription,
-// which strict clients treat as an inconsistency.
-//
-// The shared floor is published synchronously (bounded timeout) so sibling
-// instances can refresh it before serving HTTP "latest".
+// which strict clients treat as an inconsistency. Sibling instances pick the
+// shared floor up through the shared counter's sync.
 func (n *Network) NoteObservedLatestBlock(ctx context.Context, blockNumber int64) {
 	if n == nil || blockNumber <= 0 {
 		return

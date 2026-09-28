@@ -175,10 +175,8 @@ func NewNetwork(
 		nwCfg.Architecture = common.ArchitectureEvm
 	}
 
-	// Cross-instance delivered-head floor for "latest" (see
-	// Network.latestBlockShared), keyed per project since each project has
-	// its own upstreams. Tolerates the same rollback as per-upstream state
-	// pollers so a rare deep reorg can still correct the value.
+	// Keyed per project since each project has its own upstreams; tolerates
+	// the same rollback as upstream state pollers.
 	if upstreamsRegistry != nil {
 		if ssr := upstreamsRegistry.SharedStateRegistry(); ssr != nil {
 			network.latestBlockShared = ssr.GetCounterInt64(

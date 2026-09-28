@@ -289,10 +289,8 @@ func GenerateValidationReport(ctx context.Context, cfg *common.Config) *Validati
 	// Upstream runtime checks (chain id + block hash comparisons). Use a silent logger and short timeout per upstream
 	silent := zerolog.New(io.Discard)
 
-	// Scope all transient upstreams created below to a validation-only ctx.
-	// Their client goroutines (HTTP shutdown waiter, WS read/ping loops)
-	// listen on this ctx — without scoping, they outlive validation and
-	// accumulate forever.
+	// Transient upstreams below spawn client goroutines bound to their ctx;
+	// cancel it on return so they don't outlive validation.
 	valCtx, cancelVal := context.WithCancel(ctx)
 	defer cancelVal()
 
@@ -1022,11 +1020,8 @@ func printConfigStats(logger zerolog.Logger, stats ConfigStats) {
 }
 
 func validateUpstreamEndpoints(ctx context.Context, cfg *common.Config, logger zerolog.Logger) error {
-	// The Upstreams we construct below spawn long-lived client goroutines
-	// (HTTP shutdown waiter, WS read/ping loops) that listen on the appCtx
-	// passed into NewUpstream. If we hand them the caller's ctx, they
-	// outlive validation and accumulate forever. Scope them to a
-	// validation-only ctx that we cancel on return.
+	// Transient upstreams below spawn client goroutines bound to their ctx;
+	// cancel it on return so they don't outlive validation.
 	valCtx, cancelVal := context.WithCancel(ctx)
 	defer cancelVal()
 	err := telemetry.SetHistogramBuckets(

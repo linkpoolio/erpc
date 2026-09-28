@@ -65,8 +65,8 @@ projects:
         evm:
           chainId: 1
           # Drops fromBlock: "0x0" / "0" from eth_subscribe logs filters
-          # before forwarding to upstream WebSockets. Only the exact
-          # zero value is stripped — non-zero fromBlocks pass through.
+          # before forwarding to upstream WebSockets. Only a value that
+          # parses to zero is stripped — other fromBlocks pass through.
           stripSubscribeFromBlockZero: true  # default: false
 ```
 </Tabs.Tab>
@@ -84,8 +84,8 @@ export default createConfig({
           evm: {
             chainId: 1,
             // Drops fromBlock: "0x0" / "0" from eth_subscribe logs filters
-            // before forwarding to upstream WebSockets. Only the exact
-            // zero value is stripped — non-zero fromBlocks pass through.
+            // before forwarding to upstream WebSockets. Only a value that
+            // parses to zero is stripped — other fromBlocks pass through.
             stripSubscribeFromBlockZero: true,  // default: false
           },
         },
@@ -97,7 +97,7 @@ export default createConfig({
 </Tabs.Tab>
 </Tabs>
 
-Leave unset for chains where upstreams handle `fromBlock: "0x0"` in an `eth_subscribe` filter correctly (most do — the flag is a targeted workaround, not a universal default).
+Leave unset for chains where upstreams handle `fromBlock: "0x0"` in an `eth_subscribe` filter correctly (most do — the flag is a targeted workaround, not a universal default). It can also be set once for every network under `networkDefaults.evm`.
 
 ## Agent reference
 

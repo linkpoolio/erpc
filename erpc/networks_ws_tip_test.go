@@ -4,9 +4,11 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/erpc/erpc/architecture/evm"
 	"github.com/erpc/erpc/common"
 	"github.com/erpc/erpc/data"
 	"github.com/erpc/erpc/health"
@@ -360,9 +362,21 @@ func TestNetworkHandle_SuggestLatestBlock_FallbackAdvancesTipHWWhenNoPrimaryUp(t
 		"fallback WS may advance TipHW when no primary is up")
 }
 
-// EvmRefreshHighestLatestBlockNumber must not regress the tip after
-// NoteObservedLatestBlock (sync publish path) has advanced TipHW.
-func TestEvmRefreshHighestLatestBlockNumber_PreservesObservedTip(t *testing.T) {
+// countingSharedCounter counts foreground remote reads of the delivered-head
+// floor.
+type countingSharedCounter struct {
+	data.CounterInt64SharedVariable
+	remoteReads atomic.Int32
+}
+
+func (c *countingSharedCounter) RefreshFromRemote(ctx context.Context) int64 {
+	c.remoteReads.Add(1)
+	return c.CounterInt64SharedVariable.RefreshFromRemote(ctx)
+}
+
+// At-tip "latest" reads must stay local: the floor receives remote updates via
+// the shared counter's background sync, so the request path never waits on it.
+func TestDeliveredHeadFloor_AtTipRequestsMakeNoRemoteReads(t *testing.T) {
 	util.ResetGock()
 	defer util.ResetGock()
 	util.SetupMocksForEvmStatePoller()
@@ -370,64 +384,32 @@ func TestEvmRefreshHighestLatestBlockNumber_PreservesObservedTip(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	up := &common.UpstreamConfig{
-		Type:     common.UpstreamTypeEvm,
-		Id:       "rpc1",
-		Endpoint: "http://rpc1.localhost",
-		Evm:      &common.EvmUpstreamConfig{ChainId: 123},
+	network, ups := setupServedTipNetworkWith(t, ctx, []servedTipFixture{
+		{id: "a", chainID: 123, latestBlock: 1000},
+		{id: "b", chainID: 123, latestBlock: 1000},
+	}, &common.EvmServedTipConfig{})
+	require.NotNil(t, network.latestBlockShared)
+	counter := &countingSharedCounter{CounterInt64SharedVariable: network.latestBlockShared}
+	network.latestBlockShared = counter
+
+	for _, method := range []string{"eth_blockNumber", "eth_getBlockByNumber"} {
+		for i := 0; i < 5; i++ {
+			req := common.NewNormalizedRequest([]byte(`{"jsonrpc":"2.0","id":1,"method":"` + method + `","params":["latest",false]}`))
+			req.SetDirectives(&common.RequestDirectives{EnforceHighestBlock: true})
+			req.SetNetwork(network)
+			var result interface{} = "0x3e8"
+			if method == "eth_getBlockByNumber" {
+				result = map[string]interface{}{"number": "0x3e8", "hash": "0x01"}
+			}
+			jrr, err := common.NewJsonRpcResponse(1, result, nil)
+			require.NoError(t, err)
+			resp := common.NewNormalizedResponse().WithRequest(req).WithJsonRpcResponse(jrr)
+			resp.SetUpstream(ups[0])
+
+			out, err := evm.HandleNetworkPostForward(ctx, network, req, resp, nil)
+			require.NoError(t, err, method)
+			assert.Same(t, resp, out, method)
+		}
 	}
-
-	gock.New("http://rpc1.localhost").
-		Post("").
-		Persist().
-		Filter(func(r *http.Request) bool {
-			return strings.Contains(util.SafeReadBody(r), `eth_chainId`)
-		}).
-		Reply(200).
-		JSON([]byte(`{"result":"0x7b"}`))
-
-	rateLimitersRegistry, _ := upstream.NewRateLimitersRegistry(context.Background(), &common.RateLimiterConfig{}, &log.Logger)
-	metricsTracker := health.NewTracker(&log.Logger, "test", time.Minute)
-
-	vr := thirdparty.NewVendorsRegistry()
-	pr, err := thirdparty.NewProvidersRegistry(&log.Logger, vr, []*common.ProviderConfig{}, nil)
-	require.NoError(t, err)
-
-	ssr, err := data.NewSharedStateRegistry(ctx, &log.Logger, &common.SharedStateConfig{
-		Connector: &common.ConnectorConfig{
-			Driver: "memory",
-			Memory: &common.MemoryConnectorConfig{MaxItems: 100_000, MaxTotalSize: "1GB"},
-		},
-	})
-	require.NoError(t, err)
-
-	upstreamsRegistry := upstream.NewUpstreamsRegistry(
-		ctx, &log.Logger, "test",
-		[]*common.UpstreamConfig{up}, ssr, rateLimitersRegistry, vr, pr, nil,
-		metricsTracker, nil,
-	)
-
-	networkConfig := &common.NetworkConfig{
-		Architecture: common.ArchitectureEvm,
-		Evm:          &common.EvmNetworkConfig{ChainId: 123},
-	}
-	network, err := NewNetwork(ctx, &log.Logger, "test", networkConfig,
-		rateLimitersRegistry, upstreamsRegistry, metricsTracker, nil)
-	require.NoError(t, err)
-
-	upstreamsRegistry.Bootstrap(ctx)
-	time.Sleep(200 * time.Millisecond)
-	require.NoError(t, upstreamsRegistry.GetInitializer().WaitForTasks(ctx))
-	require.NoError(t, network.Bootstrap(ctx))
-	time.Sleep(250 * time.Millisecond)
-
-	upsList := upstreamsRegistry.GetNetworkUpstreams(ctx, util.EvmNetworkId(123))
-	require.Len(t, upsList, 1)
-	upsList[0].EvmStatePoller().SuggestLatestBlock(1000)
-	time.Sleep(50 * time.Millisecond)
-
-	network.NoteObservedLatestBlock(ctx, 1001)
-	assert.Equal(t, int64(1001), network.EvmRefreshHighestLatestBlockNumber(ctx),
-		"refresh after sync TipHW publish must keep the observed tip")
-	assert.Equal(t, int64(1001), network.EvmHighestLatestBlockNumber(ctx))
+	assert.Zero(t, counter.remoteReads.Load())
 }

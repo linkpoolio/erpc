@@ -132,22 +132,6 @@ func (n *Network) NoteObservedLatestBlock(ctx context.Context, blockNumber int64
 	}
 }
 
-// EvmRefreshHighestLatestBlockNumber pulls the shared latest floor from
-// remote storage once and returns the network tip after adopting any higher
-// remote value. Used when the local view would otherwise skip
-// EnforceHighestBlock (a false negative under async pub/sub lag).
-func (n *Network) EvmRefreshHighestLatestBlockNumber(ctx context.Context) int64 {
-	ctx, span := common.StartDetailSpan(ctx, "Network.EvmRefreshHighestLatestBlockNumber")
-	defer span.End()
-
-	if n.latestBlockShared != nil {
-		n.latestBlockShared.RefreshFromRemote(ctx)
-	}
-	result := n.EvmHighestLatestBlockNumber(ctx)
-	span.SetAttributes(attribute.Int64("highest_latest_block", result))
-	return result
-}
-
 // maxServedTipPartitions caps the number of materialized per-tag served-tip
 // partitions per network (a backstop on top of the "must be a configured tag"
 // gate). Realistic configs have 1–3 groups; beyond the cap, extra tags fall

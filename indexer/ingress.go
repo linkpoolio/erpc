@@ -9,9 +9,9 @@ import (
 // indexer pipeline. The indexer itself implements Sink — a pointer to the
 // indexer is what adapters call on every upstream notification.
 //
-// Ingest is non-blocking and best-effort. Dedup, reorg handling, lifecycle
-// tagging, and per-egress drop policy all live downstream; an ingress that
-// re-delivers an already-seen notification is expected and handled.
+// Ingest is non-blocking and best-effort. Dedup and per-egress drop policy
+// live downstream; an ingress that re-delivers an already-seen notification
+// is expected and handled.
 type Sink interface {
 	Ingest(ev StreamEvent)
 }
@@ -19,14 +19,10 @@ type Sink interface {
 // NetworkHandle is the narrow slice of network state an ingress is
 // allowed to touch. It intentionally excludes almost everything on
 // *erpc.Network — the invariant is that an ingress only needs
-// identification, finality info, and per-source bookkeeping hooks.
+// identification and per-source bookkeeping hooks.
 type NetworkHandle interface {
 	// Id returns the network identifier ("evm:<chainId>").
 	Id() string
-	// FinalityDepth returns the number of blocks below the latest head
-	// that are considered finalized on this network. Used by the
-	// indexer when tagging IndexedEvent.Lifecycle.
-	FinalityDepth() int64
 	// SuggestLatestBlock advances the per-source latest-block tracker
 	// (and the network-level latest tip) before the indexer dedupes /
 	// fans out. payload is the verbatim newHeads header JSON when known
@@ -44,12 +40,10 @@ type NetworkHandle interface {
 //
 //   - Start is called once when the indexer takes ownership. The ingress
 //     is expected to spin up its own goroutine(s) and push events at the
-//     sink until Stop is called or the context is cancelled.
+//     sink for as long as its transport lives.
 //   - EnsureFilter / RemoveFilter are invoked when the first/last client
 //     subscribes to a filter. Idempotent: repeated EnsureFilter calls for
 //     the same (subType, paramsHash) are no-ops.
-//   - Stop is best-effort; implementations should return promptly even
-//     if upstream unsubscribe RPCs time out.
 type EventIngress interface {
 	// Name is a human-readable identifier used in logs/metrics
 	// ("ws:<upstreamId>", "kafka:<topic>"). Must be stable for the life
@@ -68,9 +62,6 @@ type EventIngress interface {
 	// A no-op if the filter was never subscribed. Called when the last
 	// client for a filter unsubscribes.
 	RemoveFilter(ctx context.Context, subType string, paramsHash string) error
-	// Stop shuts down the ingress and releases resources. After Stop
-	// returns, no further events should be delivered to the sink.
-	Stop(ctx context.Context) error
 }
 
 // IngressSelector chooses which of a network's pooled ingresses should

@@ -562,13 +562,6 @@ type networkHandle struct {
 
 func (h *networkHandle) Id() string { return h.nw.networkId }
 
-func (h *networkHandle) FinalityDepth() int64 {
-	if h.nw.cfg != nil && h.nw.cfg.Evm != nil {
-		return h.nw.cfg.Evm.FallbackFinalityDepth
-	}
-	return 0
-}
-
 // SuggestLatestBlock routes a per-source block observation to the
 // upstream's state poller, then advances the network-level latest tip.
 // sourceId is the ingress adapter's Name(), which for wsupstream.Adapter

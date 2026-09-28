@@ -76,9 +76,6 @@ func (c *Config) Validate() error {
 // Validate rejects nonsensical values; zeros pass through and resolve to
 // internal defaults inside the indexer.
 func (i *IndexerConfig) Validate() error {
-	if i.CanonicalChainDepth < 0 {
-		return fmt.Errorf("indexer.canonicalChainDepth must be >= 0 (0 uses the default)")
-	}
 	if i.DedupWindowSize < 0 {
 		return fmt.Errorf("indexer.dedupWindowSize must be >= 0 (0 uses the default)")
 	}

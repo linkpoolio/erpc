@@ -49,6 +49,31 @@ logLevel: DEBUG
 	}
 }
 
+// TestLoadConfig_DeprecatedIndexerCanonicalChainDepthAccepted: the indexer
+// no longer tracks a canonical chain, but configs that still set
+// indexer.canonicalChainDepth must keep loading under strict decoding.
+func TestLoadConfig_DeprecatedIndexerCanonicalChainDepthAccepted(t *testing.T) {
+	fs := afero.NewMemMapFs()
+	cfg, err := afero.TempFile(fs, "", "erpc.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.WriteString(`
+logLevel: error
+indexer:
+  canonicalChainDepth: 256
+  dedupWindowSize: 1024
+`)
+
+	loaded, err := LoadConfig(fs, cfg.Name(), &DefaultOptions{})
+	if err != nil {
+		t.Fatalf("config setting the deprecated field must still load: %v", err)
+	}
+	if loaded.Indexer == nil || loaded.Indexer.DedupWindowSize != 1024 {
+		t.Fatalf("indexer block must still parse, got %+v", loaded.Indexer)
+	}
+}
+
 // TestLoadConfig_LegacyFieldsAccepted pins the back-compat contract:
 // a prod-shape YAML carrying legacy `routing.scoreMultipliers` on
 // upstreams + `scoreMetricsWindowSize` at the project level loads

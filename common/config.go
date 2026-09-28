@@ -85,13 +85,10 @@ var LegacyTranslateFn func(*Config) ([]string, error)
 var LegacyTranslateLogger func(warning string)
 
 // IndexerConfig tunes the transport-neutral event-stream indexer that
-// powers `eth_subscribe` fan-out and reorg-aware log invalidation. Most
-// deployments can leave this unset.
+// powers `eth_subscribe` fan-out. Most deployments can leave this unset.
 type IndexerConfig struct {
-	// CanonicalChainDepth is the per-network ring-buffer size for the
-	// canonical-chain tracker. It bounds how deep a reorg the indexer
-	// can fully resolve — reorgs beyond this window get only the
-	// immediate head evicted. 0 uses the internal default (256).
+	// Deprecated: ignored; the indexer no longer tracks a canonical chain.
+	// Kept so configs that still set it load under strict decoding.
 	CanonicalChainDepth int `yaml:"canonicalChainDepth,omitempty" json:"canonicalChainDepth"`
 	// DedupWindowSize is the per-filter seen-set capacity for log /
 	// pending-tx fan-out across sibling upstreams. 0 uses the internal

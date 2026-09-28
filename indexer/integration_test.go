@@ -14,14 +14,14 @@ import (
 
 // TestIntegration_NullIngress_EndToEnd wires a real indexer.Indexer to a
 // transport-free nullingress.Adapter and asserts the full pipeline
-// (ingest → dedup → lifecycle → fan-out) works with zero WebSocket-shaped
+// (ingest → dedup → fan-out) works with zero WebSocket-shaped
 // dependencies. This is the forcing-function test proving the interface
 // is transport-neutral.
 func TestIntegration_NullIngress_EndToEnd(t *testing.T) {
 	logger := zerolog.New(zerolog.NewTestWriter(t))
 	idx := indexer.New(&logger, indexer.Options{})
 
-	nw := &stubNetwork{id: "evm:1", finality: 10}
+	nw := &stubNetwork{id: "evm:1"}
 	idx.RegisterNetwork(nw)
 
 	ing := nullingress.New("null:test")
@@ -98,15 +98,13 @@ func TestIntegration_NullIngress_FilterRefcountAndTeardown(t *testing.T) {
 // --- stubs ------------------------------------------------------------
 
 type stubNetwork struct {
-	id       string
-	finality int64
+	id string
 
 	mu          sync.Mutex
 	suggestions map[string][]int64
 }
 
-func (s *stubNetwork) Id() string           { return s.id }
-func (s *stubNetwork) FinalityDepth() int64 { return s.finality }
+func (s *stubNetwork) Id() string { return s.id }
 func (s *stubNetwork) SuggestLatestBlock(sourceID string, block int64, _ json.RawMessage) {
 	s.mu.Lock()
 	if s.suggestions == nil {

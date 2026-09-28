@@ -1,6 +1,6 @@
 // Package indexer hosts the transport-neutral event-stream core: dedup,
-// per-source subscription bookkeeping, canonical event shape, and (in a
-// follow-up) reorg-aware canonical-chain tracking. Packages in this tree
+// per-source subscription bookkeeping, and the canonical event shape.
+// Packages in this tree
 // MUST NOT import erpc, clients, or any transport-specific library — that
 // invariant is what keeps ingress/egress implementations swappable.
 package indexer

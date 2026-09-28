@@ -5,7 +5,6 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/rs/zerolog"
 )
@@ -15,18 +14,11 @@ import (
 type Options struct {
 	// DedupWindowSize is the per-filter seen-set capacity. 0 = default.
 	DedupWindowSize int
-	// CanonicalChainDepth is the ring-buffer size of the per-network
-	// canonical-chain tracker. 0 = default. Controls how deep a reorg
-	// we can fully resolve.
-	CanonicalChainDepth int
-	// Now is the clock used for event timestamps. Tests inject a fake
-	// clock; nil falls back to time.Now.
-	Now func() time.Time
 }
 
 // Indexer is the transport-neutral core: ingresses push StreamEvents via
-// Sink.Ingest; the indexer dedupes, sequences, and lifecycle-tags them,
-// then fans out to every interested egress.
+// Sink.Ingest; the indexer dedupes them, then fans out to every interested
+// egress.
 //
 // The Indexer itself implements Sink so adapters can call indexer.Ingest
 // directly — the choice is deliberate: synchronous Ingest keeps
@@ -38,7 +30,6 @@ type Indexer struct {
 
 	networks sync.Map // networkId -> *networkState
 	egresses sync.Map // egress Name() -> EventEgress
-	seq      atomic.Uint64
 }
 
 // networkState holds the indexer's per-network bookkeeping: the
@@ -51,8 +42,8 @@ type headMarker struct {
 	hash string
 }
 
-// NetworkHandle for finality lookups, the ingresses feeding it, and the
-// dedup windows for each active filter (plus the newHeads window).
+// networkState holds a network's NetworkHandle, the ingresses feeding it,
+// the newHeads dedup marker, and the dedup windows for each active filter.
 type networkState struct {
 	handle NetworkHandle
 
@@ -70,29 +61,18 @@ type networkState struct {
 	// pass the "load, check, store" sequence with the same stale num.
 	// We saw the latter in prod against evm:1101 where four upstream WS
 	// sources delivered the same head within ~1ms and both raced past
-	// the dedup. Fallback DedupWindow still catches the rare
-	// "older-but-not-newest" case (out-of-order delivery on a reorg
-	// boundary).
-	lastHead     atomic.Pointer[headMarker]
-	headFallback *DedupWindow
+	// the dedup.
+	lastHead atomic.Pointer[headMarker]
 
 	// Per-filter dedup windows: filterHash -> *DedupWindow.
 	filterMu     sync.RWMutex
 	filterDedup  map[string]*DedupWindow
 	filterRefcnt map[string]int // clients × filterHash; triggers RemoveFilter at 0
-
-	// chain records the last N canonical heads for this network plus
-	// an index of delivered logs keyed by blockHash. Drives reorg
-	// detection and Removed=true re-emission.
-	chain *canonicalChain
 }
 
 // New returns an empty Indexer. Networks must be registered via
 // RegisterNetwork before any ingress can push events.
 func New(logger *zerolog.Logger, opts Options) *Indexer {
-	if opts.Now == nil {
-		opts.Now = time.Now
-	}
 	if opts.DedupWindowSize <= 0 {
 		opts.DedupWindowSize = DefaultDedupWindowSize
 	}
@@ -103,8 +83,8 @@ func New(logger *zerolog.Logger, opts Options) *Indexer {
 }
 
 // RegisterNetwork installs a NetworkHandle for the indexer to consult when
-// tagging lifecycle and routing per-source state-poller updates. Safe to
-// call more than once for the same network (idempotent on handle identity).
+// routing per-source state-poller updates. Safe to call more than once for
+// the same network (idempotent on handle identity).
 func (i *Indexer) RegisterNetwork(nw NetworkHandle) *networkState {
 	if ns, ok := i.networks.Load(nw.Id()); ok {
 		return ns.(*networkState)
@@ -112,10 +92,8 @@ func (i *Indexer) RegisterNetwork(nw NetworkHandle) *networkState {
 	ns := &networkState{
 		handle:       nw,
 		ingresses:    make(map[string]EventIngress),
-		headFallback: NewDedupWindow(i.opts.DedupWindowSize),
 		filterDedup:  make(map[string]*DedupWindow),
 		filterRefcnt: make(map[string]int),
-		chain:        newCanonicalChain(i.opts.CanonicalChainDepth),
 	}
 	actual, _ := i.networks.LoadOrStore(nw.Id(), ns)
 	return actual.(*networkState)
@@ -347,8 +325,7 @@ func (i *Indexer) ReleaseFilter(ctx context.Context, networkId, subType, paramsH
 
 // Ingest is the hot-path entry point for ingress adapters. It updates
 // per-source state (via NetworkHandle.SuggestLatestBlock for headed
-// events), dedupes, lifecycle-tags, emits reorg invalidations, and
-// fans out to every interested egress.
+// events), dedupes, and fans out to every interested egress.
 func (i *Indexer) Ingest(ev StreamEvent) {
 	nsRaw, ok := i.networks.Load(ev.NetworkId)
 	if !ok {
@@ -369,39 +346,9 @@ func (i *Indexer) Ingest(ev StreamEvent) {
 		return
 	}
 
-	// Detect and emit reorg invalidations BEFORE delivering the new
-	// head. Consumers see: (removed logs) → reorg summary → new head.
-	if ev.Kind == KindNewHead && !ev.Block.Zero() {
-		if evicted := ns.chain.observeHead(ev.Block); len(evicted) > 0 {
-			i.emitReorgInvalidations(ns, evicted)
-		}
-	}
-
-	// Index logs so a later reorg can re-emit them with Removed=true.
-	if ev.Kind == KindLog {
-		// Best-effort: if the payload has a parseable blockHash, record
-		// the log against it. Logs without a blockHash can't be
-		// invalidated — safe to drop from the index.
-		if blockRef := parseLogBlockRef(ev.Payload); blockRef.Hash != "" {
-			ns.chain.indexLog(loggedLog{
-				filterHash: ev.FilterHash,
-				networkID:  ev.NetworkId,
-				sourceID:   ev.SourceId,
-				block:      blockRef,
-				payload:    ev.Payload,
-			})
-		}
-	}
-
-	// Build the indexed event.
-	out := IndexedEvent{
-		StreamEvent: ev,
-		Seq:         i.seq.Add(1),
-		Lifecycle:   i.classify(ns, ev),
-	}
-	// Upstream-asserted removed flag. Chain-tracker-driven removal goes
-	// through emitReorgInvalidations; this handles the case where the
-	// upstream itself has already classified the log as reorged-out.
+	out := IndexedEvent{StreamEvent: ev}
+	// Upstream-asserted removed flag, passed through: the indexer does not
+	// second-guess which chain is canonical.
 	if ev.Kind == KindLog {
 		out.Removed = logRemoved(ev.Payload)
 	}
@@ -409,60 +356,15 @@ func (i *Indexer) Ingest(ev StreamEvent) {
 	i.fanOut(out)
 }
 
-// emitReorgInvalidations fans out a KindReorg summary followed by
-// Removed=true copies of every log indexed against the evicted blocks.
-// Called under ingest's caller goroutine; Deliver is non-blocking by
-// contract so this stays cheap even under deep reorgs.
-func (i *Indexer) emitReorgInvalidations(ns *networkState, evicted []BlockRef) {
-	if len(evicted) == 0 {
-		return
-	}
-	networkID := ns.handle.Id()
-
-	// One KindReorg summary carrying the evicted BlockRefs.
-	reorgPayload, err := reorgSummaryPayload(evicted)
-	if err == nil {
-		i.fanOut(IndexedEvent{
-			StreamEvent: StreamEvent{
-				Kind:      KindReorg,
-				NetworkId: networkID,
-				Payload:   reorgPayload,
-			},
-			Seq:       i.seq.Add(1),
-			Lifecycle: LifeSoft,
-		})
-	}
-
-	// One Removed=true emission per indexed log in each evicted block.
-	for _, blk := range evicted {
-		logs := ns.chain.drainLogsFor(blk.Hash)
-		for _, lg := range logs {
-			i.fanOut(IndexedEvent{
-				StreamEvent: StreamEvent{
-					Kind:       KindLog,
-					NetworkId:  lg.networkID,
-					SourceId:   lg.sourceID,
-					FilterHash: lg.filterHash,
-					Block:      lg.block,
-					Payload:    lg.payload,
-				},
-				Seq:       i.seq.Add(1),
-				Lifecycle: LifeSoft,
-				Removed:   true,
-			})
-		}
-	}
-}
-
 // dedupe returns true if the event should be delivered, false if it's a
-// dupe. For newHeads we use an optimistic fast-path on (last number,
-// last hash); misses fall through to a bounded DedupWindow.
+// dupe. newHeads dedupe on the most recently delivered (number, hash);
+// filter events on a bounded per-filter DedupWindow.
 func (i *Indexer) dedupe(ns *networkState, ev *StreamEvent) bool {
 	switch ev.Kind {
 	case KindNewHead:
 		// CAS-retry on the packed (num, hash) pointer. On the happy path
 		// exactly one goroutine per distinct head wins the swap and falls
-		// through to mark+deliver; any concurrent ingest of the same head
+		// through to deliver; any concurrent ingest of the same head
 		// sees its CAS fail, reloads, and drops as a dupe on the next
 		// iteration. Reorgs at the same height (same num, different hash)
 		// win a second CAS and are delivered.
@@ -478,13 +380,9 @@ func (i *Indexer) dedupe(ns *networkState, ev *StreamEvent) bool {
 				}
 			}
 			if ns.lastHead.CompareAndSwap(prev, next) {
-				break
+				return true
 			}
 		}
-		// Store in the fallback window too for the rare "older-but-not-
-		// newest" case (out-of-order delivery on a reorg boundary).
-		ns.headFallback.Mark(ev.Block.Hash)
-		return true
 	case KindLog, KindPendingTx:
 		ns.filterMu.RLock()
 		win := ns.filterDedup[ev.FilterHash]
@@ -504,28 +402,6 @@ func (i *Indexer) dedupe(ns *networkState, ev *StreamEvent) bool {
 	default:
 		return true
 	}
-}
-
-// classify computes Lifecycle for an event using the network's finality
-// depth. Events at or below (latest - depth) are considered finalized.
-// Applied only to events with a BlockRef; KindPendingTx and KindReorg
-// default to LifeSoft.
-func (i *Indexer) classify(ns *networkState, ev StreamEvent) Lifecycle {
-	if ev.Block.Zero() {
-		return LifeSoft
-	}
-	depth := ns.handle.FinalityDepth()
-	if depth <= 0 {
-		return LifeSoft
-	}
-	var latest int64
-	if head := ns.lastHead.Load(); head != nil {
-		latest = head.num
-	}
-	if latest-ev.Block.Number >= depth {
-		return LifeFinalized
-	}
-	return LifeSoft
 }
 
 // fanOut dispatches to every registered egress whose InterestedIn matches.

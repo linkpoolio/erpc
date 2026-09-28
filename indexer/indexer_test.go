@@ -14,23 +14,20 @@ import (
 // --- fakes -----------------------------------------------------------
 
 type fakeNetwork struct {
-	id            string
-	finalityDepth int64
+	id string
 
 	mu          sync.Mutex
 	suggestedBy map[string][]int64 // sourceId -> block nums seen
 }
 
-func newFakeNetwork(id string, depth int64) *fakeNetwork {
+func newFakeNetwork(id string) *fakeNetwork {
 	return &fakeNetwork{
-		id:            id,
-		finalityDepth: depth,
-		suggestedBy:   make(map[string][]int64),
+		id:          id,
+		suggestedBy: make(map[string][]int64),
 	}
 }
 
-func (n *fakeNetwork) Id() string           { return n.id }
-func (n *fakeNetwork) FinalityDepth() int64 { return n.finalityDepth }
+func (n *fakeNetwork) Id() string { return n.id }
 func (n *fakeNetwork) SuggestLatestBlock(sourceId string, block int64, _ json.RawMessage) {
 	n.mu.Lock()
 	n.suggestedBy[sourceId] = append(n.suggestedBy[sourceId], block)
@@ -41,7 +38,6 @@ type fakeEgress struct {
 	name           string
 	filters        map[string]struct{} // filterHash -> interested
 	acceptAllHeads bool
-	acceptReorgs   bool
 
 	mu       sync.Mutex
 	received []IndexedEvent
@@ -49,11 +45,8 @@ type fakeEgress struct {
 
 func (e *fakeEgress) Name() string { return e.name }
 func (e *fakeEgress) InterestedIn(kind EventKind, networkId, filterHash string) bool {
-	switch kind {
-	case KindNewHead:
+	if kind == KindNewHead {
 		return e.acceptAllHeads
-	case KindReorg:
-		return e.acceptReorgs
 	}
 	_, ok := e.filters[filterHash]
 	return ok
@@ -107,7 +100,6 @@ func (i *fakeIngress) RemoveFilter(_ context.Context, _, _ string) error {
 	i.removeCalls.Add(1)
 	return nil
 }
-func (i *fakeIngress) Stop(_ context.Context) error { return nil }
 
 // fakeSelector is a static IngressSelector for tests.
 type fakeSelector struct {
@@ -129,7 +121,7 @@ func newIndexer(t *testing.T) *Indexer {
 
 func TestIndexer_NewHead_FanOutAndDedup(t *testing.T) {
 	idx := newIndexer(t)
-	nw := newFakeNetwork("evm:1", 0)
+	nw := newFakeNetwork("evm:1")
 	idx.RegisterNetwork(nw)
 	eg := &fakeEgress{name: "eg1", filters: map[string]struct{}{}, acceptAllHeads: true}
 	idx.Attach(eg)
@@ -162,7 +154,7 @@ func TestIndexer_NewHead_FanOutAndDedup(t *testing.T) {
 // receives exactly one delivery.
 func TestIndexer_NewHead_ConcurrentIngestDedupe(t *testing.T) {
 	idx := newIndexer(t)
-	nw := newFakeNetwork("evm:1", 0)
+	nw := newFakeNetwork("evm:1")
 	idx.RegisterNetwork(nw)
 	eg := &fakeEgress{name: "eg1", filters: map[string]struct{}{}, acceptAllHeads: true}
 	idx.Attach(eg)
@@ -196,7 +188,7 @@ func TestIndexer_NewHead_ConcurrentIngestDedupe(t *testing.T) {
 
 func TestIndexer_NewHead_StalerDroppedKeepsStatePollerFed(t *testing.T) {
 	idx := newIndexer(t)
-	nw := newFakeNetwork("evm:1", 0)
+	nw := newFakeNetwork("evm:1")
 	idx.RegisterNetwork(nw)
 	eg := &fakeEgress{name: "eg1", acceptAllHeads: true}
 	idx.Attach(eg)
@@ -218,7 +210,7 @@ func TestIndexer_NewHead_StalerDroppedKeepsStatePollerFed(t *testing.T) {
 
 func TestIndexer_Log_RefcountFanOutAndTeardown(t *testing.T) {
 	idx := newIndexer(t)
-	nw := newFakeNetwork("evm:1", 0)
+	nw := newFakeNetwork("evm:1")
 	idx.RegisterNetwork(nw)
 	ing := &fakeIngress{name: "ws:up1"}
 	if err := idx.AddIngress(context.Background(), "evm:1", ing); err != nil {
@@ -253,7 +245,7 @@ func TestIndexer_Log_RefcountFanOutAndTeardown(t *testing.T) {
 
 func TestIndexer_Log_DedupFanOut(t *testing.T) {
 	idx := newIndexer(t)
-	nw := newFakeNetwork("evm:1", 0)
+	nw := newFakeNetwork("evm:1")
 	idx.RegisterNetwork(nw)
 
 	params := []interface{}{"logs", map[string]interface{}{}}
@@ -294,124 +286,6 @@ func TestIndexer_Log_DedupFanOut(t *testing.T) {
 	}
 }
 
-func TestIndexer_Lifecycle_FinalityBoundary(t *testing.T) {
-	idx := newIndexer(t)
-	nw := newFakeNetwork("evm:1", 10)
-	idx.RegisterNetwork(nw)
-	eg := &fakeEgress{name: "eg1", acceptAllHeads: true}
-	idx.Attach(eg)
-
-	// Latest head: 100.
-	idx.Ingest(StreamEvent{Kind: KindNewHead, NetworkId: "evm:1", SourceId: "ws:up1", Block: BlockRef{Number: 100, Hash: "0xH100"}})
-	// A log at block 90 → latest-90 = 10 = depth → finalized.
-	idx.Ingest(StreamEvent{
-		Kind: KindLog, NetworkId: "evm:1", SourceId: "ws:up1",
-		Block:   BlockRef{Number: 90, Hash: "0xH90"},
-		Payload: json.RawMessage(`{"blockHash":"0xH90","transactionHash":"0xT","logIndex":"0x0"}`),
-	})
-	// A log at 95 → latest-95 = 5 < depth → soft.
-	idx.Ingest(StreamEvent{
-		Kind: KindLog, NetworkId: "evm:1", SourceId: "ws:up1",
-		Block:   BlockRef{Number: 95, Hash: "0xH95"},
-		Payload: json.RawMessage(`{"blockHash":"0xH95","transactionHash":"0xT","logIndex":"0x1"}`),
-	})
-
-	eg.mu.Lock()
-	defer eg.mu.Unlock()
-	// Only KindNewHead at 100 got through the egress (logs don't pass
-	// through the egress without a matching filter). So assert lifecycle
-	// on the head event.
-	if len(eg.received) != 1 {
-		t.Fatalf("egress should have 1 newHead event, got %d", len(eg.received))
-	}
-	head := eg.received[0]
-	// latest-latest = 0 < depth → soft.
-	if head.Lifecycle != LifeSoft {
-		t.Fatalf("latest head must be soft, got %v", head.Lifecycle)
-	}
-}
-
-func TestIndexer_ReorgEmitsRemovedLogs(t *testing.T) {
-	idx := newIndexer(t)
-	nw := newFakeNetwork("evm:1", 0)
-	idx.RegisterNetwork(nw)
-
-	params := []interface{}{"logs", map[string]interface{}{}}
-	h, _ := idx.EnsureFilter(context.Background(), "evm:1", "logs", params)
-
-	eg := &fakeEgress{
-		name:           "eg1",
-		filters:        map[string]struct{}{h: {}},
-		acceptAllHeads: true,
-		acceptReorgs:   true,
-	}
-	idx.Attach(eg)
-
-	// newHead 100/0xA.
-	idx.Ingest(StreamEvent{
-		Kind: KindNewHead, NetworkId: "evm:1", SourceId: "src1",
-		Block: BlockRef{Number: 100, Hash: "0xA", ParentHash: "0xZ"},
-	})
-	// newHead 101/0xB, child of 0xA.
-	idx.Ingest(StreamEvent{
-		Kind: KindNewHead, NetworkId: "evm:1", SourceId: "src1",
-		Block: BlockRef{Number: 101, Hash: "0xB", ParentHash: "0xA"},
-	})
-	// Log in block 0xB.
-	logPayload := json.RawMessage(`{"blockHash":"0xB","blockNumber":"0x65","transactionHash":"0xT1","logIndex":"0x0"}`)
-	idx.Ingest(StreamEvent{
-		Kind: KindLog, NetworkId: "evm:1", SourceId: "src1", FilterHash: h,
-		Block:   BlockRef{Number: 101, Hash: "0xB"},
-		Payload: logPayload,
-	})
-
-	// Reorg: new head 101/0xC replaces 0xB.
-	idx.Ingest(StreamEvent{
-		Kind: KindNewHead, NetworkId: "evm:1", SourceId: "src1",
-		Block: BlockRef{Number: 101, Hash: "0xC", ParentHash: "0xA"},
-	})
-
-	// Expected sequence in eg.received:
-	//   newHead 100, newHead 101 (0xB), log 0xB, reorg summary, log 0xB (removed), newHead 101 (0xC)
-	// eg.interestedIn filters: newHeads + logs with filterHash h.
-	eg.mu.Lock()
-	defer eg.mu.Unlock()
-	if len(eg.received) < 6 {
-		t.Fatalf("want >= 6 events after reorg, got %d: %+v", len(eg.received), kinds(eg.received))
-	}
-	// Find the reorg event.
-	var reorgIdx = -1
-	for i, ev := range eg.received {
-		if ev.Kind == KindReorg {
-			reorgIdx = i
-			break
-		}
-	}
-	if reorgIdx < 0 {
-		t.Fatalf("KindReorg not emitted; got %+v", kinds(eg.received))
-	}
-	// Next event after reorg (amongst this egress's filtered set) should
-	// be a log with Removed=true.
-	foundRemoved := false
-	for _, ev := range eg.received[reorgIdx+1:] {
-		if ev.Kind == KindLog && ev.Removed {
-			foundRemoved = true
-			break
-		}
-	}
-	if !foundRemoved {
-		t.Fatalf("expected a log with Removed=true after reorg, got %+v", kinds(eg.received))
-	}
-}
-
-func kinds(evs []IndexedEvent) []string {
-	out := make([]string, 0, len(evs))
-	for _, ev := range evs {
-		out = append(out, ev.Kind.String())
-	}
-	return out
-}
-
 func TestIndexer_UnregisteredNetwork(t *testing.T) {
 	idx := newIndexer(t)
 	if err := idx.AddIngress(context.Background(), "evm:missing", &fakeIngress{name: "x"}); err == nil {
@@ -426,7 +300,7 @@ func TestIndexer_UnregisteredNetwork(t *testing.T) {
 // "evm:1" and returns them. Helper for selector tests.
 func registerThreeIngresses(t *testing.T, idx *Indexer) (a, b, c *fakeIngress) {
 	t.Helper()
-	idx.RegisterNetwork(newFakeNetwork("evm:1", 0))
+	idx.RegisterNetwork(newFakeNetwork("evm:1"))
 	a = &fakeIngress{name: "a"}
 	b = &fakeIngress{name: "b"}
 	c = &fakeIngress{name: "c"}

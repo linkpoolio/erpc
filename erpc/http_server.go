@@ -94,7 +94,6 @@ func NewHttpServer(
 	indexerLogger := logger.With().Str("component", "indexer").Logger()
 	indexerOpts := indexer.Options{}
 	if indexerCfg != nil {
-		indexerOpts.CanonicalChainDepth = indexerCfg.CanonicalChainDepth
 		indexerOpts.DedupWindowSize = indexerCfg.DedupWindowSize
 	}
 	idx := indexer.New(&indexerLogger, indexerOpts)

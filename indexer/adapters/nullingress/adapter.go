@@ -21,7 +21,6 @@ type Adapter struct {
 
 	mu      sync.Mutex
 	started bool
-	cancel  context.CancelFunc
 	sink    indexer.Sink
 	events  chan indexer.StreamEvent
 
@@ -44,15 +43,13 @@ func New(name string) *Adapter {
 func (a *Adapter) Name() string { return a.name }
 
 // Start implements indexer.EventIngress. Spins up a goroutine that
-// forwards any Push()ed event to the indexer's Sink.
+// forwards any Push()ed event to the indexer's Sink until ctx is done.
 func (a *Adapter) Start(ctx context.Context, _ indexer.NetworkHandle, sink indexer.Sink) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.started {
 		return nil
 	}
-	ctx, cancel := context.WithCancel(ctx)
-	a.cancel = cancel
 	a.sink = sink
 	a.started = true
 	go a.pump(ctx)
@@ -85,17 +82,6 @@ func (a *Adapter) RemoveFilter(_ context.Context, subType, paramsHash string) er
 	a.mu.Lock()
 	delete(a.filters, key)
 	a.mu.Unlock()
-	return nil
-}
-
-// Stop implements indexer.EventIngress.
-func (a *Adapter) Stop(_ context.Context) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.cancel != nil {
-		a.cancel()
-	}
-	a.started = false
 	return nil
 }
 

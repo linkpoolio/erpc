@@ -99,10 +99,9 @@ func (m *selfHealMockUpstream) handle(conn *websocket.Conn) {
 	}
 }
 
-// TestWebSocket_UpstreamDiesUngracefully_SelfHeals is the end-to-end
-// regression test for an ungraceful upstream socket death: the single
-// WS upstream's connection dies with NO close handshake; eRPC must — with
-// no process restart —
+// TestWebSocket_UpstreamDiesUngracefully_SelfHeals: when the only WS
+// upstream's connection dies without a close handshake, eRPC must, with no
+// restart:
 //
 //  1. detect the dead connection and re-dial,
 //  2. re-subscribe newHeads upstream (retrying through transient failures),

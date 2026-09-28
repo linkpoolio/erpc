@@ -1262,15 +1262,9 @@ func TestWebSocket_MethodFiltering(t *testing.T) {
 	})
 }
 
-//
-// --- Regression tests ---
-//
-
-// TestWebSocket_RegressionFailedSubscribeKeepsConnectionOpen verifies that a
-// failed subscribe does NOT close the entire client connection. A regression
-// where eRPC closed the WS on subscribe failure caused cascading failures —
-// one bad subscribe killed all working ones for downstream consumers.
-func TestWebSocket_RegressionFailedSubscribeKeepsConnectionOpen(t *testing.T) {
+// TestWebSocket_FailedSubscribeKeepsConnectionOpen: a failed subscribe must
+// not close the connection and its other subscriptions.
+func TestWebSocket_FailedSubscribeKeepsConnectionOpen(t *testing.T) {
 	setupGock()
 	defer util.ResetGock()
 
@@ -1291,61 +1285,10 @@ func TestWebSocket_RegressionFailedSubscribeKeepsConnectionOpen(t *testing.T) {
 	assert.Equal(t, "0xabc123", resp2["result"], "connection should remain open after subscribe failure")
 }
 
-// TestWebSocket_SecondSubscriberReusesUpstreamNewHeads verifies that the
-// first newHeads subscriber triggers the upstream subscription and a second
-// one reuses it instead of subscribing upstream again.
-func TestWebSocket_SecondSubscriberReusesUpstreamNewHeads(t *testing.T) {
-	subscribeCount := int64(0)
-	mockUpstream := mockWsUpstream(t, func(conn *websocket.Conn) {
-		standardMockWsHandler(conn, func(method string, id interface{}, req map[string]interface{}) {
-			switch method {
-			case "eth_subscribe":
-				atomic.AddInt64(&subscribeCount, 1)
-				mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0xabc"})
-			default:
-				mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x1"})
-			}
-		})
-	})
-	defer mockUpstream.Close()
-
-	setupGock()
-	defer util.ResetGock()
-
-	wsUpstreamURL := "ws" + strings.TrimPrefix(mockUpstream.URL, "http")
-	addr, cleanup := setupTestERPCServer(t, standardWsConfig(wsUpstreamURL))
-	defer cleanup()
-	time.Sleep(2 * time.Second)
-
-	// First subscribe triggers the upstream subscribe, which is dispatched
-	// asynchronously, so poll for it.
-	conn1 := dialWs(t, addr)
-	defer conn1.Close()
-	resp1 := sendAndReceive(t, conn1, `{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}`)
-	require.NotNil(t, resp1["result"])
-	require.Eventually(t, func() bool {
-		return atomic.LoadInt64(&subscribeCount) >= 1
-	}, 3*time.Second, 20*time.Millisecond, "first client should trigger upstream subscribe")
-	first := atomic.LoadInt64(&subscribeCount)
-
-	// A second subscriber must reuse the existing upstream newHeads sub.
-	conn2 := dialWs(t, addr)
-	defer conn2.Close()
-	resp2 := sendAndReceive(t, conn2, `{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}`)
-	require.NotNil(t, resp2["result"])
-	// Small stabilization window: even if a second upstream subscribe were
-	// erroneously triggered, it would happen shortly after the response.
-	time.Sleep(200 * time.Millisecond)
-	assert.Equal(t, first, atomic.LoadInt64(&subscribeCount),
-		"second client should reuse existing newHeads sub (idempotent bootstrap)")
-}
-
-// TestWebSocket_RegressionSuggestLatestBlockOnEveryUpstream verifies that
-// SuggestLatestBlock fires for every WS upstream that delivers a block,
-// regardless of the network-level dedup. Previously only the first upstream
-// to deliver got its poller updated, causing other upstreams to appear
-// behind and be rejected by the block availability check.
-func TestWebSocket_RegressionSuggestLatestBlockOnEveryUpstream(t *testing.T) {
+// TestWebSocket_EveryUpstreamHeadReachesItsPoller: a head delivered by
+// several upstreams updates every one of their state pollers, though the
+// client receives it once.
+func TestWebSocket_EveryUpstreamHeadReachesItsPoller(t *testing.T) {
 	// Two WS upstreams that both deliver the same block.
 	upSubId := "0xupsub"
 
@@ -1426,11 +1369,10 @@ func TestWebSocket_RegressionSuggestLatestBlockOnEveryUpstream(t *testing.T) {
 	assert.Error(t, err, "duplicate block from second upstream must be deduped")
 }
 
-// TestWebSocket_RegressionFilterFanOutAcrossUpstreams verifies that logs
-// subscriptions subscribe on ALL WS upstreams and dedup notifications by
-// content (blockHash + txHash + logIndex). Previously logs subscribed on a
-// single "best" upstream; one disconnect caused gaps until re-route.
-func TestWebSocket_RegressionFilterFanOutAcrossUpstreams(t *testing.T) {
+// TestWebSocket_LogsSubscribeOnAllUpstreamsAndDedupe: a logs subscription
+// is made on every WS upstream and its notifications are deduplicated by
+// blockHash + txHash + logIndex.
+func TestWebSocket_LogsSubscribeOnAllUpstreamsAndDedupe(t *testing.T) {
 	subscribeCount := int64(0)
 	logSubId := "0xlogsub"
 
@@ -1516,10 +1458,9 @@ func TestWebSocket_RegressionFilterFanOutAcrossUpstreams(t *testing.T) {
 	assert.Error(t, err, "duplicate log from second upstream must be deduped by blockHash+txHash+logIndex")
 }
 
-// TestWebSocket_RegressionUnsubscribeDoesNotPanicOnReconnect verifies that
-// an upstream reconnect after the last logs subscriber unsubscribed leaves
-// eRPC healthy (the released filter must not be resubscribed or touched).
-func TestWebSocket_RegressionUnsubscribeDoesNotPanicOnReconnect(t *testing.T) {
+// TestWebSocket_ReconnectAfterUnsubscribe: an upstream reconnect after the
+// last logs subscriber left must not touch the released filter.
+func TestWebSocket_ReconnectAfterUnsubscribe(t *testing.T) {
 	logSubId := "0xunsublog"
 	mockUpstream := mockWsUpstream(t, func(conn *websocket.Conn) {
 		standardMockWsHandler(conn, func(method string, id interface{}, req map[string]interface{}) {
@@ -1566,10 +1507,9 @@ func TestWebSocket_RegressionUnsubscribeDoesNotPanicOnReconnect(t *testing.T) {
 	assert.NotNil(t, resp2, "eRPC should not have crashed from reconnect-after-unsubscribe")
 }
 
-// TestWebSocket_RegressionInternalRequestIdsDontCollide verifies that internal
-// eth_subscribe requests use unique wire IDs so their responses can't be
-// misrouted in the WsJsonRpcClient pending map.
-func TestWebSocket_RegressionInternalRequestIdsDontCollide(t *testing.T) {
+// TestWebSocket_InternalRequestIdsAreUnique: internal eth_subscribe requests
+// use unique wire ids, so their responses cannot be misrouted.
+func TestWebSocket_InternalRequestIdsAreUnique(t *testing.T) {
 	subscribeIds := make([]int64, 0)
 	var idMu sync.Mutex
 

@@ -2412,7 +2412,7 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 				} else if r != nil {
 					bestResp = r
 					loopSpan.SetStatus(codes.Ok, "")
-					if r.IsResultEmptyish() && emptyIsMiss(loopCtx) {
+					if r.IsResultEmptyish() && n.cfg.Failover.Enabled() && emptyIsMiss(loopCtx) {
 						lastErr = common.NewErrEndpointMissingData(
 							fmt.Errorf("upstream responded emptyish"), u,
 						)

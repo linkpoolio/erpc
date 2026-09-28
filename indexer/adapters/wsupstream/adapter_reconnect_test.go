@@ -180,6 +180,19 @@ func newTestAdapter(t *testing.T, u *url.URL) (*Adapter, *fakeSink) {
 	return a, &fakeSink{events: make(chan indexer.StreamEvent, 64)}
 }
 
+// subscribedHeads reports whether a is connected with a live newHeads
+// subscription.
+func subscribedHeads(a *Adapter) func() bool {
+	return func() bool {
+		if !a.wsClient.IsConnected() {
+			return false
+		}
+		a.subsMu.Lock()
+		defer a.subsMu.Unlock()
+		return a.heads.id != ""
+	}
+}
+
 func logsParams(address string) []interface{} {
 	return []interface{}{indexer.SubTypeLogs, map[string]interface{}{"address": address}}
 }
@@ -201,11 +214,9 @@ func nextEvent(t *testing.T, sink *fakeSink, kind indexer.EventKind) indexer.Str
 
 // --- tests ----------------------------------------------------------------
 
-// TestAdapterResubscribesWithRetryAfterReconnect: subscribes can fail when
-// the WS layer reconnects (upstream still recovering, circuit breaker
-// open, …). A single-shot resubscribe would leave the adapter head-less
-// until the next disconnect; it must keep retrying and report
-// Healthy()==false until it has a live subscription.
+// TestAdapterResubscribesWithRetryAfterReconnect: a failed resubscribe must
+// be retried rather than leave the adapter without heads until the next
+// reconnect.
 func TestAdapterResubscribesWithRetryAfterReconnect(t *testing.T) {
 	compressResubRetry(t)
 	server := newNotifyServer(t)
@@ -226,8 +237,8 @@ func TestAdapterResubscribesWithRetryAfterReconnect(t *testing.T) {
 
 	require.NoError(t, a.Start(context.Background(), fakeNetworkHandle{}, sink))
 
-	require.Eventually(t, a.Healthy, 3*time.Second, 10*time.Millisecond,
-		"adapter never became healthy despite the failures stopping after %d", failuresPerEpoch)
+	require.Eventually(t, subscribedHeads(a), 3*time.Second, 10*time.Millisecond,
+		"adapter never subscribed newHeads despite the failures stopping after %d", failuresPerEpoch)
 	require.GreaterOrEqual(t, forwardCalls.Load(), int64(failuresPerEpoch+1),
 		"expected the subscribe to be retried through failures")
 
@@ -246,7 +257,7 @@ func TestAdapterResubscribesWithRetryAfterReconnect(t *testing.T) {
 		t.Fatal("client never re-dialed after the upstream connection was killed")
 	}
 
-	require.Eventually(t, a.Healthy, 3*time.Second, 10*time.Millisecond,
+	require.Eventually(t, subscribedHeads(a), 3*time.Second, 10*time.Millisecond,
 		"adapter never re-established the newHeads subscription after reconnect")
 	conn2.sendNewHead(conn2.nextRequest(t, methodEthSubscribe).SubID, 101)
 	require.Equal(t, int64(101), nextEvent(t, sink, indexer.KindNewHead).Block.Number)
@@ -262,7 +273,7 @@ func TestAdapterResubscribesAllFiltersAfterReconnect(t *testing.T) {
 	a, sink := newTestAdapter(t, server.wsURL(t))
 	conn1 := <-server.newConn
 	require.NoError(t, a.Start(context.Background(), fakeNetworkHandle{}, sink))
-	require.Eventually(t, a.Healthy, 3*time.Second, 10*time.Millisecond)
+	require.Eventually(t, subscribedHeads(a), 3*time.Second, 10*time.Millisecond)
 
 	const numFilters = 8
 	for i := 0; i < numFilters; i++ {
@@ -277,7 +288,7 @@ func TestAdapterResubscribesAllFiltersAfterReconnect(t *testing.T) {
 		req := conn2.nextRequest(t, methodEthSubscribe)
 		subscribes[req.SubID] = fmt.Sprint(req.Params[0])
 	}
-	require.Eventually(t, a.Healthy, 3*time.Second, 10*time.Millisecond)
+	require.Eventually(t, subscribedHeads(a), 3*time.Second, 10*time.Millisecond)
 
 	for id, subType := range subscribes {
 		if subType == indexer.SubTypeLogs {
@@ -353,20 +364,4 @@ func TestAdapterEnsureFilterWhileDisconnected(t *testing.T) {
 	a.subsMu.Lock()
 	assert.Empty(t, a.filters)
 	a.subsMu.Unlock()
-}
-
-// TestAdapterHealthyReportsFalseWhenDisconnected pins the Healthy()
-// contract the subscription-refusal path depends on.
-func TestAdapterHealthyReportsFalseWhenDisconnected(t *testing.T) {
-	server := newNotifyServer(t)
-	a, _ := newTestAdapter(t, server.wsURL(t))
-	<-server.newConn
-
-	// Connected but no newHeads subscription yet.
-	require.False(t, a.Healthy())
-
-	a.subsMu.Lock()
-	a.heads.id = "0xsub"
-	a.subsMu.Unlock()
-	require.True(t, a.Healthy())
 }

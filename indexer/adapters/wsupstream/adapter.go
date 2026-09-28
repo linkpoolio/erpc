@@ -1,9 +1,6 @@
-// Package wsupstream adapts a single WebSocket JSON-RPC upstream into an
-// indexer.EventIngress. One adapter per (upstream, network). The adapter
-// owns the eth_subscribe / eth_unsubscribe RPCs, the per-subscription
-// handler registration, and the re-subscribe-on-reconnect hook. Dedup,
-// lifecycle tagging, and client fan-out live in the indexer core — this
-// package is strictly a WS ↔ StreamEvent bridge.
+// Package wsupstream adapts a WebSocket JSON-RPC upstream into an
+// indexer.EventIngress: it owns the upstream eth_subscribe/eth_unsubscribe
+// calls and resubscribes after every reconnect.
 package wsupstream
 
 import (
@@ -28,14 +25,11 @@ const (
 	methodEthSubscribe   = "eth_subscribe"
 	methodEthUnsubscribe = "eth_unsubscribe"
 
-	// resubAttemptTimeout bounds each individual subscribe RPC inside the
-	// resubscribe retry loop, and every unsubscribe.
+	// resubAttemptTimeout bounds each subscribe attempt and unsubscribe.
 	resubAttemptTimeout = 15 * time.Second
 )
 
-// Resubscribe retry backoff bounds. Vars (not consts) so tests can compress
-// time. Copied into per-adapter fields in New(), so adapter goroutines
-// never read them after construction.
+// Resubscribe backoff bounds; vars so tests can shorten them.
 var (
 	resubRetryMin = 1 * time.Second
 	resubRetryMax = 30 * time.Second
@@ -43,28 +37,20 @@ var (
 
 var errNotConnected = errors.New("upstream websocket is not connected")
 
-// Adapter bridges one WS upstream into the indexer pipeline. It is
-// created per (upstream, network) at startup and registered via
-// indexer.AddIngress.
+// Adapter is the EventIngress of one WS upstream on one network.
 type Adapter struct {
 	upstreamID string
 	networkID  string
-	upstream   *upstream.Upstream
 	wsClient   *clients.WsJsonRpcClient
 	logger     *zerolog.Logger
 
-	// forward routes subscribe/unsubscribe RPCs through the upstream's
-	// Forward (rate limits, timeouts, metrics); overridable in tests.
+	// forward sends subscription RPCs through the upstream's Forward (rate
+	// limits, timeouts, metrics); replaced in tests.
 	forward func(ctx context.Context, nq *common.NormalizedRequest, bypassMethodExclusion bool) (*common.NormalizedResponse, error)
 
-	// Retry backoff bounds, snapshotted from resubRetryMin/resubRetryMax
-	// at construction.
 	retryMin time.Duration
 	retryMax time.Duration
 
-	// stripSubscribeFromBlockZero controls whether fromBlock: "0x0" is
-	// removed from eth_subscribe logs filters before forwarding upstream.
-	// See common.EvmNetworkConfig.StripSubscribeFromBlockZero for details.
 	stripSubscribeFromBlockZero bool
 
 	nw   indexer.NetworkHandle
@@ -72,13 +58,11 @@ type Adapter struct {
 
 	// subsMu guards all mutable state below. Never held across an RPC.
 	subsMu sync.Mutex
-	// resubCancel cancels the resubscribe loop, which runs for connection
-	// epoch resubEpoch.
+	// resubCancel cancels the resubscribe loop of connection resubEpoch.
 	resubCancel context.CancelFunc
 	resubEpoch  uint64
 	heads       upstreamSub
-	// filters keyed by `subType + ":" + paramsHash`. Survives disconnects
-	// so we can re-subscribe on reconnect.
+	// filters (by filterKey) survive disconnects to be resubscribed.
 	filters map[string]*filterSub
 }
 
@@ -94,13 +78,10 @@ type upstreamSub struct {
 	removed bool
 }
 
-// Options carries optional settings for New. Fields zero-valued by default
-// preserve the adapter's standard behaviour — only set what you want to
-// override.
+// Options are the network-level settings of an Adapter.
 type Options struct {
-	// StripSubscribeFromBlockZero, when true, removes fromBlock: "0x0" from
-	// eth_subscribe logs filters before sending to the upstream. See
-	// common.EvmNetworkConfig.StripSubscribeFromBlockZero.
+	// StripSubscribeFromBlockZero removes a zero fromBlock from logs
+	// filters; see common.EvmNetworkConfig.StripSubscribeFromBlockZero.
 	StripSubscribeFromBlockZero bool
 }
 
@@ -111,61 +92,45 @@ type filterSub struct {
 	params     []interface{}
 }
 
-// New constructs an adapter for one upstream. Returns nil if the upstream
-// is not backed by a WsJsonRpcClient (i.e. it's HTTP) — callers filter
-// upstream lists up-front but this is a cheap safety net.
-//
-// Pass opts for network-level behaviour overrides; a nil opts preserves
-// default behaviour.
-func New(up *upstream.Upstream, networkID string, logger *zerolog.Logger, opts *Options) *Adapter {
+// New returns the adapter of up, or nil if up is not a WebSocket upstream.
+func New(up *upstream.Upstream, networkID string, logger *zerolog.Logger, opts Options) *Adapter {
 	wsClient, ok := up.Client.(*clients.WsJsonRpcClient)
 	if !ok {
 		return nil
 	}
 	lg := logger.With().Str("upstreamId", up.Id()).Str("networkId", networkID).Logger()
-	a := &Adapter{
+	return &Adapter{
 		upstreamID: up.Id(),
 		networkID:  networkID,
-		upstream:   up,
 		wsClient:   wsClient,
 		logger:     &lg,
 		filters:    make(map[string]*filterSub),
 		forward: func(ctx context.Context, nq *common.NormalizedRequest, bypassMethodExclusion bool) (*common.NormalizedResponse, error) {
 			return up.Forward(ctx, nq, bypassMethodExclusion, false)
 		},
-		retryMin: resubRetryMin,
-		retryMax: resubRetryMax,
+		retryMin:                    resubRetryMin,
+		retryMax:                    resubRetryMax,
+		stripSubscribeFromBlockZero: opts.StripSubscribeFromBlockZero,
 	}
-	if opts != nil {
-		a.stripSubscribeFromBlockZero = opts.StripSubscribeFromBlockZero
-	}
-	return a
 }
 
-// Name identifies the adapter in indexer registries and logs. Unique per
-// upstream — two networks never share a WS client today.
 func (a *Adapter) Name() string { return "ws:" + a.upstreamID }
 
-// Start wires the adapter to the indexer's sink, registers the
-// reconnect/disconnect hooks, and kicks off the initial newHeads
-// subscribe in a background goroutine. Per the EventIngress contract
-// Start returns once background workers are set up, not once the first
-// event arrives — the initial subscribe uses its own detached context
-// so a cancelled caller ctx doesn't abort the upstream RPC.
+// Start registers the connection hooks and subscribes newHeads in the
+// background, detached from ctx.
 func (a *Adapter) Start(_ context.Context, nw indexer.NetworkHandle, sink indexer.Sink) error {
 	a.nw = nw
 	a.sink = sink
 
 	cbID := a.Name()
 	a.wsClient.SetOnReconnect(cbID, func() {
-		a.logger.Info().Msg("WS reconnected — re-subscribing to all active subs")
+		a.logger.Info().Msg("upstream websocket reconnected, resubscribing")
 		a.startResubscribe()
 	})
 	a.wsClient.SetOnDisconnect(cbID, func() {
-		a.logger.Info().Msg("WS disconnected — active subs will re-subscribe on reconnect")
-		// The subscriptions died with the connection (the client already
-		// dropped their handlers); forget them so Healthy() reports
-		// honestly and the next connection resubscribes everything.
+		a.logger.Info().Msg("upstream websocket disconnected, will resubscribe on reconnect")
+		// The subscriptions died with the connection; forget them so the
+		// next connection resubscribes everything.
 		a.subsMu.Lock()
 		if a.resubCancel != nil {
 			a.resubCancel()
@@ -179,18 +144,6 @@ func (a *Adapter) Start(_ context.Context, nw indexer.NetworkHandle, sink indexe
 
 	a.startResubscribe()
 	return nil
-}
-
-// Healthy reports whether this ingress currently has a live upstream WS
-// connection AND an active newHeads subscription — i.e. it can actually
-// deliver heads right now.
-func (a *Adapter) Healthy() bool {
-	if !a.wsClient.IsConnected() {
-		return false
-	}
-	a.subsMu.Lock()
-	defer a.subsMu.Unlock()
-	return a.heads.id != ""
 }
 
 // startResubscribe launches the retry loop for the current connection
@@ -210,9 +163,9 @@ func (a *Adapter) startResubscribe() {
 	go a.resubscribeWithRetry(ctx)
 }
 
-// EnsureFilter subscribes a filter on this upstream; a no-op if it is
-// already subscribed. On failure a filter this call added is dropped again
-// so it isn't resubscribed on every reconnect for nobody.
+// EnsureFilter subscribes a filter; a no-op if it is already subscribed. A
+// filter this call added is dropped again on failure, so it isn't
+// resubscribed on every reconnect.
 func (a *Adapter) EnsureFilter(ctx context.Context, subType, paramsHash string, params []interface{}) error {
 	key := filterKey(subType, paramsHash)
 
@@ -238,10 +191,7 @@ func (a *Adapter) EnsureFilter(ctx context.Context, subType, paramsHash string, 
 	return err
 }
 
-// RemoveFilter unsubscribes a filter from the upstream and drops it from
-// the adapter's state so it won't be resubscribed on reconnect. Any
-// notifications that arrive in the race window are dropped by the
-// indexer (no refcount → no fan-out).
+// RemoveFilter unsubscribes a filter and stops resubscribing it.
 func (a *Adapter) RemoveFilter(ctx context.Context, subType, paramsHash string) error {
 	key := filterKey(subType, paramsHash)
 
@@ -255,17 +205,14 @@ func (a *Adapter) RemoveFilter(ctx context.Context, subType, paramsHash string) 
 	return nil
 }
 
-// --- internals ---------------------------------------------------------
-
 func filterKey(subType, paramsHash string) string {
 	return subType + ":" + paramsHash
 }
 
-// resubscribeWithRetry (re)establishes the newHeads subscription plus every
-// tracked filter, retrying with backoff until everything is subscribed or
-// the epoch is cancelled (disconnect / Stop). A single failed subscribe
-// (upstream error, rate limit, …) must not leave the adapter head-less
-// until the next reconnect.
+// resubscribeWithRetry (re)subscribes newHeads and every filter, retrying
+// with backoff until all succeed or ctx is cancelled, so one failed
+// subscribe doesn't leave the adapter without heads until the next
+// reconnect.
 func (a *Adapter) resubscribeWithRetry(ctx context.Context) {
 	backoff := a.retryMin
 	for {
@@ -318,10 +265,10 @@ func (a *Adapter) subscribeFilterLocked(ctx context.Context, sub *filterSub) err
 	outParams := append([]interface{}{sub.subType}, sub.params[1:]...)
 	if a.stripSubscribeFromBlockZero {
 		if cleaned, changed := stripFromBlockZero(outParams); changed {
-			a.logger.Info().
+			a.logger.Debug().
 				Str("subType", sub.subType).
 				Str("paramsHash", sub.paramsHash).
-				Msg("stripping fromBlock:0x0 from eth_subscribe filter (stripSubscribeFromBlockZero)")
+				Msg("stripped zero fromBlock from eth_subscribe filter")
 			outParams = cleaned
 		}
 	}
@@ -334,11 +281,9 @@ func (a *Adapter) subscribeFilterLocked(ctx context.Context, sub *filterSub) err
 	return nil
 }
 
-// subscribeLocked establishes sub's upstream subscription unless it is
-// already live or has been dropped; the caller holds sub.mu. The client
-// registers handler as the subscribe response is read. The result is then
-// committed only if sub is still wanted and its connection still up;
-// otherwise it is released so nothing is left subscribed upstream.
+// subscribeLocked subscribes sub unless it is live or dropped; the caller
+// holds sub.mu. The result is kept only if sub is still wanted and its
+// connection is still up, and released upstream otherwise.
 func (a *Adapter) subscribeLocked(ctx context.Context, sub *upstreamSub, params []interface{}, handler func(params []byte)) error {
 	a.subsMu.Lock()
 	skip := sub.id != "" || sub.removed
@@ -417,13 +362,12 @@ func (a *Adapter) send(ctx context.Context, method string, params []interface{})
 	return err
 }
 
-// handleNewHeads converts a newHeads notification into a StreamEvent and
-// pushes it at the indexer's Sink.
+type notificationParams struct {
+	Result json.RawMessage `json:"result"`
+}
+
 func (a *Adapter) handleNewHeads(raw []byte) {
-	var outer struct {
-		Subscription string          `json:"subscription"`
-		Result       json.RawMessage `json:"result"`
-	}
+	var outer notificationParams
 	if err := common.SonicCfg.Unmarshal(raw, &outer); err != nil {
 		a.logger.Warn().Err(err).Msg("failed to parse newHeads notification envelope")
 		return
@@ -450,12 +394,8 @@ func (a *Adapter) handleNewHeads(raw []byte) {
 	})
 }
 
-// handleFilter converts a filter notification into a StreamEvent.
 func (a *Adapter) handleFilter(subType, paramsHash string, raw []byte) {
-	var outer struct {
-		Subscription string          `json:"subscription"`
-		Result       json.RawMessage `json:"result"`
-	}
+	var outer notificationParams
 	if err := common.SonicCfg.Unmarshal(raw, &outer); err != nil {
 		a.logger.Warn().Err(err).Str("subType", subType).Msg("failed to parse filter notification envelope")
 		return
@@ -464,22 +404,18 @@ func (a *Adapter) handleFilter(subType, paramsHash string, raw []byte) {
 	if subType == indexer.SubTypeNewPendingTransactions {
 		kind = indexer.KindPendingTx
 	}
-	ev := indexer.StreamEvent{
+	a.sink.Ingest(indexer.StreamEvent{
 		Kind:       kind,
 		NetworkId:  a.networkID,
 		SourceId:   a.Name(),
 		FilterHash: paramsHash,
 		Payload:    outer.Result,
-	}
-	a.sink.Ingest(ev)
+	})
 }
 
-// stripFromBlockZero returns a copy of params with fromBlock removed from
-// any filter object whose fromBlock equals "0x0" or "0". toBlock is left
-// alone. Other fromBlock values (including "latest", "finalized", or a
-// specific hex block number) are not touched. The input slice is not
-// mutated — filter maps are shallow-copied so the caller's params remain
-// stable for paramsHash computation and resubscribe.
+// stripFromBlockZero returns a copy of params without fromBlock in filter
+// objects whose fromBlock is zero. params is not mutated, so it stays valid
+// for the paramsHash and later resubscribes.
 func stripFromBlockZero(params []interface{}) ([]interface{}, bool) {
 	out := make([]interface{}, len(params))
 	changed := false
@@ -512,9 +448,7 @@ func stripFromBlockZero(params []interface{}) ([]interface{}, bool) {
 	return out, changed
 }
 
-// isZeroBlockRef reports whether s parses to zero in any form eth clients
-// typically emit ("0", "0x0", "0x00", …). strconv.ParseInt with base 0
-// auto-detects the 0x prefix for hex.
+// isZeroBlockRef reports whether s is a zero integer literal ("0", "0x0", ...).
 func isZeroBlockRef(s string) bool {
 	n, err := strconv.ParseInt(strings.TrimSpace(s), 0, 64)
 	return err == nil && n == 0

@@ -320,24 +320,27 @@ func TestExtractJsonRpcError_MempoolPolicyRejections(t *testing.T) {
 	}
 }
 
-// TestExtractJsonRpcError_ReplayAttackIdempotency verifies that a re-submission
-// of an already-accepted transaction rejected with a "replay attack" error is
-// normalized to ErrEndpointNonceException with reason "already known", so
-// eth_sendRawTransaction idempotency handling can convert it to success.
+// TestExtractJsonRpcError_ReplayAttackIdempotency verifies that the observed
+// TX_REPLAY_ATTACK rejection of an already-accepted transaction is normalized
+// to ErrEndpointNonceException with reason "already known", so
+// eth_sendRawTransaction idempotency handling can convert it to success, and
+// that other "replay attack" wording (e.g. a replay-protection rejection) is not.
 func TestExtractJsonRpcError_ReplayAttackIdempotency(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		name    string
-		message string
+		name         string
+		message      string
+		alreadyKnown bool
 	}{
 		{
-			name:    "uppercase errmsg token",
-			message: "errcode: 113, errmsg: TX_REPLAY_ATTACK",
+			name:         "observed errmsg token",
+			message:      "errcode: 113, errmsg: TX_REPLAY_ATTACK",
+			alreadyKnown: true,
 		},
 		{
-			name:    "spaced phrasing",
-			message: "transaction rejected: replay attack detected",
+			name:    "other replay attack wording",
+			message: "replay attack detected",
 		},
 	}
 
@@ -357,15 +360,11 @@ func TestExtractJsonRpcError_ReplayAttackIdempotency(t *testing.T) {
 			if err == nil {
 				t.Fatalf("expected error, got nil")
 			}
-			if !common.HasErrorCode(err, common.ErrCodeEndpointNonceException) {
-				t.Fatalf("expected ErrEndpointNonceException, got %T: %v", err, err)
-			}
 			var ne *common.ErrEndpointNonceException
-			if !errors.As(err, &ne) {
-				t.Fatalf("expected *common.ErrEndpointNonceException in chain, got %T", err)
-			}
-			if got := ne.Details["nonceExceptionReason"]; got != string(common.NonceExceptionReasonAlreadyKnown) {
-				t.Fatalf("expected reason %q, got %v", common.NonceExceptionReasonAlreadyKnown, got)
+			isAlreadyKnown := errors.As(err, &ne) &&
+				ne.Details["nonceExceptionReason"] == string(common.NonceExceptionReasonAlreadyKnown)
+			if isAlreadyKnown != tc.alreadyKnown {
+				t.Fatalf("expected alreadyKnown=%v, got %T: %v", tc.alreadyKnown, err, err)
 			}
 		})
 	}

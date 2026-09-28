@@ -354,8 +354,7 @@ func ExtractJsonRpcError(r *http.Response, nr *common.NormalizedResponse, jr *co
 			strings.Contains(ml, "transaction already exists") ||
 			strings.Contains(ml, "already have transaction") ||
 			strings.Contains(ml, "already exists in mempool") ||
-			strings.Contains(ml, "tx_replay_attack") ||
-			strings.Contains(ml, "replay attack") {
+			strings.Contains(ml, "tx_replay_attack") {
 			// These indicate the exact same transaction is already known - idempotent success case
 			return common.NewErrEndpointNonceException(
 				common.NewErrJsonRpcExceptionInternal(

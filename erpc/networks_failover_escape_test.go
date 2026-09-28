@@ -26,13 +26,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// The fixtures run a real policy.Engine with the built-in default selection
-// policy (fallback-tier upstreams cordoned while a primary is healthy), with a
-// frozen ticker driven by policy.TickForTest.
-
-// mockJsonRpcUpstream wires the standard state-poller mocks for one upstream
-// at a fixed block height. Used to build the multi-primary + multi-fallback
-// fixture the failover tests need.
+// mockJsonRpcUpstream wires the state-poller mocks for one upstream at a
+// fixed block height.
 func mockJsonRpcUpstream(host string, chainIdHex, latestHex, finalizedHex string) {
 	gock.New("http://" + host).
 		Post("").
@@ -73,9 +68,8 @@ func mockJsonRpcUpstream(host string, chainIdHex, latestHex, finalizedHex string
 		JSON([]byte(`{"result":false}`))
 }
 
-// mockEthCallReturning wires an eth_call mock that echoes which upstream
-// served the request via a unique result hex. Lets the test assert
-// failover by which upstream actually answered.
+// mockEthCallReturning wires an eth_call mock whose result identifies the
+// upstream that served it.
 func mockEthCallReturning(host string, resultHex string) {
 	gock.New("http://" + host).
 		Post("").
@@ -87,71 +81,41 @@ func mockEthCallReturning(host string, resultHex string) {
 		JSON([]byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"result":"%s"}`, resultHex)))
 }
 
-// failoverUpstreamConfigs builds the standard 4-upstream layout used by the
-// failover tests: 2 primaries + 2 fallbacks (the latter tagged
-// `common.TagTierFallback`). Hosts are rpc1..rpc4.localhost.
-// headBoundedAvailability declares "serve only blocks up to my observed head".
-// The block-availability gate enforces ONLY an upstream's configured serving
-// range (it deliberately has no implicit blockNumber > latestBlock check, see
-// checkUpstreamBlockAvailability), so the fixtures state the bound explicitly
-// to reproduce a primary whose poller trails the requested block.
+// headBoundedAvailability makes an upstream serve only blocks up to its
+// polled head; the availability gate has no such implicit bound.
 func headBoundedAvailability() *common.EvmBlockAvailabilityConfig {
 	return &common.EvmBlockAvailabilityConfig{
 		Upper: &common.EvmAvailabilityBoundConfig{LatestBlockMinus: i64(0)},
 	}
 }
 
+// failoverUpstreamConfigs builds 2 primaries and 2 fallback-tier upstreams on
+// rpc1..rpc4.localhost.
 func failoverUpstreamConfigs() []*common.UpstreamConfig {
-	return []*common.UpstreamConfig{
-		{
-			Type: common.UpstreamTypeEvm, Id: "primary-1",
-			Endpoint: "http://rpc1.localhost",
+	var cfgs []*common.UpstreamConfig
+	for i, id := range []string{"primary-1", "primary-2", "fallback-1", "fallback-2"} {
+		cfg := &common.UpstreamConfig{
+			Type:     common.UpstreamTypeEvm,
+			Id:       id,
+			Endpoint: fmt.Sprintf("http://rpc%d.localhost", i+1),
 			Evm: &common.EvmUpstreamConfig{
 				ChainId:             999,
 				StatePollerInterval: common.Duration(100 * time.Millisecond),
 				StatePollerDebounce: common.Duration(20 * time.Millisecond),
 				BlockAvailability:   headBoundedAvailability(),
 			},
-		},
-		{
-			Type: common.UpstreamTypeEvm, Id: "primary-2",
-			Endpoint: "http://rpc2.localhost",
-			Evm: &common.EvmUpstreamConfig{
-				ChainId:             999,
-				StatePollerInterval: common.Duration(100 * time.Millisecond),
-				StatePollerDebounce: common.Duration(20 * time.Millisecond),
-				BlockAvailability:   headBoundedAvailability(),
-			},
-		},
-		{
-			Type: common.UpstreamTypeEvm, Id: "fallback-1",
-			Endpoint: "http://rpc3.localhost",
-			Tags:     []string{common.TagTierFallback},
-			Evm: &common.EvmUpstreamConfig{
-				ChainId:             999,
-				StatePollerInterval: common.Duration(100 * time.Millisecond),
-				StatePollerDebounce: common.Duration(20 * time.Millisecond),
-				BlockAvailability:   headBoundedAvailability(),
-			},
-		},
-		{
-			Type: common.UpstreamTypeEvm, Id: "fallback-2",
-			Endpoint: "http://rpc4.localhost",
-			Tags:     []string{common.TagTierFallback},
-			Evm: &common.EvmUpstreamConfig{
-				ChainId:             999,
-				StatePollerInterval: common.Duration(100 * time.Millisecond),
-				StatePollerDebounce: common.Duration(20 * time.Millisecond),
-				BlockAvailability:   headBoundedAvailability(),
-			},
-		},
+		}
+		if strings.HasPrefix(id, "fallback") {
+			cfg.Tags = []string{common.TagTierFallback}
+		}
+		cfgs = append(cfgs, cfg)
 	}
+	return cfgs
 }
 
-// buildFailoverNetwork wires a real Network + UpstreamsRegistry +
-// policy.Engine running the built-in default selection policy (which
-// cordons `tier:fallback` upstreams while a primary survives). The engine
-// ticker is frozen; the caller drives ticks via policy.TickForTest.
+// buildFailoverNetwork wires a Network with the default selection policy
+// (fallback tier cordoned while a primary is healthy) on a frozen ticker;
+// callers drive ticks via policy.TickForTest.
 func buildFailoverNetwork(
 	t *testing.T, ctx context.Context,
 	upstreamConfigs []*common.UpstreamConfig,
@@ -220,29 +184,19 @@ func buildFailoverNetwork(
 	require.NoError(t, upr.PrepareUpstreamsForNetwork(ctx, util.EvmNetworkId(999)))
 	require.NoError(t, network.Bootstrap(ctx))
 
-	// Bootstrap each upstream's state poller; they fetch latest/finalized
-	// from the gock mocks and populate the per-upstream shared counters.
 	upsList := upr.GetNetworkUpstreams(ctx, util.EvmNetworkId(999))
 	require.Len(t, upsList, 4)
 	for _, ups := range upsList {
 		require.NoError(t, ups.Bootstrap(ctx))
 	}
 
-	// Let pollers run a couple of cycles so per-upstream LatestBlock counters
-	// are populated.
+	// Let the pollers run a couple of cycles.
 	time.Sleep(500 * time.Millisecond)
 
 	return network, upr, mt
 }
 
-// finalityForRequest computes the finality the gate-skip recording path uses
-// for a request, so assertions read the same tracker bucket. We read the
-// all-finalities aggregate via DataFinalityStateAll which is fed by every
-// Record* regardless of the request's specific finality, so this is mostly
-// documentation — DataFinalityStateAll is the safe key.
-
-// failoverFixtureOpts configures the standard 4-upstream test layout
-// (2 primaries + 2 fallbacks) used by the escape-hatch sub-tests.
+// failoverFixtureOpts configures the failoverUpstreamConfigs layout.
 type failoverFixtureOpts struct {
 	primaryLatest  string
 	fallbackLatest string
@@ -283,11 +237,8 @@ func setupFailoverFixture(
 	upsList := upr.GetNetworkUpstreams(ctx, util.EvmNetworkId(999))
 	require.Len(t, upsList, 4)
 
-	// Drive an initial tick so the default policy computes the ordered list.
-	// With healthy primaries, preferTag cordons the fallbacks out of the
-	// ordered list — so the request path sees only primaries, exhausts them
-	// on a gate-skip, and the per-request escape hatch (not the policy) is
-	// what brings the fallbacks in. This is exactly the path under test.
+	// With healthy primaries the default policy cordons the fallbacks, so
+	// only the per-request escape brings them in.
 	if network.policyEngine != nil {
 		policy.ResetSlotStateForTest(network.policyEngine, network.networkId, "*")
 		policy.TickForTest(network.policyEngine, network.networkId, "*")
@@ -306,19 +257,15 @@ func ethCallRequest(id int, blockHex string) *common.NormalizedRequest {
 	)))
 }
 
-// TestFailover_EscapeHatch verifies the per-request escape hatch:
-// when the primary set is exhausted with retryable errors within a single
-// request, fallbacks are appended and re-iterated so the client receives a
-// fallback response on the same call.
+// Once the primaries are exhausted with retryable errors, the same request
+// escalates to the fallback tier.
 func TestFailover_EscapeHatch(t *testing.T) {
 	t.Run("EscapesToFallbackOnFirstFailingRequest", func(t *testing.T) {
 		defer util.ResetGock()
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		// Primaries stuck at 1000, fallbacks at 1002. Request block 1002 →
-		// gate-rejects on primaries → escape hatch should fire and route to
-		// fallback.
+		// Primaries at 1000 skip block 1002; the fallbacks at 1002 serve it.
 		network, _, _ := setupFailoverFixture(t, ctx, failoverFixtureOpts{
 			primaryLatest:  "0x3e8", // 1000
 			fallbackLatest: "0x3ea", // 1002
@@ -328,7 +275,6 @@ func TestFailover_EscapeHatch(t *testing.T) {
 		counter := telemetry.MetricNetworkFallbackEscapeTotal.WithLabelValues("main", "evm:999", "eth_call")
 		before := promUtil.ToFloat64(counter)
 
-		// Single request — no warm-up burst, no policy-tick wait.
 		req := ethCallRequest(1, "0x3ea")
 		req.SetNetwork(network)
 		resp, err := network.Forward(ctx, req)
@@ -352,8 +298,6 @@ func TestFailover_EscapeHatch(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		// All upstreams at block 1002. Request block 1002 → primary's gate
-		// passes → returns on first iteration → escape hatch never fires.
 		network, _, _ := setupFailoverFixture(t, ctx, failoverFixtureOpts{
 			primaryLatest:  "0x3ea", // 1002
 			fallbackLatest: "0x3ea", // 1002
@@ -363,7 +307,6 @@ func TestFailover_EscapeHatch(t *testing.T) {
 		counter := telemetry.MetricNetworkFallbackEscapeTotal.WithLabelValues("main", "evm:999", "eth_call")
 		before := promUtil.ToFloat64(counter)
 
-		// 30 requests over the healthy path. None should hit fallback.
 		for i := 0; i < 30; i++ {
 			req := ethCallRequest(i, "0x3ea")
 			req.SetNetwork(network)
@@ -388,16 +331,8 @@ func TestFailover_EscapeHatch(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		// Same primary-stuck-fallback-ahead setup as Sub-test A, but with
-		// failover.onDefaultsExhausted unset. The per-request escape hatch must
-		// respect the operator's opt-out and never fire.
-		//
-		// NOTE (post-#888): the request may still be served by the fallback
-		// tier — upstream's default selection policy natively falls through to
-		// `tier:fallback` via preferTag('!tier:fallback', {fallback}). That
-		// native routing is independent of our Failover feature. What this test
-		// guards is precisely OUR contribution: with Failover disabled the
-		// `network_fallback_escape_total` counter must stay flat.
+		// The default selection policy may still route to the fallback tier
+		// on its own; only the escape counter is asserted.
 		network, _, _ := setupFailoverFixture(t, ctx, failoverFixtureOpts{
 			primaryLatest:  "0x3e8", // 1000
 			fallbackLatest: "0x3ea", // 1002
@@ -423,14 +358,8 @@ func TestFailover_EscapeHatch(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		// Primaries stuck at 1000, fallbacks ALSO stuck at 1000. Request
-		// block 1002. The gap (2 blocks) is within MaxRetryableBlockDistance,
-		// so the gate-skip is RETRYABLE and the primary set exhausts → the
-		// escape hatch fires and appends the fallback tier. Under upstream's
-		// new model the fallback (within retryable tolerance) then serves the
-		// request. The invariant this test guards is escalate-AT-MOST-ONCE: the
-		// escape must fire exactly once and never re-enter escalationLoop a
-		// second time (which the single MarkEscalatedToFallbacks gate ensures).
+		// Every upstream skips block 1002 (retryable); the escape fires once
+		// and does not re-escalate after the fallbacks also skip.
 		network, _, _ := setupFailoverFixture(t, ctx, failoverFixtureOpts{
 			primaryLatest:  "0x3e8", // 1000
 			fallbackLatest: "0x3e8", // also 1000
@@ -458,16 +387,8 @@ func TestFailover_EscapeHatch(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		// Primaries stuck at block 1000, fallbacks far ahead at block 10000.
-		// Request block 9000 (0x2328). The gap from primary (1000) to 9000 is
-		// 8000 blocks — well beyond the default MaxRetryableBlockDistance —
-		// so checkUpstreamBlockAvailability classifies each primary's skip as
-		// NON-retryable (ErrUpstreamRequestSkipped wrapping
-		// ErrUpstreamBlockUnavailable).
-		//
-		// Scenario: primaries fronting a stalled node report a head far
-		// behind the chain, while a fallback at the real head can serve. The
-		// non-retryable skips must still let the escape fire.
+		// Block 9000 is beyond MaxRetryableBlockDistance of the primaries at
+		// 1000, so their skips are non-retryable; the escape must still fire.
 		network, _, _ := setupFailoverFixture(t, ctx, failoverFixtureOpts{
 			primaryLatest:  "0x3e8",  // 1000
 			fallbackLatest: "0x2710", // 10000
@@ -477,7 +398,7 @@ func TestFailover_EscapeHatch(t *testing.T) {
 		counter := telemetry.MetricNetworkFallbackEscapeTotal.WithLabelValues("main", "evm:999", "eth_call")
 		before := promUtil.ToFloat64(counter)
 
-		req := ethCallRequest(1, "0x2328") // 9000 — 8000 blocks ahead of primary
+		req := ethCallRequest(1, "0x2328") // 9000
 		req.SetNetwork(network)
 		resp, err := network.Forward(ctx, req)
 		require.NoError(t, err,
@@ -492,11 +413,8 @@ func TestFailover_EscapeHatch(t *testing.T) {
 		assert.Contains(t, []string{"0x3333", "0x4444"}, result,
 			"non-retryable-gate-skip escape must route to a fallback; got %q", result)
 
-		// The selection policy may already have excluded primaries that trail
-		// the head this far (block-head-lag exclusion), in which case the
-		// fallback is selected directly and the escape has nothing to do. When
-		// the primaries are still in the ordered list, the non-retryable skip
-		// must seed lastErr so the escape fires — exactly once.
+		// The selection policy may already exclude primaries this far behind,
+		// leaving the escape nothing to do.
 		after := promUtil.ToFloat64(counter)
 		assert.LessOrEqual(t, after-before, float64(1),
 			"escape hatch must fire at most once for the non-retryable gate-skip case")
@@ -507,10 +425,7 @@ func TestFailover_EscapeHatch(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		// Primaries and fallbacks both report tip 1002 via poller, so the
-		// availability gate fails open / passes. Primaries return null for
-		// the concrete tip block (missing data); fallbacks return the header.
-		// Before the emptyish-escape fix, bestResp=null blocked escalation.
+		// Every upstream reports 1002, but the primaries return null for it.
 		network, _, _ := setupFailoverFixture(t, ctx, failoverFixtureOpts{
 			primaryLatest:  "0x3ea", // 1002
 			fallbackLatest: "0x3ea", // 1002

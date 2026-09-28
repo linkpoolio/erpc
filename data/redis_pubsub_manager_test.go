@@ -48,6 +48,18 @@ func TestSubscriberChannel_SendKeepLatestEvictsStale(t *testing.T) {
 	}
 }
 
+// A stale value (e.g. Subscribe's initial GET landing after a pubsub
+// message) must not replace a fresher one still in the buffer.
+func TestSubscriberChannel_SendKeepLatestKeepsFresherBuffered(t *testing.T) {
+	sc := newTestSubscriberChannel()
+
+	fresh := CounterInt64State{Value: 101, UpdatedAt: 2}
+	sc.sendKeepLatest(fresh)
+	sc.sendKeepLatest(CounterInt64State{Value: 100, UpdatedAt: 1})
+
+	assert.Equal(t, fresh, <-sc.ch, "buffered fresher value must survive a stale send")
+}
+
 func TestSubscriberChannel_SendKeepLatestSequentialDeliversEachValue(t *testing.T) {
 	sc := newTestSubscriberChannel()
 

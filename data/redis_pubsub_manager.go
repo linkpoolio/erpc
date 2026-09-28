@@ -43,9 +43,10 @@ func (sc *subscriberChannel) close() {
 }
 
 // sendKeepLatest delivers value into sc.ch using keep-latest semantics:
-// if the buffered slot is full, the stale value is drained and the new
-// one takes its place. Returns early if the subscriber has been closed.
-// Never blocks on a slow consumer.
+// if the buffered slot is full, the buffered value is drained and the
+// fresher of the two (by UpdatedAt, the order consumers apply) takes its
+// place. Returns early if the subscriber has been closed. Never blocks on
+// a slow consumer.
 //
 // Keep-latest (rather than drop-new) matters for monotonic counters
 // (latest / finalized block): the freshest value is the only one
@@ -60,10 +61,14 @@ func (sc *subscriberChannel) sendKeepLatest(value CounterInt64State) {
 			return
 		default:
 		}
-		// Buffer full. Drain the stale entry, then loop and retry the send.
-		// The inner select also watches done so we don't spin after shutdown.
+		// Buffer full. Drain the buffered entry, then loop and retry the send
+		// with whichever is fresher. The inner select also watches done so
+		// we don't spin after shutdown.
 		select {
-		case <-sc.ch:
+		case queued := <-sc.ch:
+			if queued.UpdatedAt > value.UpdatedAt {
+				value = queued
+			}
 		case <-sc.done:
 			return
 		default:
@@ -242,11 +247,9 @@ func (m *RedisPubSubManager) Subscribe(key string) (<-chan CounterInt64State, fu
 	// Add the channel to subscribers
 	m.addSubscriber(key, sc)
 
-	// Get initial value in background. Reuse sendKeepLatest so a pubsub
-	// message that landed first isn't clobbered by a stale initial fetch
-	// (processNewState's timestamp ordering also catches this, but
-	// keep-latest at the transport means the consumer never even sees
-	// the out-of-order value).
+	// Get initial value in background. sendKeepLatest keeps a fresher
+	// pubsub message still in the buffer; one already consumed is protected
+	// by processNewState's timestamp ordering.
 	go func() {
 		if val, ok, err := m.getCurrentValue(m.appCtx, key); err == nil && ok {
 			sc.sendKeepLatest(val)

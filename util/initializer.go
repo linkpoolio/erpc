@@ -53,6 +53,9 @@ type BootstrapTask struct {
 	ctxCancel   atomic.Value                    // context.CancelFunc
 	doneVal     atomic.Value                    // chan struct{}
 	attempts    atomic.Int32
+	// attemptMu makes "claim Running + bump attempts" and "check attempt id +
+	// leave Running" atomic, so a superseded attempt cannot finish the next one.
+	attemptMu sync.Mutex
 }
 
 func NewBootstrapTask(name string, fn func(ctx context.Context) error) *BootstrapTask {
@@ -139,10 +142,33 @@ func (t *BootstrapTask) Wait(ctx context.Context) error {
 	}
 }
 
-// attempt is called just before a new attempt to run t.Fn.
-func (t *BootstrapTask) beginAttempt() {
-	t.attempts.Add(1)
+// startAttempt moves the task from state `from` to Running and returns the new
+// attempt's id, or false when another caller changed the state first.
+func (t *BootstrapTask) startAttempt(from TaskState) (int32, bool) {
+	t.attemptMu.Lock()
+	defer t.attemptMu.Unlock()
+	// #nosec G115 - We know TaskState is small enough that int->int32 won't overflow
+	if !t.state.CompareAndSwap(int32(from), int32(TaskRunning)) {
+		return 0, false
+	}
 	t.lastAttempt.Store(time.Now())
+	return t.attempts.Add(1), true
+}
+
+// finishAttempt applies terminal only while attemptID is still the current,
+// Running attempt, so a reaped or superseded Fn cannot clobber a later retry.
+func (t *BootstrapTask) finishAttempt(attemptID int32, terminal TaskState, err error) bool {
+	t.attemptMu.Lock()
+	defer t.attemptMu.Unlock()
+	if t.attempts.Load() != attemptID {
+		return false
+	}
+	// #nosec G115 - We know TaskState is small enough that int->int32 won't overflow
+	if !t.state.CompareAndSwap(int32(TaskRunning), int32(terminal)) {
+		return false
+	}
+	t.lastErr.Store(wrappedError{err: err})
+	return true
 }
 
 type InitializerConfig struct {
@@ -353,10 +379,7 @@ func (i *Initializer) attemptRemainingTasks(respectBackoff bool) {
 				return true
 			}
 			// Attempt to swap from [Pending|Failed|Timeout] -> Running
-			// #nosec G115 - We know TaskState is small enough that int->int32 won't overflow
-			if t.state.CompareAndSwap(int32(state), int32(TaskRunning)) {
-				t.beginAttempt()
-				attemptID := t.attempts.Load()
+			if attemptID, ok := t.startAttempt(state); ok {
 				t.lastErr.Store(wrappedError{err: nil})
 
 				// Create a fresh done channel to signal this attempt's completion
@@ -367,27 +390,8 @@ func (i *Initializer) attemptRemainingTasks(respectBackoff bool) {
 					// Close the channel when the function finishes.
 					defer close(doneCh)
 
-					// finishAttempt applies terminalState only if this goroutine
-					// still owns the attempt (same attemptID and still Running).
-					// Prevents a reaped/superseded hung Fn from clobbering a
-					// later retry's state.
-					finishAttempt := func(terminal TaskState, err error) bool {
-						if bt.attempts.Load() != attemptID {
-							return false
-						}
-						if !bt.state.CompareAndSwap(int32(TaskRunning), int32(terminal)) {
-							return false
-						}
-						if err != nil {
-							bt.lastErr.Store(wrappedError{err: err})
-						} else {
-							bt.lastErr.Store(wrappedError{err: nil})
-						}
-						return true
-					}
-
 					if i.appCtx.Err() != nil {
-						if finishAttempt(TaskFailed, i.appCtx.Err()) {
+						if bt.finishAttempt(attemptID, TaskFailed, i.appCtx.Err()) {
 							i.logger.Warn().Str("task", bt.Name).Err(i.appCtx.Err()).Msg("initialization task context error")
 						}
 						return
@@ -410,7 +414,7 @@ func (i *Initializer) attemptRemainingTasks(respectBackoff bool) {
 							if uw, ok := err.(interface{ Unwrap() error }); ok && uw.Unwrap() != nil {
 								underlying = uw.Unwrap()
 							}
-							if finishAttempt(TaskFatal, underlying) {
+							if bt.finishAttempt(attemptID, TaskFatal, underlying) {
 								i.logger.Error().Str("task", bt.Name).Err(underlying).Msg("initialization task fatal error")
 							}
 							return
@@ -429,11 +433,11 @@ func (i *Initializer) attemptRemainingTasks(respectBackoff bool) {
 						if errors.Is(err, context.DeadlineExceeded) {
 							terminal = TaskTimedOut
 						}
-						if finishAttempt(terminal, err) {
+						if bt.finishAttempt(attemptID, terminal, err) {
 							i.logger.Warn().Str("task", bt.Name).Err(err).Str("state", terminal.String()).Msg("initialization task failed")
 						}
 					} else {
-						if finishAttempt(TaskSucceeded, nil) {
+						if bt.finishAttempt(attemptID, TaskSucceeded, nil) {
 							lastAttempt, _ := bt.lastAttempt.Load().(time.Time)
 							i.logger.Info().Str("task", bt.Name).Dur("durationMs", time.Since(lastAttempt)).Msg("initialization task succeeded")
 						}

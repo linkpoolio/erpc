@@ -742,15 +742,15 @@ type NetworkDefaults struct {
 	Failover          *FailoverConfig          `yaml:"failover,omitempty" json:"failover"`
 }
 
-// FailoverConfig controls within-request escalation between upstream groups.
-// Independent of SelectionPolicy (which evaluates group membership
+// FailoverConfig controls within-request escalation to fallback-tier
+// upstreams. Independent of SelectionPolicy (which re-evaluates tiers
 // periodically across requests) — Failover operates per-request only.
 type FailoverConfig struct {
 	// OnDefaultsExhausted, when true, causes the network request loop to
-	// try upstreams with group "default" (or unset) first and only advance
-	// to group "fallback" if every default upstream returned a retryable
-	// error within the same request. Deterministic client errors still
-	// short-circuit without advancing.
+	// try upstreams not tagged `tier:fallback` first and only advance to the
+	// `tier:fallback` ones if every other upstream failed with an error that
+	// is retryable toward the network within the same request. Deterministic
+	// client errors still short-circuit without advancing.
 	OnDefaultsExhausted *bool `yaml:"onDefaultsExhausted,omitempty" json:"onDefaultsExhausted"`
 }
 

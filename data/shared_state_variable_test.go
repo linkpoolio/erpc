@@ -1883,45 +1883,6 @@ func TestCounterInt64_BackgroundPush_DoesNotRegressHigherRemote(t *testing.T) {
 	connector.AssertNotCalled(t, "Set", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 }
 
-func TestCounterInt64_RefreshFromRemote_AdoptsHigherTip(t *testing.T) {
-	registry, connector, ctx := setupTest("refresh-tip")
-
-	remoteTs := time.Now().UnixMilli() + 60_000
-	connector.On("Get", mock.Anything, ConnectorMainIndex, "test", "value", nil).
-		Return([]byte(fmt.Sprintf(`{"v":1001,"t":%d,"b":"pod-a"}`, remoteTs)), nil)
-
-	counter := &counterInt64{
-		registry:         registry,
-		key:              "test",
-		ignoreRollbackOf: 1024,
-	}
-	counter.value.Store(1000)
-	counter.updatedAtUnixMs.Store(time.Now().UnixMilli())
-
-	got := counter.RefreshFromRemote(ctx)
-	assert.Equal(t, int64(1001), got)
-	assert.Equal(t, int64(1001), counter.GetValue())
-	connector.AssertExpectations(t)
-}
-
-func TestCounterInt64_RefreshFromRemote_KeepsLocalWhenRemoteMissing(t *testing.T) {
-	registry, connector, ctx := setupTest("refresh-missing")
-
-	connector.On("Get", mock.Anything, ConnectorMainIndex, "test", "value", nil).
-		Return([]byte(""), common.NewErrRecordNotFound("test", "value", "mock"))
-
-	counter := &counterInt64{
-		registry:         registry,
-		key:              "test",
-		ignoreRollbackOf: 1024,
-	}
-	counter.value.Store(777)
-	counter.updatedAtUnixMs.Store(time.Now().UnixMilli())
-
-	got := counter.RefreshFromRemote(ctx)
-	assert.Equal(t, int64(777), got)
-}
-
 // TestCounterInt64_ZeroIsNotAHeadObservation covers the case where a shared head
 // counter is asked to move to zero.
 //

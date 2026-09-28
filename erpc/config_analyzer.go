@@ -257,6 +257,15 @@ func GenerateValidationReport(ctx context.Context, cfg *common.Config) *Validati
 				}
 			}
 		}
+
+		// Warnings: failover enabled but no fallback-tier upstream to escalate to.
+		failoverEnabled := p.NetworkDefaults != nil && p.NetworkDefaults.Failover.Enabled()
+		for _, nw := range p.Networks {
+			failoverEnabled = failoverEnabled || nw.Failover.Enabled()
+		}
+		if failoverEnabled && !projectHasFallbackTier(p) {
+			report.Warnings = append(report.Warnings, fmt.Sprintf("project=%s failover.onDefaultsExhausted is enabled but no upstream is tagged '%s', so requests never escalate", p.Id, common.TagTierFallback))
+		}
 	}
 
 	// Admin auth budgets
@@ -957,6 +966,24 @@ func calculateConfigStats(cfg *common.Config) ConfigStats {
 	}
 
 	return stats
+}
+
+// projectHasFallbackTier reports whether any upstream the project defines,
+// directly or via provider overrides, is tagged as fallback tier.
+func projectHasFallbackTier(p *common.ProjectConfig) bool {
+	for _, u := range p.Upstreams {
+		if u.HasTag(common.TagTierFallback) {
+			return true
+		}
+	}
+	for _, pr := range p.Providers {
+		for _, o := range pr.Overrides {
+			if o != nil && o.HasTag(common.TagTierFallback) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func printConfigStats(logger zerolog.Logger, stats ConfigStats) {

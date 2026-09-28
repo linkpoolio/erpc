@@ -536,18 +536,15 @@ type networkHandle struct {
 func (h *networkHandle) Id() string { return h.nw.networkId }
 
 // SuggestLatestBlock routes a per-source block observation to the
-// upstream's state poller, then advances the network-level latest tip.
-// sourceId is the ingress adapter's Name(), which for wsupstream.Adapter
-// is "ws:<upstreamId>". payload is unused (kept for indexer.NetworkHandle).
+// upstream's state poller. sourceId is the ingress adapter's Name(), which
+// for wsupstream.Adapter is "ws:<upstreamId>". payload is unused (kept for
+// indexer.NetworkHandle).
 //
-// Ordering matters: Indexer.Ingest calls this BEFORE fan-out, so by the
-// time any client sees head N on WS, EvmHighestLatestBlockNumber on this
-// instance is already ≥ N. That invariant applies to every ingress source,
-// including tier:fallback: Ingest fans out all sources, so skipping the tip
-// advance for fallback heads while still delivering them to clients leaves
-// the WS tip ahead of the HTTP tip, which strict clients treat as out of
-// sync. A tip re-fetch for a head that came from a fallback must reach that
-// fallback via the emptyish escape hatch instead.
+// Indexer.Ingest calls this before fan-out, so the head also advances the
+// network's delivered-head floor — but only once the poller has accepted it
+// (a major jump is verified asynchronously first) and only for an upstream in
+// the network's tip candidate set, so a head from a fallback-tier or
+// policy-excluded upstream cannot lift "latest".
 func (h *networkHandle) SuggestLatestBlock(sourceId string, blockNumber int64, payload json.RawMessage) {
 	_ = payload
 	const prefix = "ws:"
@@ -555,17 +552,27 @@ func (h *networkHandle) SuggestLatestBlock(sourceId string, blockNumber int64, p
 		return
 	}
 	upstreamID := sourceId[len(prefix):]
-	for _, u := range h.nw.upstreamsRegistry.GetNetworkUpstreams(context.Background(), h.nw.networkId) {
+	ctx := context.Background()
+	for _, u := range h.nw.upstreamsRegistry.GetNetworkUpstreams(ctx, h.nw.networkId) {
 		if u.Id() != upstreamID {
 			continue
 		}
 		poller := u.EvmStatePoller()
-		if poller != nil && !poller.IsObjectNull() {
-			poller.SuggestLatestBlock(blockNumber)
+		if poller == nil || poller.IsObjectNull() {
+			return
 		}
-		break
+		poller.SuggestLatestBlock(blockNumber)
+		if poller.LatestBlock() < blockNumber {
+			return
+		}
+		for _, c := range h.nw.tipCandidateUpstreams(ctx, "*") {
+			if c.Id() == upstreamID {
+				h.nw.NoteObservedLatestBlock(h.nw.appCtx, blockNumber)
+				break
+			}
+		}
+		return
 	}
-	h.nw.NoteObservedLatestBlock(h.nw.appCtx, blockNumber)
 }
 
 // Interface checks: fail the build if either contract drifts.

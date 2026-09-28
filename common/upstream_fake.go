@@ -285,10 +285,6 @@ func (p *FakeEvmStatePoller) PollLatestBlockNumber(ctx context.Context) (int64, 
 	return p.latestBlockNumber, nil
 }
 
-func (p *FakeEvmStatePoller) PollLatestBlockNumberNow(ctx context.Context) (int64, error) {
-	return p.PollLatestBlockNumber(ctx)
-}
-
 func (p *FakeEvmStatePoller) SetNetworkConfig(config *NetworkConfig) {
 	// No-op for testing
 }

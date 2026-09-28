@@ -22,11 +22,6 @@ type CounterInt64SharedVariable interface {
 	GetValue() int64
 	TryUpdateIfStale(ctx context.Context, staleness time.Duration, getNewValue func(ctx context.Context) (int64, error)) (int64, error)
 	TryUpdate(ctx context.Context, newValue int64) int64
-	// RefreshFromRemote performs a synchronous Redis GET and adopts the
-	// remote value when it is ahead of the local cache. Used on the HTTP
-	// tip-floor false-negative path (local TipHW appears caught up but a
-	// sibling pod already published a higher tip).
-	RefreshFromRemote(ctx context.Context) int64
 	OnValue(callback func(int64))
 	OnLargeRollback(callback func(currentVal, newVal int64))
 }
@@ -428,38 +423,6 @@ func (c *counterInt64) TryUpdate(ctx context.Context, newValue int64) int64 {
 	// Note: Value can be 0 for valid cases like earliest block = genesis.
 	if updated {
 		c.scheduleBackgroundPushCurrent()
-	}
-	return c.value.Load()
-}
-
-// tipRefreshTimeout bounds RefreshFromRemote's GET so the HTTP path never
-// stalls hard on a slow Redis. Callers may pass a tighter deadline via ctx.
-const tipRefreshTimeout = 100 * time.Millisecond
-
-func (c *counterInt64) RefreshFromRemote(ctx context.Context) int64 {
-	ctx, span := common.StartSpan(ctx, "CounterInt64.RefreshFromRemote",
-		trace.WithAttributes(
-			attribute.String("key", c.key),
-		),
-	)
-	defer span.End()
-
-	getCtx := ctx
-	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
-		var cancel context.CancelFunc
-		getCtx, cancel = context.WithTimeout(ctx, tipRefreshTimeout)
-		defer cancel()
-	}
-
-	remote, ok := c.tryGetRemoteState(getCtx)
-	if !ok {
-		return c.value.Load()
-	}
-	if c.processNewState(UpdateSourceRemoteCheck, remote) {
-		c.registry.logger.Debug().
-			Str("key", c.key).
-			Int64("value", remote.Value).
-			Msg("adopted higher tip from remote refresh")
 	}
 	return c.value.Load()
 }

@@ -31,38 +31,6 @@ func init() {
 // This test reproduces the race condition described in https://github.com/erpc/erpc/pull/615
 // where cleanupMultiplexer would acquire the lock before followers could copy the response,
 // causing followers to see nil response and make their own upstream requests.
-func TestMethodSkipMultiplexing(t *testing.T) {
-	cases := []struct {
-		method string
-		skip   bool
-	}{
-		// Tx broadcasts must not multiplex: a retry of the same signed
-		// payload is the caller's way of asking us to re-submit, not a
-		// duplicate that can wait on an in-flight attempt.
-		{"eth_sendRawTransaction", true},
-		{"eth_sendTransaction", true},
-		// Reads are the multiplexer's intended workload: concurrent
-		// identical lookups share one upstream call.
-		{"eth_call", false},
-		{"eth_getBlockByNumber", false},
-		{"eth_getLogs", false},
-		{"eth_chainId", false},
-		{"net_version", false},
-		// Unknown methods default to multiplex-eligible. Skipping the
-		// dedup is a behaviour change, so the safer default for methods
-		// we haven't classified is to keep dedup on — the only cost is
-		// occasional redundant work coalescing into one request.
-		{"some_unknown_method", false},
-		{"", false},
-	}
-	for _, tc := range cases {
-		got := methodSkipMultiplexing(tc.method)
-		if got != tc.skip {
-			t.Errorf("methodSkipMultiplexing(%q) = %v, want %v", tc.method, got, tc.skip)
-		}
-	}
-}
-
 func TestNetwork_Multiplexer_FollowersReceiveResponse(t *testing.T) {
 	t.Run("ConcurrentFollowers_AllReceiveLeaderResponse", func(t *testing.T) {
 		util.ResetGock()
@@ -490,4 +458,23 @@ func setupTestNetworkForMultiplexer(t *testing.T, ctx context.Context) *Network 
 	time.Sleep(100 * time.Millisecond)
 
 	return network
+}
+
+// Non-retryable writes (EVM and SVM) never share an in-flight call; reads do.
+func TestNetwork_Multiplexer_SkipsNonRetryableWrites(t *testing.T) {
+	n := &Network{
+		cfg:              &common.NetworkConfig{Architecture: common.ArchitectureEvm},
+		inFlightRequests: &sync.Map{},
+	}
+	cases := map[string]bool{
+		"eth_newFilter":   true,
+		"sendTransaction": true,
+		"eth_call":        false,
+	}
+	for method, skip := range cases {
+		req := common.NewNormalizedRequest([]byte(`{"jsonrpc":"2.0","id":1,"method":"` + method + `","params":[]}`))
+		mlx, _, err := n.handleMultiplexing(context.Background(), &log.Logger, req, time.Now())
+		require.NoError(t, err)
+		assert.Equal(t, skip, mlx == nil, method)
+	}
 }

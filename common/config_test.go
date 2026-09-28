@@ -1252,6 +1252,14 @@ func TestNetworkConfig_SetDefaults_FailoverInheritsFromDefaults(t *testing.T) {
 	assert.True(t, n.Failover.Enabled())
 }
 
+func TestNetworkConfig_SetDefaults_StripSubscribeFromBlockZeroInheritsFromDefaults(t *testing.T) {
+	strip := true
+	defaults := &NetworkDefaults{Evm: &EvmNetworkConfig{StripSubscribeFromBlockZero: &strip}}
+	n := &NetworkConfig{Architecture: ArchitectureEvm, Evm: &EvmNetworkConfig{ChainId: 1}}
+	assert.NoError(t, n.SetDefaults(nil, defaults))
+	assert.Equal(t, &strip, n.Evm.StripSubscribeFromBlockZero)
+}
+
 func TestUpstreamConfig_ValidateRateLimitCountMode(t *testing.T) {
 	cfg := &Config{}
 	base := func(mode RateLimitCountMode) *UpstreamConfig {

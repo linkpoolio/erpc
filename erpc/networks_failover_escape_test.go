@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,33 +26,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// NOTE (post-refactor adaptation):
-//
-// This file originally drove a hand-written `selectionPolicy` JS function
-// that keyed off `u.config.group === 'fallback'`. After the policy refactor
-// the per-request `selectionPolicyEvaluator` / `AcquirePermit` API is gone;
-// selection is pre-computed per (network, method) tick by `internal/policy`'s
-// Engine, and fallback-tier upstreams are declared via the
-// `tier:fallback` tag (constant `common.TagTierFallback`).
-//
-// The production default policy (internal/policy/default_policy.js) already
-// expresses exactly the behaviour these tests need via
-//   .preferTag('!tier:fallback', { minHealthy: 1, fallback: 'tier:fallback' })
-// which cordons fallback-tagged upstreams out of the ordered list while at
-// least one primary survives the health excludes, and promotes the
-// fallbacks once every primary is excluded (e.g. by error-rate/lag).
-//
-// So instead of a custom JS function + `AcquirePermit` introspection, these
-// tests now build a real `*policy.Engine` running the default policy and
-// assert OBSERVABLE behaviour:
-//   - tracker metrics moved (errorRate) via GetUpstreamMethodMetrics(..., finality)
-//   - the policy's ordered list (PolicyOrderedUpstreams / the engine's
-//     LatestDecisionOutputForTest) cordons the primary / promotes the fallback
-//   - which upstream actually served the response
-//   - the erpc_network_fallback_escape_total metric count
-//
-// The ticker is frozen (EvalInterval=0); tests drive ticks via
-// `policy.TickForTest`.
+// The fixtures run a real policy.Engine with the built-in default selection
+// policy (fallback-tier upstreams cordoned while a primary is healthy), with a
+// frozen ticker driven by policy.TickForTest.
 
 // mockJsonRpcUpstream wires the standard state-poller mocks for one upstream
 // at a fixed block height. Used to build the multi-primary + multi-fallback
@@ -171,13 +149,13 @@ func failoverUpstreamConfigs() []*common.UpstreamConfig {
 }
 
 // buildFailoverNetwork wires a real Network + UpstreamsRegistry +
-// policy.Engine running the production default selection policy (which
+// policy.Engine running the built-in default selection policy (which
 // cordons `tier:fallback` upstreams while a primary survives). The engine
 // ticker is frozen; the caller drives ticks via policy.TickForTest.
 func buildFailoverNetwork(
 	t *testing.T, ctx context.Context,
 	upstreamConfigs []*common.UpstreamConfig,
-	enableFailover bool,
+	opts failoverFixtureOpts,
 ) (*Network, *upstream.UpstreamsRegistry, *health.Tracker) {
 	t.Helper()
 
@@ -223,11 +201,15 @@ func buildFailoverNetwork(
 			EvalInterval: 0,
 		},
 	}
-	if enableFailover {
+	if opts.enableFailover {
 		networkConfig.Failover = &common.FailoverConfig{OnDefaultsExhausted: util.BoolPtr(true)}
 	}
+	networkConfig.Failsafe = opts.failsafe
 
-	policyEngine := policy.NewEngine(ctx, &log.Logger, "main", mt, policystdlib.Install, nil)
+	var policyEngine *policy.Engine
+	if !opts.noPolicy {
+		policyEngine = policy.NewEngine(ctx, &log.Logger, "main", mt, policystdlib.Install, nil)
+	}
 
 	network, err := NewNetwork(ctx, &log.Logger, "main", networkConfig, rlr, upr, mt, policyEngine)
 	require.NoError(t, err)
@@ -265,6 +247,13 @@ type failoverFixtureOpts struct {
 	primaryLatest  string
 	fallbackLatest string
 	enableFailover bool
+	failsafe       []*common.FailsafeConfig
+	// noPolicy leaves the network without a policy engine, so every
+	// upstream (fallbacks included) is in the routed list.
+	noPolicy bool
+	// mocks registers test-specific mocks ahead of the standard ones, before
+	// any poller starts.
+	mocks func()
 }
 
 func setupFailoverFixture(
@@ -276,6 +265,9 @@ func setupFailoverFixture(
 	const chainIdHex = "0x3e7" // 999
 	const finalizedHex = "0x3e0"
 
+	if opts.mocks != nil {
+		opts.mocks()
+	}
 	mockJsonRpcUpstream("rpc1.localhost", chainIdHex, opts.primaryLatest, finalizedHex)
 	mockJsonRpcUpstream("rpc2.localhost", chainIdHex, opts.primaryLatest, finalizedHex)
 	mockJsonRpcUpstream("rpc3.localhost", chainIdHex, opts.fallbackLatest, finalizedHex)
@@ -286,7 +278,7 @@ func setupFailoverFixture(
 	mockEthCallReturning("rpc3.localhost", "0x3333")
 	mockEthCallReturning("rpc4.localhost", "0x4444")
 
-	network, upr, mt := buildFailoverNetwork(t, ctx, failoverUpstreamConfigs(), opts.enableFailover)
+	network, upr, mt := buildFailoverNetwork(t, ctx, failoverUpstreamConfigs(), opts)
 
 	upsList := upr.GetNetworkUpstreams(ctx, util.EvmNetworkId(999))
 	require.Len(t, upsList, 4)
@@ -296,8 +288,10 @@ func setupFailoverFixture(
 	// ordered list — so the request path sees only primaries, exhausts them
 	// on a gate-skip, and the per-request escape hatch (not the policy) is
 	// what brings the fallbacks in. This is exactly the path under test.
-	policy.ResetSlotStateForTest(network.policyEngine, network.networkId, "*")
-	policy.TickForTest(network.policyEngine, network.networkId, "*")
+	if network.policyEngine != nil {
+		policy.ResetSlotStateForTest(network.policyEngine, network.networkId, "*")
+		policy.TickForTest(network.policyEngine, network.networkId, "*")
+	}
 	require.NoError(t, upr.RefreshUpstreamNetworkMethodScores())
 	time.Sleep(50 * time.Millisecond)
 
@@ -471,13 +465,9 @@ func TestFailover_EscapeHatch(t *testing.T) {
 		// NON-retryable (ErrUpstreamRequestSkipped wrapping
 		// ErrUpstreamBlockUnavailable).
 		//
-		// This mirrors a production incident pattern: primaries fronting a
-		// stalled L2 node return latestBlock far behind the chain head,
-		// while a third-party fallback is at the real head and can
-		// serve. Before the fix, lastErr stayed nil for non-retryable skips,
-		// the escape gate's `lastErr != nil` check failed, and clients got
-		// ErrUpstreamsExhausted. After the fix, lastErr is set unconditionally
-		// in the gate-skip branch and the escape fires.
+		// Scenario: primaries fronting a stalled node report a head far
+		// behind the chain, while a fallback at the real head can serve. The
+		// non-retryable skips must still let the escape fire.
 		network, _, _ := setupFailoverFixture(t, ctx, failoverFixtureOpts{
 			primaryLatest:  "0x3e8",  // 1000
 			fallbackLatest: "0x2710", // 10000
@@ -525,32 +515,33 @@ func TestFailover_EscapeHatch(t *testing.T) {
 			primaryLatest:  "0x3ea", // 1002
 			fallbackLatest: "0x3ea", // 1002
 			enableFailover: true,
+			mocks: func() {
+				nullBlock := `{"jsonrpc":"2.0","id":1,"result":null}`
+				okBlock := `{"jsonrpc":"2.0","id":1,"result":{"number":"0x3ea","hash":"0xabc","parentHash":"0xdef","timestamp":"0x6702a8f0"}}`
+				for _, host := range []string{"rpc1.localhost", "rpc2.localhost"} {
+					gock.New("http://" + host).
+						Post("").
+						Persist().
+						Filter(func(r *http.Request) bool {
+							b := util.SafeReadBody(r)
+							return strings.Contains(b, "eth_getBlockByNumber") && strings.Contains(b, `"0x3ea"`)
+						}).
+						Reply(200).
+						JSON([]byte(nullBlock))
+				}
+				for _, host := range []string{"rpc3.localhost", "rpc4.localhost"} {
+					gock.New("http://" + host).
+						Post("").
+						Persist().
+						Filter(func(r *http.Request) bool {
+							b := util.SafeReadBody(r)
+							return strings.Contains(b, "eth_getBlockByNumber") && strings.Contains(b, `"0x3ea"`)
+						}).
+						Reply(200).
+						JSON([]byte(okBlock))
+				}
+			},
 		})
-
-		nullBlock := `{"jsonrpc":"2.0","id":1,"result":null}`
-		okBlock := `{"jsonrpc":"2.0","id":1,"result":{"number":"0x3ea","hash":"0xabc","parentHash":"0xdef","timestamp":"0x6702a8f0"}}`
-		for _, host := range []string{"rpc1.localhost", "rpc2.localhost"} {
-			gock.New("http://" + host).
-				Post("").
-				Persist().
-				Filter(func(r *http.Request) bool {
-					b := util.SafeReadBody(r)
-					return strings.Contains(b, "eth_getBlockByNumber") && strings.Contains(b, `"0x3ea"`)
-				}).
-				Reply(200).
-				JSON([]byte(nullBlock))
-		}
-		for _, host := range []string{"rpc3.localhost", "rpc4.localhost"} {
-			gock.New("http://" + host).
-				Post("").
-				Persist().
-				Filter(func(r *http.Request) bool {
-					b := util.SafeReadBody(r)
-					return strings.Contains(b, "eth_getBlockByNumber") && strings.Contains(b, `"0x3ea"`)
-				}).
-				Reply(200).
-				JSON([]byte(okBlock))
-		}
 
 		counter := telemetry.MetricNetworkFallbackEscapeTotal.WithLabelValues("main", "evm:999", "eth_getBlockByNumber")
 		before := promUtil.ToFloat64(counter)
@@ -578,4 +569,207 @@ func TestFailover_EscapeHatch(t *testing.T) {
 		assert.Equal(t, before+1, after,
 			"escape hatch must fire for emptyish eth_getBlockByNumber primary misses")
 	})
+
+	t.Run("NoEscapeOnErrorNonRetryableTowardNetwork", func(t *testing.T) {
+		defer util.ResetGock()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		// Every provider returns the same verdict for this error, so sweeping
+		// the fallbacks cannot help.
+		network, _, _ := setupFailoverFixture(t, ctx, failoverFixtureOpts{
+			primaryLatest:  "0x3e8",
+			fallbackLatest: "0x3e8",
+			enableFailover: true,
+			mocks: func() {
+				mockEthCallError("rpc1.localhost", -32000, "sender is over rate limit")
+				mockEthCallError("rpc2.localhost", -32000, "sender is over rate limit")
+			},
+		})
+
+		counter := telemetry.MetricNetworkFallbackEscapeTotal.WithLabelValues("main", "evm:999", "eth_call")
+		before := promUtil.ToFloat64(counter)
+		req := ethCallRequest(1, "0x3e8")
+		req.SetNetwork(network)
+		resp, _ := network.Forward(ctx, req)
+		if resp != nil {
+			resp.Release()
+		}
+		assert.Equal(t, before, promUtil.ToFloat64(counter))
+	})
+
+	t.Run("NoEscapeOnNullReceipt", func(t *testing.T) {
+		defer util.ResetGock()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		// A pending tx's receipt is null on every upstream; that is an
+		// answer, not an outage.
+		network, _, _ := setupFailoverFixture(t, ctx, failoverFixtureOpts{
+			primaryLatest:  "0x3e8",
+			fallbackLatest: "0x3e8",
+			enableFailover: true,
+			mocks: func() {
+				for _, host := range []string{"rpc1.localhost", "rpc2.localhost", "rpc3.localhost", "rpc4.localhost"} {
+					gock.New("http://" + host).
+						Post("").
+						Persist().
+						Filter(func(r *http.Request) bool {
+							return strings.Contains(util.SafeReadBody(r), "eth_getTransactionReceipt")
+						}).
+						Reply(200).
+						JSON([]byte(`{"jsonrpc":"2.0","id":1,"result":null}`))
+				}
+			},
+		})
+
+		counter := telemetry.MetricNetworkFallbackEscapeTotal.WithLabelValues("main", "evm:999", "eth_getTransactionReceipt")
+		before := promUtil.ToFloat64(counter)
+		for i := 0; i < 5; i++ {
+			req := common.NewNormalizedRequest([]byte(fmt.Sprintf(
+				`{"jsonrpc":"2.0","id":%d,"method":"eth_getTransactionReceipt","params":["0x%064x"]}`, i, i+1,
+			)))
+			req.SetNetwork(network)
+			resp, _ := network.Forward(ctx, req)
+			if resp != nil {
+				resp.Release()
+			}
+		}
+		assert.Equal(t, before, promUtil.ToFloat64(counter))
+	})
+
+	t.Run("DoesNotResweepFallbacksAlreadyTried", func(t *testing.T) {
+		defer util.ResetGock()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		// Without a policy engine the fallbacks are already in the routed
+		// list, so the sweep has tried them before the escape is considered.
+		var fallbackHits atomic.Int64
+		network, _, _ := setupFailoverFixture(t, ctx, failoverFixtureOpts{
+			primaryLatest:  "0x3e8",
+			fallbackLatest: "0x3e8",
+			enableFailover: true,
+			noPolicy:       true,
+			mocks: func() {
+				for _, host := range []string{"rpc1.localhost", "rpc2.localhost", "rpc3.localhost", "rpc4.localhost"} {
+					host := host
+					fallback := host == "rpc3.localhost" || host == "rpc4.localhost"
+					gock.New("http://" + host).
+						Post("").
+						Persist().
+						Filter(func(r *http.Request) bool {
+							// Filters run before host matching.
+							if r.URL.Host != host || !strings.Contains(util.SafeReadBody(r), "eth_call") {
+								return false
+							}
+							if fallback {
+								fallbackHits.Add(1)
+							}
+							return true
+						}).
+						Reply(200).
+						JSON([]byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"internal error"}}`))
+				}
+			},
+		})
+
+		counter := telemetry.MetricNetworkFallbackEscapeTotal.WithLabelValues("main", "evm:999", "eth_call")
+		before := promUtil.ToFloat64(counter)
+		req := ethCallRequest(1, "0x3e8")
+		req.SetNetwork(network)
+		resp, _ := network.Forward(ctx, req)
+		if resp != nil {
+			resp.Release()
+		}
+		assert.Equal(t, int64(2), fallbackHits.Load(), "each fallback is tried once")
+		assert.Equal(t, before, promUtil.ToFloat64(counter), "nothing is left to escape to")
+	})
+
+	t.Run("ConcurrentHedgesEscalateAtMostOnce", func(t *testing.T) {
+		defer util.ResetGock()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		network, _, _ := setupFailoverFixture(t, ctx, failoverFixtureOpts{
+			primaryLatest:  "0x3e8",
+			fallbackLatest: "0x3e8",
+			enableFailover: true,
+			failsafe: []*common.FailsafeConfig{{
+				MatchMethod: "*",
+				Hedge:       &common.HedgePolicyConfig{Delay: common.NewStaticDuration(10 * time.Millisecond), MaxCount: 2},
+				Retry:       &common.RetryPolicyConfig{MaxAttempts: 2},
+			}},
+			mocks: func() {
+				for _, host := range []string{"rpc1.localhost", "rpc2.localhost"} {
+					gock.New("http://" + host).
+						Post("").
+						Persist().
+						Filter(func(r *http.Request) bool {
+							return strings.Contains(util.SafeReadBody(r), "eth_call")
+						}).
+						Reply(200).
+						Delay(30 * time.Millisecond).
+						JSON([]byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"internal error"}}`))
+				}
+			},
+		})
+
+		counter := telemetry.MetricNetworkFallbackEscapeTotal.WithLabelValues("main", "evm:999", "eth_call")
+		before := promUtil.ToFloat64(counter)
+		const requests = 10
+		var wg sync.WaitGroup
+		for i := 0; i < requests; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				req := ethCallRequest(100+i, "0x3e8")
+				req.SetNetwork(network)
+				resp, _ := network.Forward(ctx, req)
+				if resp != nil {
+					resp.Release()
+				}
+			}(i)
+		}
+		wg.Wait()
+		assert.LessOrEqual(t, promUtil.ToFloat64(counter)-before, float64(requests))
+	})
+}
+
+// mockEthCallError wires an eth_call mock that returns a JSON-RPC error.
+func mockEthCallError(host string, code int, message string) {
+	gock.New("http://" + host).
+		Post("").
+		Persist().
+		Filter(func(r *http.Request) bool {
+			return strings.Contains(util.SafeReadBody(r), "eth_call")
+		}).
+		Reply(200).
+		JSON([]byte(fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"error":{"code":%d,"message":"%s"}}`, code, message)))
+}
+
+// A consensus slot whose upstream is skipped by block availability reports
+// ErrUpstreamsExhausted, which consensus counts as "no attempt", rather than
+// the raw skip error.
+func TestNetwork_ConsensusSlotSkippedByBlockAvailability(t *testing.T) {
+	defer util.ResetGock()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	network, _, _ := setupFailoverFixture(t, ctx, failoverFixtureOpts{
+		primaryLatest:  "0x3e8", // 1000
+		fallbackLatest: "0x3e8",
+		failsafe: []*common.FailsafeConfig{{
+			MatchMethod: "*",
+			Consensus:   &common.ConsensusPolicyConfig{MaxParticipants: 2, AgreementThreshold: 2},
+		}},
+	})
+
+	req := ethCallRequest(1, "0x3ea") // 1002: beyond every primary's served range
+	req.SetNetwork(network)
+	resp, err := network.Forward(ctx, req)
+	if resp != nil {
+		resp.Release()
+	}
+	assert.True(t, common.HasErrorCode(err, common.ErrCodeUpstreamsExhausted), "got %v", err)
 }

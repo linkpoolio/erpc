@@ -106,8 +106,9 @@ type Network struct {
 // lower tip than a head already (or about to be) served on the subscription,
 // which strict clients treat as an inconsistency.
 //
-// Only the local update is synchronous; the shared floor is pushed to remote
-// in the background, and only when this call advanced it.
+// Only the local update is synchronous: the shared floor is pushed to remote
+// in the background when this call advanced it, and sibling instances pick
+// it up through the shared counter's sync.
 func (n *Network) NoteObservedLatestBlock(ctx context.Context, blockNumber int64) {
 	if n == nil || blockNumber <= 0 {
 		return
@@ -130,22 +131,6 @@ func (n *Network) NoteObservedLatestBlock(ctx context.Context, blockNumber int64
 			return
 		}
 	}
-}
-
-// EvmRefreshHighestLatestBlockNumber pulls the shared latest floor from
-// remote storage once and returns the network tip after adopting any higher
-// remote value. Used when the local view would otherwise skip
-// EnforceHighestBlock (a false negative under async pub/sub lag).
-func (n *Network) EvmRefreshHighestLatestBlockNumber(ctx context.Context) int64 {
-	ctx, span := common.StartDetailSpan(ctx, "Network.EvmRefreshHighestLatestBlockNumber")
-	defer span.End()
-
-	if n.latestBlockShared != nil {
-		n.latestBlockShared.RefreshFromRemote(ctx)
-	}
-	result := n.EvmHighestLatestBlockNumber(ctx)
-	span.SetAttributes(attribute.Int64("highest_latest_block", result))
-	return result
 }
 
 // maxServedTipPartitions caps the number of materialized per-tag served-tip
@@ -863,8 +848,12 @@ func (n *Network) EvmHighestLatestBlockNumber(ctx context.Context) int64 {
 
 	if !n.servedTipEnabledFor("latest") {
 		// tipCandidateUpstreams already scopes to the request's selector (if
-		// any), so the head is within-subset.
+		// any), so the head is within-subset. The delivered-head floor is
+		// network-wide, so it only applies to unscoped requests.
 		ref := n.evmHeadReference(ctx, false)
+		if requestSelector(ctx) != "" {
+			return ref.Corroborated
+		}
 		return n.applyDeliveredHeadFloor(ref.Corroborated, ref.Max)
 	}
 	if sel := requestSelector(ctx); sel != "" {
@@ -1809,42 +1798,20 @@ func (n *Network) EvmLowestFinalizedBlockNumber(ctx context.Context) int64 {
 	return minBlock
 }
 
-// EvmLeaderUpstream returns the upstream whose state poller has the highest
-// latest tip. Fallback-tier upstreams are ignored while any primary is up —
-// otherwise tip re-fetch pins UseUpstream to a cordoned fallback that is not
-// in the ordered primary list. TipHW may still advance from fallback WS
-// (fan-out invariant); unconstrained tip re-fetch + emptyish escape reaches
-// those fallbacks when primaries miss.
 func (n *Network) EvmLeaderUpstream(ctx context.Context) common.Upstream {
-	var leader, fallbackLeader common.Upstream
-	var leaderLastBlock, fallbackLastBlock int64
-	anyPrimaryUp := false
+	var leader common.Upstream
+	var leaderLastBlock int64 = 0
 	upsList := n.upstreamsRegistry.GetNetworkUpstreams(ctx, n.networkId)
 	for _, u := range upsList {
-		statePoller := u.EvmStatePoller()
-		if statePoller == nil {
-			continue
-		}
-		lastBlock := statePoller.LatestBlock()
-		if u.Config() != nil && u.Config().HasTag(common.TagTierFallback) {
-			if lastBlock > fallbackLastBlock {
-				fallbackLeader = u
-				fallbackLastBlock = lastBlock
+		if statePoller := u.EvmStatePoller(); statePoller != nil {
+			lastBlock := statePoller.LatestBlock()
+			if lastBlock > leaderLastBlock {
+				leader = u
+				leaderLastBlock = lastBlock
 			}
-			continue
-		}
-		if !u.IsDown() {
-			anyPrimaryUp = true
-		}
-		if lastBlock > leaderLastBlock {
-			leader = u
-			leaderLastBlock = lastBlock
 		}
 	}
-	if anyPrimaryUp || fallbackLeader == nil {
-		return leader
-	}
-	return fallbackLeader
+	return leader
 }
 
 func (n *Network) getFailsafeExecutor(ctx context.Context, req *common.NormalizedRequest) *networkExecutor {
@@ -2046,28 +2013,13 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 		return nil, err
 	}
 
-	// Block-availability-aware routing: when the request targets a specific
-	// block, prefer upstreams whose state poller has already observed it.
-	// Without this, requests for a block we just delivered to a client via
-	// WS would still get routed to an HTTP-only sibling whose own polling
-	// loop hasn't caught up — checkUpstreamBlockAvailability rejects with
-	// ErrUpstreamBlockUnavailable, retries cascade through the rest of the
-	// lagging siblings, and the request can fail entirely despite the WS
-	// upstream demonstrably having the block. partitionUpstreamsByLatestBlock
-	// is stable so it composes with the tier and score orderings layered
-	// on top.
-	//
-	// Near-tip eth_getBlockByNumber additionally moves EvmLeaderUpstream
-	// (typically the WS ingress that SuggestLatestBlock advanced) to the
-	// front so the first attempt hits the node that already has the head —
-	// same idea as EnforceHighestBlock's tip re-fetch pin, but for direct
-	// client tip reads. This is an ORDERING hint, not a use-upstream
-	// selector: the other upstreams stay eligible, so a leader that answers
-	// null still falls through to its siblings and the fallback escape.
+	// For a specific block, try upstreams whose poller already has it first
+	// (e.g. one a WebSocket head just advanced) rather than a sibling that has
+	// not polled it yet. Ordering hints only: every upstream stays eligible.
 	if n.Architecture() == common.ArchitectureEvm {
 		if bn := requestBlockNumber(ctx, req); bn > 0 {
 			upsList = partitionUpstreamsByLatestBlock(upsList, bn)
-			upsList = n.preferTipLeaderForNearTipGetBlock(ctx, upsList, method, bn)
+			upsList = preferTipLeaderForNearTipGetBlock(upsList, method, bn)
 		}
 	}
 
@@ -2308,12 +2260,15 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 			maxLoopIterations = 1
 		}
 		attempted := make(map[string]struct{}, maxLoopIterations)
-		// Capture the pre-escalation upsList size for the error reporting
-		// path below. If the per-request fallback escape hatch fires, we
-		// replace upsList with the appended fallback set, but the
-		// ErrUpstreamsExhausted.upstreams field is meant to describe the
-		// routable set the policy selected — not the escape-hatch override.
-		originalUpsListLen := len(upsList)
+		// The fallback escape below swaps in a pick over its own local list,
+		// leaving the request's routed list untouched for later retries.
+		nextUpstream := effectiveReq.NextUpstream
+		// An empty result is a miss (rather than a legitimate answer, like a
+		// pending tx's null receipt) only for a concrete block the network is
+		// confident about.
+		emptyIsMiss := func(ctx context.Context) bool {
+			return requestBlockNumber(ctx, effectiveReq) > 0 && !evm.EmptyResultBeyondConfidence(ctx, effectiveReq)
+		}
 
 	escalationLoop:
 		for {
@@ -2335,7 +2290,7 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 					return nil, cause
 				}
 
-				u, selErr := effectiveReq.NextUpstream()
+				u, selErr := nextUpstream()
 				if selErr != nil {
 					loopSpan.SetAttributes(
 						attribute.Bool("upstreams_exhausted", true),
@@ -2377,13 +2332,12 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 				// Pre-forward: block availability gating → skip to next upstream
 				if skipErr, isRetryable := n.checkUpstreamBlockAvailability(loopCtx, u, effectiveReq, method); skipErr != nil {
 					n.handleBlockSkip(loopCtx, loopSpan, &ulg, u, effectiveReq, method, skipErr, isRetryable)
-					// Track the skip as the loop's last error so the per-request
-					// fallback escape hatch (after the loop) can see it. Record
-					// BOTH retryable and non-retryable skips: "non-retryable"
-					// means "don't retry the SAME upstream", not "don't try OTHER
-					// upstreams" — exactly what the escape hatch is for, and
-					// fallbacks ahead of a stalled primary need this path reachable.
-					lastErr = skipErr
+					// Seen by the fallback escape below: "non-retryable" means
+					// "don't retry this upstream", not "don't try others". A
+					// consensus slot keeps reporting a skip as no attempt.
+					if !oneUpstreamOnly {
+						lastErr = skipErr
+					}
 					loopSpan.End()
 					continue
 				}
@@ -2460,16 +2414,11 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 					common.SetTraceSpanError(loopSpan, err)
 				} else if r != nil {
 					bestResp = r
-					if r.IsResultEmptyish() {
-						// Soft miss (e.g. eth_getBlockByNumber null): seed
-						// lastErr so the fallback escape hatch can fire after
-						// primaries are exhausted. Without this, emptyish
-						// responses leave lastErr nil and block escalation.
+					loopSpan.SetStatus(codes.Ok, "")
+					if r.IsResultEmptyish() && n.cfg.Failover.Enabled() && emptyIsMiss(loopCtx) {
 						lastErr = common.NewErrEndpointMissingData(
 							fmt.Errorf("upstream responded emptyish"), u,
 						)
-					} else {
-						loopSpan.SetStatus(codes.Ok, "")
 					}
 				}
 				loopSpan.End()
@@ -2507,70 +2456,45 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 				return nil, cause
 			}
 
-			// === Per-request fallback escape hatch ===
-			//
-			// If the inner loop exhausted upsList with a retryable error (the
-			// selectionPolicy has cordoned fallbacks while primaries are down)
-			// and failover is enabled, append the fallback-tier upstreams that
-			// are bootstrapped + CB-closed + method-allowed and re-enter the
-			// inner loop once. The client gets the fallback's response on the
-			// same call that would otherwise return ErrUpstreamsExhausted.
-			//
-			// Bounds:
-			//   - At most one escalation per request (MarkEscalatedToFallbacks).
-			//   - Emptyish bestResp still escapes: methods like
-			//     eth_getBlockByNumber return null for missing blocks without
-			//     setting err, and that soft miss must escalate to fallbacks
-			//     the same way a gate-reject does. Non-empty bestResp means we
-			//     already have a usable candidate — leave it for failsafe.
-			//   - Deterministic client errors return from the inner loop
-			//     immediately, so any non-nil lastErr here means "this upstream
-			//     couldn't serve; try a different one" — exactly the escape's job.
-			//   - Consensus requires strict per-upstream semantics; don't modify
-			//     the candidate set mid-execution.
-			bestRespEmptyish := bestResp != nil && bestResp.IsResultEmptyish()
-			if (bestResp == nil || bestRespEmptyish) &&
-				!effectiveReq.HasEscalatedToFallbacks() &&
-				lastErr != nil &&
-				n.cfg.Failover != nil && n.cfg.Failover.Enabled() &&
-				!failsafeExecutor.HasConsensus() {
-
-				fallbacks := n.upstreamsRegistry.GetFallbackEscapeUpstreams(
-					execSpanCtx, n.networkId, method,
-				)
-				if len(fallbacks) > 0 {
-					// Replace upsList with ALL eligible fallbacks. Clear their
-					// stored errors and consumed reservations so NextUpstream
-					// re-selects them; primaries are removed from upsList so they
-					// won't be picked again, but their state in attempted /
-					// ErrorsByUpstream is preserved for eventual error reporting.
-					if bestRespEmptyish {
+			// Per-request fallback escape: once the routed upstreams are
+			// exhausted without a usable result, sweep the fallback tier
+			// (bootstrapped, not down, method-allowed) not yet tried here, at
+			// most once per request. An error every upstream would repeat
+			// (non-retryable toward the network) does not escalate, and
+			// consensus keeps its fixed participant set.
+			if (bestResp == nil || (bestResp.IsResultEmptyish() && emptyIsMiss(execSpanCtx))) &&
+				lastErr != nil && common.IsRetryableTowardNetwork(lastErr) &&
+				n.cfg.Failover.Enabled() && !failsafeExecutor.HasConsensus() {
+				var fallbacks []common.Upstream
+				for _, fb := range n.upstreamsRegistry.GetFallbackEscapeUpstreams(execSpanCtx, n.networkId, method) {
+					if _, seen := attempted[fb.Id()]; !seen {
+						fallbacks = append(fallbacks, fb)
+					}
+				}
+				if len(fallbacks) > 0 && effectiveReq.MarkEscalatedToFallbacks() {
+					if bestResp != nil {
 						bestResp.Release()
 						bestResp = nil
 					}
-					fbCommon := make([]common.Upstream, 0, len(fallbacks))
-					for _, fb := range fallbacks {
-						fbCommon = append(fbCommon, fb)
-						effectiveReq.ErrorsByUpstream.Delete(common.Upstream(fb))
-						effectiveReq.ConsumedUpstreams.Delete(common.Upstream(fb))
-					}
-					effectiveReq.SetUpstreams(fbCommon)
-					upsList = fbCommon
-					maxLoopIterations = len(fallbacks)
-					attempted = make(map[string]struct{}, len(fallbacks))
-					effectiveReq.MarkEscalatedToFallbacks()
-					// Reset lastErr so the next pass either replaces it (new
-					// failure) or leaves it nil (success).
 					lastErr = nil
+					maxLoopIterations = len(fallbacks)
+					nextUpstream = func() (common.Upstream, error) {
+						for len(fallbacks) > 0 {
+							fb := fallbacks[0]
+							fallbacks = fallbacks[1:]
+							// Skip one a sibling hedge is already running.
+							if _, loaded := effectiveReq.ConsumedUpstreams.LoadOrStore(fb, true); !loaded {
+								return fb, nil
+							}
+						}
+						return nil, common.NewErrNoUpstreamsLeftToSelect(effectiveReq, "no more fallback upstreams left")
+					}
 
 					telemetry.MetricNetworkFallbackEscapeTotal.WithLabelValues(
 						n.projectId, n.Label(), method,
 					).Inc()
-
 					lg.Debug().
-						Str("networkId", n.networkId).
-						Str("method", method).
-						Int("fallbacks", len(fallbacks)).
+						Int("fallbacks", maxLoopIterations).
 						Msg("activated per-request fallback escape after primary set exhausted")
 
 					continue escalationLoop
@@ -2613,7 +2537,7 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 			s.Attempts,
 			s.Retries,
 			s.Hedges,
-			originalUpsListLen,
+			len(upsList),
 		)
 		common.SetTraceSpanError(execSpan, exhaustedErr)
 		return nil, exhaustedErr
@@ -3086,7 +3010,7 @@ func (n *Network) handleBlockSkip(
 				go func() { // #nosec G118 -- fire-and-forget poll; must not share request lifetime
 					pollCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 					defer cancel()
-					_, _ = sp.PollLatestBlockNumberNow(pollCtx)
+					_, _ = sp.PollLatestBlockNumber(pollCtx)
 				}()
 			}
 		}
@@ -3214,32 +3138,6 @@ func (n *Network) checkUpstreamBlockAvailability(ctx context.Context, u common.U
 	return nil, false
 }
 
-// methodSkipMultiplexing reports whether a JSON-RPC method should bypass
-// in-flight dedup. Multiplexing is correct for idempotent reads where N
-// concurrent identical requests can share one result. It is wrong for
-// transaction-broadcast methods: a client retrying a signed payload
-// expects each retry to actually re-submit, not to silently block on a
-// prior in-flight attempt. Worse, if a retrying client cancels at its
-// own context deadline before the leader returns, eRPC's failsafe
-// leader continues executing on its CopyForCancellable child for the
-// remainder of the network-level budget — and every retry the client
-// issues in that window stacks up as a follower of the doomed leader,
-// all timing out together when their parent contexts fire.
-//
-// Tx broadcasts already handle duplicate submissions via the idempotent-
-// broadcast post-forward hook (nonce-already-known → synthetic success
-// keyed by tx hash). Skipping multiplexing here costs nothing in
-// correctness: duplicate work resolves at the upstream layer with the
-// same guarantees, and retries are no longer serialised behind a slow
-// leader.
-func methodSkipMultiplexing(method string) bool {
-	switch method {
-	case "eth_sendRawTransaction", "eth_sendTransaction":
-		return true
-	}
-	return false
-}
-
 // eligibleUpstreamIDsForBoundary derives the block-availability "lane" for a
 // single-block request: the IDs of upstreams whose configured availability
 // bounds can serve the request's block. It feeds the selection policy's
@@ -3353,7 +3251,9 @@ func (n *Network) handleMultiplexing(ctx context.Context, lg *zerolog.Logger, re
 		return nil, nil, nil
 	}
 
-	if method, _ := req.Method(); methodSkipMultiplexing(method) {
+	// A non-retryable write (e.g. creating a filter) must reach an upstream
+	// once per call, so it is never shared with a concurrent identical call.
+	if method, _ := req.Method(); evm.IsNonRetryableWriteMethod(method) || svm.IsNonRetryableWriteMethod(method) {
 		return nil, nil, nil
 	}
 
@@ -3737,112 +3637,70 @@ func tierUpstreamsByGroup(ups []common.Upstream) []common.Upstream {
 }
 
 // partitionUpstreamsByLatestBlock stable-partitions ups so that upstreams
-// whose EvmStatePoller has observed a block number ≥ bn come first, in
-// their input order. Upstreams whose poller is behind bn (or has no
-// poller / isn't EVM) keep their input order and come after.
-//
-// This makes per-request routing consistent with what the indexer already
-// knows: when a WS upstream delivers newHead block N, its state poller's
-// LatestBlock advances to N immediately. If a subsequent eth_call from a
-// client references block N, this partition routes the call to that
-// upstream first instead of to an HTTP-only sibling whose own polling
-// hasn't caught up — which would fail checkUpstreamBlockAvailability and
-// burn retries. The partition is stable, so callers can layer it under
-// other orderings (tier, score) without disturbing them within each
-// partition.
+// whose poller has a known head below bn move behind the rest; order within
+// each partition is kept, so it composes with the tier and score orderings.
+// An upstream with no known head (no poller yet) keeps its place: that is no
+// evidence it lacks the block.
 func partitionUpstreamsByLatestBlock(ups []common.Upstream, bn int64) []common.Upstream {
 	if bn <= 0 || len(ups) < 2 {
 		return ups
 	}
-	// Cheap fast-path: if all upstreams already have ≥ bn, or all are
-	// behind, the partition is the identity and we can avoid the
-	// allocation. We still walk once to compute LatestBlock either way,
-	// so the gain is just the slice copy.
-	haveCount := 0
-	for _, u := range ups {
-		eu, ok := u.(common.EvmUpstream)
-		if !ok {
-			continue
-		}
-		sp := eu.EvmStatePoller()
-		if sp == nil || sp.IsObjectNull() {
-			continue
-		}
-		if sp.LatestBlock() >= bn {
-			haveCount++
-		}
+	behind := func(u common.Upstream) bool {
+		lb := upstreamLatestBlock(u)
+		return lb > 0 && lb < bn
 	}
-	if haveCount == 0 || haveCount == len(ups) {
+	if !slices.ContainsFunc(ups, behind) {
 		return ups
 	}
 	out := make([]common.Upstream, 0, len(ups))
 	for _, u := range ups {
-		eu, ok := u.(common.EvmUpstream)
-		if !ok {
-			continue
-		}
-		sp := eu.EvmStatePoller()
-		if sp != nil && !sp.IsObjectNull() && sp.LatestBlock() >= bn {
+		if !behind(u) {
 			out = append(out, u)
 		}
 	}
 	for _, u := range ups {
-		eu, ok := u.(common.EvmUpstream)
-		if !ok {
-			out = append(out, u)
-			continue
-		}
-		sp := eu.EvmStatePoller()
-		if sp == nil || sp.IsObjectNull() || sp.LatestBlock() < bn {
+		if behind(u) {
 			out = append(out, u)
 		}
 	}
 	return out
 }
 
-// preferTipLeaderForNearTipGetBlock returns ups with EvmLeaderUpstream moved
-// to the front when the request is eth_getBlockByNumber for the leader's tip
-// or tip+1 (the sibling import race window). The rest of the list keeps its
-// order, so the hint composes with the partition and score orderings and
-// never removes an upstream from consideration — unlike a use-upstream
-// selector, which would also scope the network tip to the leader and lock
-// the per-request fallback escape out when the leader answers null.
-func (n *Network) preferTipLeaderForNearTipGetBlock(ctx context.Context, ups []common.Upstream, method string, bn int64) []common.Upstream {
-	if n == nil || method != "eth_getBlockByNumber" || bn <= 0 || len(ups) < 2 {
+// preferTipLeaderForNearTipGetBlock moves the upstream whose head is strictly
+// ahead of every other candidate to the front when the request is
+// eth_getBlockByNumber for that head or the next block (the sibling import
+// race). On a tie the selection policy's order stands. It is an ordering
+// hint only: every upstream stays eligible.
+func preferTipLeaderForNearTipGetBlock(ups []common.Upstream, method string, bn int64) []common.Upstream {
+	if method != "eth_getBlockByNumber" || len(ups) < 2 {
 		return ups
 	}
-	leader := n.EvmLeaderUpstream(ctx)
-	if leader == nil {
-		return ups
-	}
-	eu, ok := leader.(common.EvmUpstream)
-	if !ok {
-		return ups
-	}
-	sp := eu.EvmStatePoller()
-	if sp == nil || sp.IsObjectNull() {
-		return ups
-	}
-	l := sp.LatestBlock()
-	if l <= 0 || bn < l || bn > l+1 {
-		return ups
-	}
-	idx := -1
+	leader, tip, runnerUp := -1, int64(0), int64(0)
 	for i, u := range ups {
-		if u.Id() == leader.Id() {
-			idx = i
-			break
+		if lb := upstreamLatestBlock(u); lb > tip {
+			leader, tip, runnerUp = i, lb, tip
+		} else if lb > runnerUp {
+			runnerUp = lb
 		}
 	}
-	if idx <= 0 {
-		// Absent (e.g. excluded by the selection policy) or already first.
+	if leader <= 0 || tip == runnerUp || bn < tip || bn > tip+1 {
 		return ups
 	}
 	out := make([]common.Upstream, 0, len(ups))
-	out = append(out, ups[idx])
-	out = append(out, ups[:idx]...)
-	out = append(out, ups[idx+1:]...)
+	out = append(out, ups[leader])
+	out = append(out, ups[:leader]...)
+	out = append(out, ups[leader+1:]...)
 	return out
+}
+
+// upstreamLatestBlock is u's polled head, or 0 when unknown.
+func upstreamLatestBlock(u common.Upstream) int64 {
+	if eu, ok := u.(common.EvmUpstream); ok {
+		if sp := eu.EvmStatePoller(); sp != nil && !sp.IsObjectNull() {
+			return sp.LatestBlock()
+		}
+	}
+	return 0
 }
 
 // requestBlockNumber resolves the specific block number a request targets,

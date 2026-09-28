@@ -499,10 +499,8 @@ func TestExtractBlockReference(t *testing.T) {
 }
 
 // TestResolveCacheBlockRef covers the cache-specific helper that rewrites
-// moving-tag blockRefs ("latest"/"finalized"/"safe") to a concrete block
-// number so each tip advance produces a distinct cache key. The previous
-// behaviour pinned all "latest" responses under the literal "latest" ref,
-// causing stale cache hits for up to TTL after a tip advance.
+// "latest"/"finalized" to a concrete block number so each tip advance
+// produces a distinct cache key.
 func TestResolveCacheBlockRef(t *testing.T) {
 	ctx := context.Background()
 
@@ -565,6 +563,24 @@ func TestResolveCacheBlockRef(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, "0x100", ref)
 		assert.Equal(t, int64(0x100), num)
+	})
+
+	t.Run("safe tag keeps the literal key on both paths", func(t *testing.T) {
+		rpcReq := &common.JsonRpcRequest{
+			Method: "eth_getBlockByNumber",
+			Params: []interface{}{"safe", false},
+		}
+		nrq := common.NewNormalizedRequestFromJsonRpcRequest(rpcReq)
+		nrq.SetNetwork(&testNetwork{highestLatest: 0x200})
+		rpcResp := common.MustNewJsonRpcResponseFromBytes(nil, []byte(`{"number":"0x180","hash":"0x1","parentHash":"0x0"}`), nil)
+		nrs := common.NewNormalizedResponse().WithJsonRpcResponse(rpcResp).WithRequest(nrq)
+
+		getRef, _, err := ResolveCacheBlockRef(ctx, nrq, nil)
+		assert.NoError(t, err)
+		setRef, _, err := ResolveCacheBlockRef(ctx, nrq, nrs)
+		assert.NoError(t, err)
+		assert.Equal(t, "safe", getRef)
+		assert.Equal(t, getRef, setRef, "GET and SET must derive the same key")
 	})
 
 	t.Run("earliest tag not rewritten (not tip-bound, existing semantics preserved)", func(t *testing.T) {

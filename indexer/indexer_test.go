@@ -39,6 +39,8 @@ type fakeEgress struct {
 	name           string
 	filters        map[string]struct{} // filterHash -> interested
 	acceptAllHeads bool
+	// hook, when set, runs at the start of every Deliver.
+	hook func(IndexedEvent)
 
 	mu       sync.Mutex
 	received []IndexedEvent
@@ -53,6 +55,9 @@ func (e *fakeEgress) InterestedIn(kind EventKind, networkId, filterHash string) 
 	return ok
 }
 func (e *fakeEgress) Deliver(ev IndexedEvent) {
+	if e.hook != nil {
+		e.hook(ev)
+	}
 	e.mu.Lock()
 	e.received = append(e.received, ev)
 	e.mu.Unlock()
@@ -159,13 +164,8 @@ func TestIndexer_NewHead_FanOutAndDedup(t *testing.T) {
 	}
 }
 
-// TestIndexer_NewHead_ConcurrentIngestDedupe reproduces the TOCTOU race
-// that prod evm:1101 hit: four WS upstream sources delivered the same
-// newHead within ~1ms, and concurrent Ingest calls both read the stale
-// lastHeadNum + Store the same new value + fell through to fanOut, so
-// clients saw every head twice. The regression asserts that no matter
-// how many goroutines race with the same (number, hash), the egress
-// receives exactly one delivery.
+// Several sources delivering the same head at the same instant must reach
+// the egress exactly once.
 func TestIndexer_NewHead_ConcurrentIngestDedupe(t *testing.T) {
 	idx := newIndexer(t)
 	nw := newFakeNetwork("evm:1")
@@ -197,6 +197,55 @@ func TestIndexer_NewHead_ConcurrentIngestDedupe(t *testing.T) {
 
 	if got := eg.count(); got != 1 {
 		t.Fatalf("concurrent ingest of identical head must dedupe to 1 delivery, got %d", got)
+	}
+}
+
+// A newer head from one source must not overtake an older head another
+// source is still delivering.
+func TestIndexer_NewHead_ConcurrentSourcesDeliverInOrder(t *testing.T) {
+	idx := newIndexer(t)
+	idx.RegisterNetwork(newFakeNetwork("evm:1"))
+	delivering, release := make(chan struct{}), make(chan struct{})
+	eg := &fakeEgress{name: "eg1", acceptAllHeads: true, hook: func(ev IndexedEvent) {
+		if ev.Block.Number == 100 {
+			close(delivering)
+			<-release
+		}
+	}}
+	idx.Attach(eg)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		idx.Ingest(StreamEvent{Kind: KindNewHead, NetworkId: "evm:1", SourceId: "ws:up1", Block: BlockRef{Number: 100, Hash: "0xA"}})
+	}()
+	<-delivering
+	go func() {
+		defer wg.Done()
+		idx.Ingest(StreamEvent{Kind: KindNewHead, NetworkId: "evm:1", SourceId: "ws:up2", Block: BlockRef{Number: 101, Hash: "0xB"}})
+	}()
+	time.Sleep(20 * time.Millisecond) // let the second head reach the indexer
+	close(release)
+	wg.Wait()
+
+	eg.mu.Lock()
+	defer eg.mu.Unlock()
+	if len(eg.received) != 2 || eg.received[0].Block.Number != 100 || eg.received[1].Block.Number != 101 {
+		t.Fatalf("heads must be delivered in order, got %+v", eg.received)
+	}
+}
+
+func TestIndexer_NewHead_DedupIgnoresHashCase(t *testing.T) {
+	idx := newIndexer(t)
+	idx.RegisterNetwork(newFakeNetwork("evm:1"))
+	eg := &fakeEgress{name: "eg1", acceptAllHeads: true}
+	idx.Attach(eg)
+
+	idx.Ingest(StreamEvent{Kind: KindNewHead, NetworkId: "evm:1", SourceId: "ws:up1", Block: BlockRef{Number: 100, Hash: "0xABC"}})
+	idx.Ingest(StreamEvent{Kind: KindNewHead, NetworkId: "evm:1", SourceId: "ws:up2", Block: BlockRef{Number: 100, Hash: "0xabc"}})
+	if got := eg.count(); got != 1 {
+		t.Fatalf("same head with differently-cased hash must dedupe, got %d", got)
 	}
 }
 

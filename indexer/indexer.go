@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
-	"sync/atomic"
 
 	"github.com/rs/zerolog"
 )
@@ -33,11 +33,7 @@ type Indexer struct {
 	egresses sync.Map // egress Name() -> EventEgress
 }
 
-// networkState holds the indexer's per-network bookkeeping: the
-// headMarker packages the most-recent head seen for a network so
-// networkState can store (num, hash) atomically. Treated as immutable
-// once published via lastHead.Store / CompareAndSwap; readers load
-// and may see nil before the first head arrives.
+// headMarker is the most recently delivered head of a network.
 type headMarker struct {
 	num  int64
 	hash string
@@ -55,15 +51,11 @@ type networkState struct {
 	// Nil means "treat every registered ingress as a default."
 	selector IngressSelector
 
-	// newHeads dedup: most-recently-delivered (blockNumber, blockHash)
-	// packed into a single pointer so the check+advance is a single
-	// atomic CAS — separate atomics on num and hash would leave readers
-	// able to see num updated before hash, and producers able to both
-	// pass the "load, check, store" sequence with the same stale num.
-	// We saw the latter in prod against evm:1101 where four upstream WS
-	// sources delivered the same head within ~1ms and both raced past
-	// the dedup.
-	lastHead atomic.Pointer[headMarker]
+	// headMu serialises newHeads dedup and fan-out, so concurrent sources
+	// can neither deliver the same head twice nor deliver heads out of
+	// order. Egress Deliver is non-blocking by contract.
+	headMu   sync.Mutex
+	lastHead *headMarker // guarded by headMu; nil until the first head
 
 	filterMu sync.RWMutex
 	filters  map[string]*filterState // paramsHash -> state
@@ -343,6 +335,10 @@ func (i *Indexer) Ingest(ev StreamEvent) {
 	// second-guess which chain is canonical.
 	removed := ev.Kind == KindLog && logRemoved(ev.Payload)
 
+	if ev.Kind == KindNewHead {
+		ns.headMu.Lock()
+		defer ns.headMu.Unlock()
+	}
 	if !i.dedupe(ns, &ev, removed) {
 		return
 	}
@@ -357,27 +353,15 @@ func (i *Indexer) Ingest(ev StreamEvent) {
 func (i *Indexer) dedupe(ns *networkState, ev *StreamEvent, removed bool) bool {
 	switch ev.Kind {
 	case KindNewHead:
-		// CAS-retry on the packed (num, hash) pointer. On the happy path
-		// exactly one goroutine per distinct head wins the swap and falls
-		// through to deliver; any concurrent ingest of the same head
-		// sees its CAS fail, reloads, and drops as a dupe on the next
-		// iteration. Reorgs at the same height (same num, different hash)
-		// win a second CAS and are delivered.
-		next := &headMarker{num: ev.Block.Number, hash: ev.Block.Hash}
-		for {
-			prev := ns.lastHead.Load()
-			if prev != nil {
-				if ev.Block.Number < prev.num {
-					return false
-				}
-				if ev.Block.Number == prev.num && prev.hash == ev.Block.Hash {
-					return false
-				}
-			}
-			if ns.lastHead.CompareAndSwap(prev, next) {
-				return true
+		// Caller holds headMu. A different hash at the same height is a
+		// reorg and is delivered.
+		if prev := ns.lastHead; prev != nil {
+			if ev.Block.Number < prev.num || (ev.Block.Number == prev.num && strings.EqualFold(prev.hash, ev.Block.Hash)) {
+				return false
 			}
 		}
+		ns.lastHead = &headMarker{num: ev.Block.Number, hash: ev.Block.Hash}
+		return true
 	case KindLog, KindPendingTx:
 		ns.filterMu.RLock()
 		f := ns.filters[ev.FilterHash]

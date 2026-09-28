@@ -1,13 +1,13 @@
 // Package wsclient adapts a single client WebSocket connection into an
 // indexer.EventEgress. One adapter per WsConnection. The adapter owns
-// per-subscription write buffers and writer goroutines — the drop policy
-// (oldest-drop for slow clients) lives here rather than in the indexer
-// core because future egresses (Kafka, webhook) will want different
-// policies.
+// per-subscription write buffers and writer goroutines — the overflow
+// policy lives here rather than in the indexer core because future
+// egresses (Kafka, webhook) will want different policies.
 package wsclient
 
 import (
 	"encoding/json"
+	"errors"
 	"sync"
 	"sync/atomic"
 
@@ -15,19 +15,12 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// clientNotifyBufferSize is the per-subscription buffer depth. Slow
-// clients drop their oldest queued notification when this is full.
-//
-// Sized small because retention scales with depth, not throughput:
-// each buffered notification pins the upstream-allocated
-// json.RawMessage until the writer drains it, so total GC-reachable
-// heap from this path is roughly N_subs × depth × payload_size. Block
-// header payloads can run tens of KB on chains that pack extended
-// header fields, and long-lived client subscriptions hold their
-// buffers across many newHead notifications. A small depth keeps the
-// drop-oldest threshold tight: a consumer that hasn't drained this
-// many events has already fallen far enough behind to need a re-sync.
-const clientNotifyBufferSize = 8
+// ErrClosed is returned by AddSubscription once the adapter was drained.
+var ErrClosed = errors.New("connection closed")
+
+// ErrLimitExceeded is returned by AddSubscription when the connection
+// already holds the maximum number of subscriptions.
+var ErrLimitExceeded = errors.New("subscription limit exceeded")
 
 // NotificationWriter is what the adapter uses to push a delivered event
 // onto the wire. The indirection lets the adapter stay unaware of
@@ -35,6 +28,19 @@ const clientNotifyBufferSize = 8
 // (clientSubId, result) pair to a single consumer works.
 type NotificationWriter interface {
 	WriteSubscriptionNotification(clientSubId string, result json.RawMessage) error
+	// NotificationDropped is called, from the delivery path, each time a
+	// full buffer costs a notification. lossy is false when the dropped
+	// notification was data the client cannot re-derive (see isLossy), in
+	// which case the transport should end the connection. Must not block.
+	NotificationDropped(sub Subscription, lossy bool)
+}
+
+// isLossy reports whether a kind may shed its oldest queued notification
+// on overflow: a newer head supersedes an older one, and pending
+// transactions are best-effort by nature. Every other kind (logs, and any
+// kind added later) is treated as data that must not silently vanish.
+func isLossy(kind indexer.EventKind) bool {
+	return kind == indexer.KindNewHead || kind == indexer.KindPendingTx
 }
 
 // Adapter is the per-connection EventEgress. Subscribe/Unsubscribe calls
@@ -42,11 +48,13 @@ type NotificationWriter interface {
 // RemoveSubscription here; the indexer calls InterestedIn on every event
 // and Deliver for matches.
 type Adapter struct {
-	connID string
-	writer NotificationWriter
-	logger *zerolog.Logger
+	connID     string
+	writer     NotificationWriter
+	logger     *zerolog.Logger
+	bufferSize int
 
-	mu sync.RWMutex
+	mu      sync.RWMutex
+	drained bool
 	// subs keyed by clientSubId. A single map supports both newHeads
 	// and filter subs.
 	subs map[string]*clientSub
@@ -76,14 +84,16 @@ type clientSub struct {
 // New creates an adapter for a single client connection. The writer is
 // invoked from the per-subscription goroutine; it must be safe for
 // concurrent use (typically an internal sync.Mutex on the WS connection).
-func New(connID string, writer NotificationWriter, logger *zerolog.Logger) *Adapter {
+// bufferSize is the per-subscription notification queue depth.
+func New(connID string, writer NotificationWriter, logger *zerolog.Logger, bufferSize int) *Adapter {
 	lg := logger.With().Str("connId", connID).Logger()
 	return &Adapter{
-		connID: connID,
-		writer: writer,
-		logger: &lg,
-		subs:   make(map[string]*clientSub),
-		routes: make(map[routeKey]map[string]struct{}),
+		connID:     connID,
+		writer:     writer,
+		logger:     &lg,
+		bufferSize: bufferSize,
+		subs:       make(map[string]*clientSub),
+		routes:     make(map[routeKey]map[string]struct{}),
 	}
 }
 
@@ -98,10 +108,8 @@ func (a *Adapter) InterestedIn(kind indexer.EventKind, networkID, filterHash str
 	return ok
 }
 
-// Deliver enqueues the event on every matching per-sub channel. If a
-// sub's buffer is full the oldest queued notification is dropped to make
-// room (fresher data is preferred, and the indexer must not block on
-// this egress).
+// Deliver enqueues the event on every matching per-sub channel without
+// blocking the indexer. See enqueue for what happens when a buffer is full.
 func (a *Adapter) Deliver(ev indexer.IndexedEvent) {
 	a.mu.RLock()
 	routes, ok := a.routes[routeKey{kind: ev.Kind, networkID: ev.NetworkId, filterHash: ev.FilterHash}]
@@ -122,25 +130,36 @@ func (a *Adapter) Deliver(ev indexer.IndexedEvent) {
 		if !ok {
 			continue
 		}
-		enqueue(sub, ev.Payload)
+		if !enqueue(sub, ev.Payload) {
+			a.writer.NotificationDropped(sub.snapshot(), isLossy(sub.kind))
+		}
 	}
 }
 
 // AddSubscription registers a client subscription on this connection and
 // starts its writer goroutine. clientSubId is the erpc-generated opaque
-// ID the caller already returned to the client. filterHash is "" for
-// newHeads.
-func (a *Adapter) AddSubscription(clientSubID, networkID string, kind indexer.EventKind, filterHash string) {
+// ID the caller will return to the client. filterHash is "" for newHeads.
+// It fails with ErrLimitExceeded when the connection already holds max
+// subscriptions, and with ErrClosed once the adapter was drained.
+func (a *Adapter) AddSubscription(clientSubID, networkID string, kind indexer.EventKind, filterHash string, max int) error {
 	sub := &clientSub{
 		id:         clientSubID,
 		kind:       kind,
 		networkID:  networkID,
 		filterHash: filterHash,
-		notify:     make(chan json.RawMessage, clientNotifyBufferSize),
+		notify:     make(chan json.RawMessage, a.bufferSize),
 		done:       make(chan struct{}),
 	}
 
 	a.mu.Lock()
+	if a.drained {
+		a.mu.Unlock()
+		return ErrClosed
+	}
+	if len(a.subs) >= max {
+		a.mu.Unlock()
+		return ErrLimitExceeded
+	}
 	a.subs[clientSubID] = sub
 	key := routeKey{kind: kind, networkID: networkID, filterHash: filterHash}
 	set, ok := a.routes[key]
@@ -152,6 +171,7 @@ func (a *Adapter) AddSubscription(clientSubID, networkID string, kind indexer.Ev
 	a.mu.Unlock()
 
 	go a.runWriter(sub)
+	return nil
 }
 
 // RemoveSubscription deregisters a subscription and stops its writer. It
@@ -181,37 +201,35 @@ func (a *Adapter) RemoveSubscription(clientSubID string) (kind indexer.EventKind
 	return sub.kind, sub.networkID, sub.filterHash, true
 }
 
-// Drain stops every sub's writer — call on connection close before
-// detaching from the indexer.
-func (a *Adapter) Drain() {
+// Drain stops every sub's writer and makes later AddSubscription calls
+// fail — call on connection close before detaching from the indexer. It
+// returns the subscriptions it removed, so the caller releases exactly
+// those (a concurrent RemoveSubscription owns any sub it removed first).
+func (a *Adapter) Drain() []Subscription {
 	a.mu.Lock()
 	subs := a.subs
+	a.drained = true
 	a.subs = make(map[string]*clientSub)
 	a.routes = make(map[routeKey]map[string]struct{})
 	a.mu.Unlock()
 
+	out := make([]Subscription, 0, len(subs))
 	for _, sub := range subs {
 		if sub.closed.CompareAndSwap(false, true) {
 			close(sub.done)
 		}
-	}
-}
-
-// Subscriptions returns a snapshot of the active subscriptions. Used by
-// connection cleanup paths to iterate subs without racing with Deliver.
-func (a *Adapter) Subscriptions() []Subscription {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	out := make([]Subscription, 0, len(a.subs))
-	for _, sub := range a.subs {
-		out = append(out, Subscription{
-			ClientSubID: sub.id,
-			Kind:        sub.kind,
-			NetworkID:   sub.networkID,
-			FilterHash:  sub.filterHash,
-		})
+		out = append(out, sub.snapshot())
 	}
 	return out
+}
+
+func (sub *clientSub) snapshot() Subscription {
+	return Subscription{
+		ClientSubID: sub.id,
+		Kind:        sub.kind,
+		NetworkID:   sub.networkID,
+		FilterHash:  sub.filterHash,
+	}
 }
 
 // Subscription is a caller-visible snapshot of one active subscription.
@@ -251,21 +269,25 @@ func (a *Adapter) runWriter(sub *clientSub) {
 	}
 }
 
-// enqueue pushes a payload onto the sub's buffer, evicting the oldest
-// element when the buffer is full. Never blocks.
-func enqueue(sub *clientSub, payload json.RawMessage) {
+// enqueue pushes a payload onto the sub's buffer without blocking. When the
+// buffer is full a lossy sub evicts its oldest notification to make room;
+// any other sub drops the new one. Returns false if a notification was
+// dropped either way.
+func enqueue(sub *clientSub, payload json.RawMessage) bool {
+	dropped := false
 	for {
 		select {
 		case sub.notify <- payload:
-			return
+			return !dropped
 		default:
-			// Buffer full; drop oldest to make room.
-			select {
-			case <-sub.notify:
-			default:
-				// Concurrent drain won the race — drop this message.
-				return
-			}
+		}
+		if !isLossy(sub.kind) {
+			return false
+		}
+		select {
+		case <-sub.notify:
+			dropped = true
+		default:
 		}
 	}
 }

@@ -3,11 +3,11 @@ package erpc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/erpc/erpc/common"
@@ -50,13 +50,11 @@ type SubscriptionManager struct {
 	logger *zerolog.Logger
 	idx    *indexer.Indexer
 
-	// conns maps connId -> *connEntry. One egress adapter per live WS
-	// connection.
-	conns sync.Map
-
-	// bySubID maps a client-facing subscription ID to the record needed
-	// to route Unsubscribe/Cleanup without walking every connection.
-	bySubID sync.Map // clientSubId -> *subRecord
+	// conns maps connId -> *connEntry: one egress adapter per live WS
+	// connection. connMu also guards WsConnection.subsClosed, so no
+	// adapter is created for a connection once CleanupConnection ran.
+	connMu sync.Mutex
+	conns  map[string]*connEntry
 
 	// networks tracks which networkIds have been bootstrapped with
 	// ingresses so we don't double-register on every Subscribe call.
@@ -75,25 +73,13 @@ type connEntry struct {
 	detach  func()
 }
 
-// subRecord is the per-subscription record kept for Unsubscribe /
-// CleanupConnection routing. We don't persist these in the adapter
-// because the adapter can't know the original subType (it holds
-// EventKind, which is a lossy projection of subType for filters).
-type subRecord struct {
-	clientSubID string
-	connID      string
-	networkID   string
-	subType     string
-	kind        indexer.EventKind
-	filterHash  string
-}
-
 // NewSubscriptionManager creates a client-facing SubscriptionManager
 // backed by the given indexer.
 func NewSubscriptionManager(logger *zerolog.Logger, idx *indexer.Indexer) *SubscriptionManager {
 	return &SubscriptionManager{
 		logger: logger,
 		idx:    idx,
+		conns:  make(map[string]*connEntry),
 	}
 }
 
@@ -136,10 +122,12 @@ func (sm *SubscriptionManager) Subscribe(
 		return nil, err
 	}
 
-	// Per-connection subscription limit. Get/create the egress adapter
-	// up-front — we need it for the limit check and for the subsequent
-	// AddSubscription call anyway.
 	conn := sm.getOrCreateConn(wsc)
+	if conn == nil {
+		return nil, wsclient.ErrClosed
+	}
+	// Fail fast before touching upstream filters; AddSubscription below
+	// enforces the limit atomically.
 	maxSubs := wsc.server.serverCfg.WebSocket.MaxSubscriptionsPerConnection
 	if conn.adapter.Count() >= maxSubs {
 		return nil, common.NewErrSubscriptionLimitExceeded(maxSubs)
@@ -174,15 +162,14 @@ func (sm *SubscriptionManager) Subscribe(
 		return nil, err
 	}
 
-	conn.adapter.AddSubscription(clientSubID, networkId, kind, filterHash)
-	sm.bySubID.Store(clientSubID, &subRecord{
-		clientSubID: clientSubID,
-		connID:      wsc.id,
-		networkID:   networkId,
-		subType:     subType,
-		kind:        kind,
-		filterHash:  filterHash,
-	})
+	if err := conn.adapter.AddSubscription(clientSubID, networkId, kind, filterHash, maxSubs); err != nil {
+		sm.releaseFilter(ctx, networkId, kind, filterHash)
+		if errors.Is(err, wsclient.ErrLimitExceeded) {
+			err = common.NewErrSubscriptionLimitExceeded(maxSubs)
+		}
+		sm.recordFailureMetrics(project, nw, method, reqFinality, start, nq, err)
+		return nil, err
+	}
 
 	lg.Info().
 		Str("clientSubId", clientSubID).
@@ -241,22 +228,25 @@ func (sm *SubscriptionManager) Unsubscribe(
 		return nil, err
 	}
 
-	recRaw, ok := sm.bySubID.LoadAndDelete(clientSubID)
-	if !ok {
+	// Only the connection that created a subscription can remove it, and
+	// only the caller that actually removed it releases its filter.
+	sm.connMu.Lock()
+	conn := sm.conns[wsc.id]
+	sm.connMu.Unlock()
+	var kind indexer.EventKind
+	var subNetworkID, filterHash string
+	existed := false
+	if conn != nil {
+		kind, subNetworkID, filterHash, existed = conn.adapter.RemoveSubscription(clientSubID)
+	}
+	if !existed {
 		err := common.NewErrSubscriptionNotFound(clientSubID)
 		sm.recordFailureMetrics(project, nw, method, reqFinality, start, nq, err)
 		return nil, err
 	}
-	rec := recRaw.(*subRecord)
+	sm.releaseFilter(ctx, subNetworkID, kind, filterHash)
 
-	if connRaw, ok := sm.conns.Load(rec.connID); ok {
-		connRaw.(*connEntry).adapter.RemoveSubscription(clientSubID)
-	}
-	if rec.kind != indexer.KindNewHead && rec.filterHash != "" {
-		sm.idx.ReleaseFilter(ctx, rec.networkID, rec.subType, rec.filterHash)
-	}
-
-	lg.Info().Str("clientSubId", clientSubID).Str("subType", rec.subType).Msg("subscription removed")
+	lg.Info().Str("clientSubId", clientSubID).Str("subType", kind.String()).Msg("subscription removed")
 
 	telemetry.CounterHandle(telemetry.MetricNetworkSuccessfulRequests,
 		project.Config.Id, nw.Label(), "proxy", "proxy",
@@ -275,30 +265,36 @@ func (sm *SubscriptionManager) Unsubscribe(
 	return resp, nil
 }
 
-// CleanupConnection is invoked on WS disconnect. It walks the adapter's
-// active subscriptions, releases each filter refcount in the indexer,
-// drains the adapter, and detaches it from the indexer's egress set.
-func (sm *SubscriptionManager) CleanupConnection(wsc *WsConnection, _ *PreparedProject) {
-	lg := sm.logger.With().Str("connId", wsc.id).Logger()
-
-	connRaw, ok := sm.conns.LoadAndDelete(wsc.id)
-	if !ok {
+// CleanupConnection is invoked on WS disconnect. It drains the adapter,
+// releases the filter refcount of every subscription it removed, and
+// detaches it from the indexer's egress set. Later Subscribe calls on the
+// same connection fail.
+func (sm *SubscriptionManager) CleanupConnection(wsc *WsConnection) {
+	sm.connMu.Lock()
+	wsc.subsClosed = true
+	conn := sm.conns[wsc.id]
+	delete(sm.conns, wsc.id)
+	sm.connMu.Unlock()
+	if conn == nil {
 		return
 	}
-	conn := connRaw.(*connEntry)
 
-	for _, sub := range conn.adapter.Subscriptions() {
-		sm.bySubID.Delete(sub.ClientSubID)
-		if sub.Kind != indexer.KindNewHead && sub.FilterHash != "" {
-			ctx, cancel := context.WithTimeout(context.Background(), unsubscribeTimeout)
-			sm.idx.ReleaseFilter(ctx, sub.NetworkID, subTypeFor(sub.Kind), sub.FilterHash)
-			cancel()
-		}
+	ctx, cancel := context.WithTimeout(context.Background(), unsubscribeTimeout)
+	defer cancel()
+	for _, sub := range conn.adapter.Drain() {
+		sm.releaseFilter(ctx, sub.NetworkID, sub.Kind, sub.FilterHash)
 	}
-	conn.adapter.Drain()
 	conn.detach()
 
-	lg.Debug().Msg("cleaned up all subscriptions for connection")
+	sm.logger.Debug().Str("connId", wsc.id).Msg("cleaned up all subscriptions for connection")
+}
+
+// releaseFilter drops one reference on a filter subscription; newHeads
+// subscriptions hold none.
+func (sm *SubscriptionManager) releaseFilter(ctx context.Context, networkID string, kind indexer.EventKind, filterHash string) {
+	if kind != indexer.KindNewHead && filterHash != "" {
+		sm.idx.ReleaseFilter(ctx, networkID, subTypeFor(kind), filterHash)
+	}
 }
 
 // --- internals --------------------------------------------------------
@@ -437,26 +433,26 @@ func (sm *SubscriptionManager) resolveSubscription(ctx context.Context, networkI
 		}
 		return kind, hash, nil
 	default:
-		return 0, "", fmt.Errorf("unsupported subscription type: %s", subType)
+		return 0, "", common.NewErrJsonRpcExceptionInternal(0, common.JsonRpcErrorInvalidArgument,
+			fmt.Sprintf("unsupported subscription type: %q", subType), nil, nil)
 	}
 }
 
 // getOrCreateConn returns the egress adapter for a WsConnection,
 // attaching a new one to the indexer if this is the first subscription
-// on that connection.
+// on that connection. Returns nil once the connection was cleaned up.
 func (sm *SubscriptionManager) getOrCreateConn(wsc *WsConnection) *connEntry {
-	if existing, ok := sm.conns.Load(wsc.id); ok {
-		return existing.(*connEntry)
+	sm.connMu.Lock()
+	defer sm.connMu.Unlock()
+	if wsc.subsClosed {
+		return nil
 	}
-	adapter := wsclient.New(wsc.id, wsc, sm.logger)
-	detach := sm.idx.Attach(adapter)
-	entry := &connEntry{adapter: adapter, detach: detach}
-	if existing, loaded := sm.conns.LoadOrStore(wsc.id, entry); loaded {
-		// Lost the race with another Subscribe — drop our adapter.
-		detach()
-		adapter.Drain()
-		return existing.(*connEntry)
+	if existing, ok := sm.conns[wsc.id]; ok {
+		return existing
 	}
+	adapter := wsclient.New(wsc.id, wsc, sm.logger, wsc.server.serverCfg.WebSocket.SubscriptionBufferSize)
+	entry := &connEntry{adapter: adapter, detach: sm.idx.Attach(adapter)}
+	sm.conns[wsc.id] = entry
 	return entry
 }
 
@@ -526,29 +522,6 @@ func subTypeFor(kind indexer.EventKind) string {
 		return indexer.SubTypeNewPendingTransactions
 	}
 	return ""
-}
-
-// internalReqIdCounter generates unique JSON-RPC IDs for internal
-// requests (subscribe/unsubscribe). Kept here so erpc-level callers
-// still have access to a uniform counter; the wsupstream adapter
-// maintains its own counter since it can't import erpc.
-var internalReqIdCounter atomic.Int64
-
-// internalReqIdOffset keeps internal IDs out of the range clients
-// typically use (small incrementing integers).
-const internalReqIdOffset = 900_000_000
-
-// buildJsonRpcBody marshals a JSON-RPC request with the given method and
-// params. Retained for non-subscription JSON-RPC send paths that still
-// live inside erpc/.
-func buildJsonRpcBody(method string, params interface{}) ([]byte, error) {
-	id := internalReqIdCounter.Add(1) + internalReqIdOffset
-	return common.SonicCfg.Marshal(map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      id,
-		"method":  method,
-		"params":  params,
-	})
 }
 
 // --- NetworkHandle ----------------------------------------------------

@@ -26,6 +26,7 @@ import (
 	"github.com/erpc/erpc/indexer"
 	"github.com/erpc/erpc/telemetry"
 	"github.com/erpc/erpc/util"
+	"github.com/gorilla/websocket"
 	"github.com/klauspost/compress/gzip"
 	"github.com/rs/zerolog"
 	"go.opentelemetry.io/otel/attribute"
@@ -56,6 +57,7 @@ type HttpServer struct {
 	resolvedResponseHeaders map[string]string
 	subscriptionManager     *SubscriptionManager
 	activeWsConns           sync.Map // connId -> *WsConnection
+	reqMaxTimeout           time.Duration
 }
 
 func NewHttpServer(
@@ -108,6 +110,7 @@ func NewHttpServer(
 		draining:            &draining,
 		gzipPool:            gzipPool,
 		subscriptionManager: NewSubscriptionManager(&subMgrLogger, idx),
+		reqMaxTimeout:       reqMaxTimeout,
 	}
 
 	if cfg != nil {
@@ -242,11 +245,18 @@ func NewHttpServer(
 		if srv.serverV6 != nil {
 			srv.serverV6.SetKeepAlivesEnabled(false)
 		}
+		// Hijacked WebSocket connections are not drained by the above, and
+		// subscriptions stop receiving events once upstream ingress stops, so
+		// close them now: clients reconnect to healthy instances while
+		// in-flight requests get the grace window to finish.
+		var grace time.Duration
+		if srv.serverCfg.WaitBeforeShutdown != nil {
+			grace = srv.serverCfg.WaitBeforeShutdown.Duration()
+		}
+		go srv.shutdownWebSockets(logger, grace)
 		// wait for readiness probe to mark the pod NotReady
 		// ideally (period_seconds * failure_threshold) + safety margin (1s)
-		if srv.serverCfg.WaitBeforeShutdown != nil {
-			time.Sleep(srv.serverCfg.WaitBeforeShutdown.Duration())
-		}
+		time.Sleep(grace)
 		if err := srv.Shutdown(logger); err != nil {
 			logger.Error().Msgf("http server forced to shutdown: %s", err)
 		} else {
@@ -385,7 +395,23 @@ func (s *HttpServer) createRequestHandler() http.Handler {
 
 		// WebSocket upgrade: handle before body reading since WS upgrades don't have a JSON body
 		if isWebSocketUpgradeRequest(r) {
-			s.handleWebSocket(httpCtx, w, r, &lg, project, architecture, chainId)
+			// A connection serves one network; there is no per-message network.
+			if architecture == "" || chainId == "" {
+				handleErrorResponse(
+					httpCtx,
+					&lg,
+					&startedAt,
+					nil,
+					common.NewErrInvalidUrlPath("websocket connections must target a network, for example /<project>/<architecture>/<chainId>", r.URL.Path),
+					w,
+					encoder,
+					writeFatalError,
+					&common.TRUE,
+					s.executionHeadersMode(),
+				)
+				return
+			}
+			s.handleWebSocket(w, r, &lg, project, architecture, chainId)
 			return
 		}
 
@@ -2027,7 +2053,7 @@ func (s *HttpServer) Shutdown(logger *zerolog.Logger) error {
 	// Close all active WebSocket connections first with GoingAway status.
 	// This sends a close frame to clients so they know to reconnect,
 	// and cleans up all subscriptions before the HTTP server stops.
-	s.shutdownWebSockets(logger)
+	s.shutdownWebSockets(logger, 0)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -2072,46 +2098,34 @@ func (s *HttpServer) Shutdown(logger *zerolog.Logger) error {
 	return lastErr
 }
 
-// shutdownWebSockets closes all active WebSocket connections with a GoingAway
-// close frame and waits for subscription cleanup to complete.
-func (s *HttpServer) shutdownWebSockets(logger *zerolog.Logger) {
-	count := 0
-	s.activeWsConns.Range(func(key, value interface{}) bool {
-		count++
+// shutdownWebSockets refuses new WebSocket connections and closes the active
+// ones with GoingAway, giving their in-flight requests up to grace to
+// finish, then waits for subscription cleanup to complete.
+func (s *HttpServer) shutdownWebSockets(logger *zerolog.Logger, grace time.Duration) {
+	s.draining.Store(true)
+
+	var conns []*WsConnection
+	s.activeWsConns.Range(func(_, value interface{}) bool {
+		wsc := value.(*WsConnection)
+		wsc.stop(websocket.CloseGoingAway, "server shutting down", grace)
+		conns = append(conns, wsc)
 		return true
 	})
-
-	if count == 0 {
+	if len(conns) == 0 {
 		return
 	}
 
-	logger.Info().Int("connections", count).Msg("closing active WebSocket connections...")
-
-	var wg sync.WaitGroup
-	s.activeWsConns.Range(func(key, value interface{}) bool {
-		wsc := value.(*WsConnection)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			wsc.CloseWithGoingAway()
-		}()
-		s.activeWsConns.Delete(key)
-		return true
-	})
-
-	// Wait for all connections to close with a timeout
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		logger.Info().Int("connections", count).Msg("all WebSocket connections closed")
-	case <-time.After(10 * time.Second):
-		logger.Warn().Int("connections", count).Msg("timed out waiting for WebSocket connections to close")
+	logger.Info().Int("connections", len(conns)).Msg("closing active WebSocket connections...")
+	timeout := time.After(grace + 10*time.Second)
+	for _, wsc := range conns {
+		select {
+		case <-wsc.done:
+		case <-timeout:
+			logger.Warn().Int("connections", len(conns)).Msg("timed out waiting for WebSocket connections to close")
+			return
+		}
 	}
+	logger.Info().Int("connections", len(conns)).Msg("all WebSocket connections closed")
 }
 
 // conditionalGzipWriter wraps ResponseWriter and decides whether to compress
@@ -2399,6 +2413,74 @@ func stripAddrDecorations(s string) string {
 		return s[1 : len(s)-1]
 	}
 	return s
+}
+
+// applyForwardHeaders copies the request headers matching the project's
+// forwardHeaders patterns onto nq.
+func applyForwardHeaders(project *PreparedProject, nq *common.NormalizedRequest, headers http.Header) error {
+	if project == nil {
+		return nil
+	}
+	for _, matchKey := range project.Config.ForwardHeaders {
+		for key, values := range headers {
+			matches, err := common.WildcardMatch(matchKey, key)
+			if err != nil {
+				return err
+			}
+			if matches {
+				for _, value := range values {
+					nq.ForwardHeaders.Add(matchKey, value)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// isMethodAllowed applies the project's ignoreMethods / allowMethods
+// (allowMethods wins).
+func isMethodAllowed(project *PreparedProject, method string) (bool, error) {
+	if project == nil {
+		return true, nil
+	}
+	allowed := true
+	for _, m := range project.Config.IgnoreMethods {
+		match, err := common.WildcardMatch(m, method)
+		if err != nil {
+			return false, err
+		}
+		if match {
+			allowed = false
+			break
+		}
+	}
+	for _, m := range project.Config.AllowMethods {
+		match, err := common.WildcardMatch(m, method)
+		if err != nil {
+			return false, err
+		}
+		if match {
+			allowed = true
+			break
+		}
+	}
+	return allowed, nil
+}
+
+// applyRequestDirectives applies network directive defaults and then the
+// client's own directives from headers/query, subject to the project's
+// allowClientDirectives for the resolved user.
+func applyRequestDirectives(project *PreparedProject, nw *Network, nq *common.NormalizedRequest, headers http.Header, queryArgs map[string][]string) {
+	nq.ApplyDirectiveDefaults(nw.Config().DirectiveDefaults)
+	// Configure how to store User-Agent (raw vs simplified) based on project config
+	uaMode := common.UserAgentTrackingModeSimplified
+	if project != nil {
+		if project.Config.UserAgentMode != "" {
+			uaMode = project.Config.UserAgentMode
+		}
+		nq.SetAllowClientDirectiveMatcher(project.clientDirectiveMatcherFor(nq.User()))
+	}
+	nq.EnrichFromHttp(headers, queryArgs, uaMode)
 }
 
 // isAdminMethodBlocked returns true when the admin config's DenyMethods/AllowMethods

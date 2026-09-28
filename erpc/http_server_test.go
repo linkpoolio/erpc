@@ -8333,6 +8333,50 @@ func TestHttpServer_DrainStampsConnectionClose(t *testing.T) {
 	require.True(t, resp.Close, "drain-window responses must carry Connection: close so pooled clients migrate before Shutdown")
 }
 
+func TestHttpServer_IgnoredMethodKeepsRequestId(t *testing.T) {
+	util.ResetGock()
+	defer util.ResetGock()
+	util.SetupMocksForEvmStatePoller()
+
+	cfg := &common.Config{
+		Server: &common.ServerConfig{
+			MaxTimeout: common.Duration(5 * time.Second).Ptr(),
+		},
+		Projects: []*common.ProjectConfig{
+			{
+				Id:            "test_project",
+				IgnoreMethods: []string{"eth_getBalance"},
+				Networks: []*common.NetworkConfig{
+					{
+						Architecture: common.ArchitectureEvm,
+						Evm:          &common.EvmNetworkConfig{ChainId: 123},
+					},
+				},
+				Upstreams: []*common.UpstreamConfig{
+					{
+						Type:     common.UpstreamTypeEvm,
+						Endpoint: "http://rpc1.localhost",
+						Evm:      &common.EvmUpstreamConfig{ChainId: 123},
+					},
+				},
+			},
+		},
+		RateLimiters: &common.RateLimiterConfig{},
+	}
+
+	sendRequest, _, _, shutdown, _ := createServerTestFixtures(cfg, t)
+	defer shutdown()
+
+	statusCode, _, body := sendRequest(`{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x123","latest"],"id":7}`, nil, nil)
+	assert.Equal(t, http.StatusOK, statusCode)
+
+	var resp map[string]interface{}
+	require.NoError(t, json.Unmarshal([]byte(body), &resp))
+	assert.Equal(t, float64(7), resp["id"], "the error response must echo the request id")
+	errMap, _ := resp["error"].(map[string]interface{})
+	assert.Contains(t, errMap["message"], "method not supported")
+}
+
 func TestHttpServer_AdminMethodFilter(t *testing.T) {
 	const adminSecret = "test-secret"
 

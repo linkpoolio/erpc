@@ -21,11 +21,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// fakeWsServer is a minimal JSON-RPC WebSocket upstream. Each accepted
-// connection can be "black-holed": the TCP connection stays open but pings
-// are swallowed (no pong reply) and nothing is ever written — what an
-// intermediate proxy does when the upstream behind it vanishes without a
-// FIN/RST.
+// fakeWsServer is a minimal JSON-RPC WebSocket upstream whose connections
+// can be black-holed: TCP stays open but nothing, not even a pong, is
+// written back.
 type fakeWsServer struct {
 	t   *testing.T
 	srv *httptest.Server
@@ -173,11 +171,9 @@ func subscribeNewHeads(t *testing.T, c *WsJsonRpcClient, handler func(params []b
 	return sub.ID
 }
 
-// TestWsClientDetectsSilentPeerAndReconnects: the upstream socket dies
-// WITHOUT a close handshake (peer keeps TCP open but stops responding, as
-// a proxy black-holing frames does). The client must declare the
-// connection dead via the ping/pong liveness deadline, re-dial, and resume
-// delivering subscription notifications.
+// TestWsClientDetectsSilentPeerAndReconnects: a peer that keeps TCP open
+// but stops responding must be declared dead by the liveness deadline,
+// re-dialed, and resume delivering notifications.
 func TestWsClientDetectsSilentPeerAndReconnects(t *testing.T) {
 	compressWsLiveness(t)
 	server := newFakeWsServer(t)

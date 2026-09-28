@@ -3137,32 +3137,6 @@ func (n *Network) checkUpstreamBlockAvailability(ctx context.Context, u common.U
 	return nil, false
 }
 
-// methodSkipMultiplexing reports whether a JSON-RPC method should bypass
-// in-flight dedup. Multiplexing is correct for idempotent reads where N
-// concurrent identical requests can share one result. It is wrong for
-// transaction-broadcast methods: a client retrying a signed payload
-// expects each retry to actually re-submit, not to silently block on a
-// prior in-flight attempt. Worse, if a retrying client cancels at its
-// own context deadline before the leader returns, eRPC's failsafe
-// leader continues executing on its CopyForCancellable child for the
-// remainder of the network-level budget — and every retry the client
-// issues in that window stacks up as a follower of the doomed leader,
-// all timing out together when their parent contexts fire.
-//
-// Tx broadcasts already handle duplicate submissions via the idempotent-
-// broadcast post-forward hook (nonce-already-known → synthetic success
-// keyed by tx hash). Skipping multiplexing here costs nothing in
-// correctness: duplicate work resolves at the upstream layer with the
-// same guarantees, and retries are no longer serialised behind a slow
-// leader.
-func methodSkipMultiplexing(method string) bool {
-	switch method {
-	case "eth_sendRawTransaction", "eth_sendTransaction":
-		return true
-	}
-	return false
-}
-
 // eligibleUpstreamIDsForBoundary derives the block-availability "lane" for a
 // single-block request: the IDs of upstreams whose configured availability
 // bounds can serve the request's block. It feeds the selection policy's
@@ -3276,7 +3250,9 @@ func (n *Network) handleMultiplexing(ctx context.Context, lg *zerolog.Logger, re
 		return nil, nil, nil
 	}
 
-	if method, _ := req.Method(); methodSkipMultiplexing(method) {
+	// A non-retryable write (e.g. creating a filter) must reach an upstream
+	// once per call, so it is never shared with a concurrent identical call.
+	if method, _ := req.Method(); evm.IsNonRetryableWriteMethod(method) || svm.IsNonRetryableWriteMethod(method) {
 		return nil, nil, nil
 	}
 

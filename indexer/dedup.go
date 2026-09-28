@@ -93,6 +93,9 @@ func (w *DedupWindow) Mark(key string, removed bool) bool {
 		w.state[key] = removed
 		return true
 	}
+	// Decoded strings may alias the notification buffer; the window
+	// outlives it.
+	key = strings.Clone(key)
 	w.state[key] = removed
 	w.order = append(w.order, key)
 

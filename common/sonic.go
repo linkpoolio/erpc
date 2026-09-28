@@ -46,18 +46,7 @@ func init() {
 		panic(err)
 	}
 	SonicCfg = sonic.Config{
-		// CopyString must be true so that strings produced by Unmarshal
-		// own their backing memory. Sonic's default (false) constructs
-		// string headers that alias the source byte slice — fast, but
-		// any string retained beyond the lifetime of the source buffer
-		// keeps that entire buffer alive. The indexer stores parsed
-		// block hashes (and similar small strings) in long-lived ring
-		// buffers and dedup windows; with aliasing, each retained
-		// string pins its multi-KB source payload, turning short-lived
-		// notification buffers into a slow accumulating leak that
-		// scales with throughput rather than with the data actually
-		// kept. Paying the per-string copy is the correct trade.
-		CopyString:              true,
+		CopyString:              false,
 		NoNullSliceOrMap:        true,
 		NoQuoteTextMarshaler:    true,
 		NoValidateJSONMarshaler: true,

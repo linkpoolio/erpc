@@ -360,7 +360,7 @@ func (i *Indexer) dedupe(ns *networkState, ev *StreamEvent, removed bool) bool {
 				return false
 			}
 		}
-		ns.lastHead = &headMarker{num: ev.Block.Number, hash: ev.Block.Hash}
+		ns.lastHead = &headMarker{num: ev.Block.Number, hash: strings.Clone(ev.Block.Hash)}
 		return true
 	case KindLog, KindPendingTx:
 		ns.filterMu.RLock()

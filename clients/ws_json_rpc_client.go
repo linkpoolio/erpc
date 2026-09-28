@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -632,6 +633,8 @@ func (c *WsJsonRpcClient) handleMessage(message []byte, epoch uint64) {
 				go c.unsubscribeOrphan(subID, epoch)
 				return
 			}
+			// The id outlives the frame it was decoded from.
+			subID = strings.Clone(subID)
 			// Register before the next frame is read so no notification
 			// is dropped as belonging to an unknown subscription.
 			c.subHandlersMu.Lock()

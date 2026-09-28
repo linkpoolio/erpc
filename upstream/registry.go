@@ -428,7 +428,7 @@ func (u *UpstreamsRegistry) GetNetworkUpstreams(ctx context.Context, networkId s
 // Filters by:
 //   - Group == UpstreamGroupFallback (the operator's explicit fallback tag)
 //   - Bootstrapped (present in networkUpstreams via GetNetworkUpstreams)
-//   - Not hard-down (IsDown == false; circuit breaker is closed)
+//   - Not hard-down for method (IsDown: its circuit breaker is closed)
 //   - Method allowed (ShouldHandleMethod respects IgnoreMethods / AllowMethods)
 //
 // Critically does NOT filter by metricsTracker.IsCordoned. The caller's
@@ -444,7 +444,7 @@ func (u *UpstreamsRegistry) GetFallbackEscapeUpstreams(ctx context.Context, netw
 		if cfg == nil || !cfg.HasTag(common.TagTierFallback) {
 			continue
 		}
-		if up.IsDown() {
+		if up.IsDown(method) {
 			continue
 		}
 		if allowed, err := up.ShouldHandleMethod(method); err != nil || !allowed {

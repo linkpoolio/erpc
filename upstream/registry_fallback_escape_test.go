@@ -200,7 +200,3 @@ func TestGetFallbackEscapeUpstreams_NoFallbacksReturnsEmpty(t *testing.T) {
 	assert.Empty(t, out, "no fallback-group upstreams configured → empty slice")
 }
 
-// IsDown filter coverage: the IsDown filter is exercised indirectly via the
-// higher-level erpc.TestFailover_EscapeHatch end-to-end test (no clean
-// unit-level way to flip an Upstream's CB to open without driving real
-// failures through the failsafe stack from this package).

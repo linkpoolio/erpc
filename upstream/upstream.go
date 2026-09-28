@@ -420,16 +420,19 @@ func (u *Upstream) Config() *common.UpstreamConfig {
 	return u.config
 }
 
-func (u *Upstream) IsDown() bool {
+// IsDown reports whether the circuit breaker of the failsafe policy that
+// would serve method is open. Breakers scoped to other methods don't count.
+func (u *Upstream) IsDown(method string) bool {
 	if u == nil {
 		return true
 	}
-	for _, fe := range u.failsafeExecutors {
-		if br := fe.Breaker(); br != nil && br.State() == failsafe.StateOpen {
-			return true
-		}
+	req := common.NewNormalizedRequestFromJsonRpcRequest(common.NewJsonRpcRequest(method, nil))
+	fe := u.getFailsafeExecutor(req)
+	if fe == nil {
+		return false
 	}
-	return false
+	br := fe.Breaker()
+	return br != nil && br.State() == failsafe.StateOpen
 }
 
 func (u *Upstream) MetricsTracker() *health.Tracker {

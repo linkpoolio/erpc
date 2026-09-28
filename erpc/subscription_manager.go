@@ -394,7 +394,7 @@ func (s *subIngressSelector) Select(_networkId, _subType string, _params []inter
 		if !isWsEndpoint(cfg.Endpoint) {
 			continue
 		}
-		if up.IsDown() {
+		if up.IsDown("eth_subscribe") {
 			continue
 		}
 		name := "ws:" + up.Id()

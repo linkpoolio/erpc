@@ -360,6 +360,10 @@ func ResetGock() {
 	gock.CleanUnmatchedRequest()
 	gock.Disable()
 
+	// gock ANDs every registered networking filter and never clears them on
+	// its own, so a narrower filter added by one test would otherwise leak
+	// into every later test in the package.
+	gock.DisableNetworkingFilters()
 	gock.EnableNetworking()
 	gock.NetworkingFilter(func(req *http.Request) bool {
 		host := strings.Split(req.URL.Host, ":")[0]

@@ -17,8 +17,8 @@ import (
 
 // selfHealMockUpstream is a WS upstream whose connections can be killed
 // WITHOUT a WebSocket close handshake, and which keeps accepting fresh
-// connections afterwards — the moral equivalent of a fullnode pod being
-// deleted and recreated behind a still-healthy gateway.
+// connections afterwards — the moral equivalent of a node behind a
+// still-healthy proxy being replaced.
 type selfHealMockUpstream struct {
 	mu        sync.Mutex
 	conns     []*selfHealConn
@@ -194,12 +194,12 @@ func TestWebSocket_UpstreamDiesUngracefully_SelfHeals(t *testing.T) {
 	require.Equal(t, "eth_subscription", notif["method"])
 	require.Equal(t, clientSubID, notif["params"].(map[string]interface{})["subscription"])
 
-	// ── The incident ──────────────────────────────────────────────────
+	// ── Failure injection ─────────────────────────────────────────────
 	// Kill the upstream TCP connection with NO WebSocket close handshake.
 	_ = upConn1.conn.UnderlyingConn().Close()
 
-	// eRPC must re-dial (the gateway/httptest server is still up, exactly
-	// like the incident topology) ...
+	// eRPC must re-dial (the httptest server is still up, as with a proxy
+	// in front of a replaced node) ...
 	var upConn2 *selfHealConn
 	select {
 	case upConn2 = <-mock.connSeen:

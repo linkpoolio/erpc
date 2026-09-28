@@ -36,6 +36,21 @@ func init() {
 	util.ConfigureTestLogger()
 }
 
+// mockWriteMus serialises writes per mock-upstream connection: gorilla
+// supports one concurrent writer, and several mock handlers push
+// notifications from a goroutine while the read loop answers requests.
+var mockWriteMus sync.Map // *websocket.Conn -> *sync.Mutex
+
+// mockWriteJSON is the only way mock upstream handlers write to their
+// connection.
+func mockWriteJSON(conn *websocket.Conn, v interface{}) error {
+	muRaw, _ := mockWriteMus.LoadOrStore(conn, &sync.Mutex{})
+	mu := muRaw.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
+	return conn.WriteJSON(v)
+}
+
 // mockWsUpstream creates a test HTTP server that upgrades to WebSocket
 // and delegates all message handling to the provided callback.
 func mockWsUpstream(t *testing.T, handler func(conn *websocket.Conn)) *httptest.Server {
@@ -48,6 +63,7 @@ func mockWsUpstream(t *testing.T, handler func(conn *websocket.Conn)) *httptest.
 			return
 		}
 		defer c.Close()
+		defer mockWriteMus.Delete(c)
 		handler(c)
 	}))
 	return srv
@@ -155,11 +171,6 @@ func httpOnlyConfig() *common.Config {
 // setupGock sets up standard gock mocks (eth_getBalance) and EVM state poller stubs.
 func setupGock() {
 	util.ResetGock()
-	gock.EnableNetworking()
-	gock.NetworkingFilter(func(req *http.Request) bool {
-		shouldMakeRealCall := strings.Split(req.URL.Host, ":")[0] == "127.0.0.1"
-		return shouldMakeRealCall
-	})
 	util.SetupMocksForEvmStatePoller()
 
 	gock.New("http://rpc1.localhost").
@@ -269,16 +280,16 @@ func standardMockWsHandler(conn *websocket.Conn, customHandler func(method strin
 
 		switch method {
 		case "eth_chainId":
-			conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x7b"})
+			mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x7b"})
 		case "eth_getBlockByNumber":
-			conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": map[string]interface{}{"number": "0x100", "timestamp": "0x6702a8f0"}})
+			mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": map[string]interface{}{"number": "0x100", "timestamp": "0x6702a8f0"}})
 		case "eth_syncing":
-			conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": false})
+			mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": false})
 		default:
 			if customHandler != nil {
 				customHandler(method, id, req)
 			} else {
-				conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x1"})
+				mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x1"})
 			}
 		}
 	}
@@ -519,10 +530,6 @@ func TestWebSocket_ErrorHandling(t *testing.T) {
 	// Verifies upstream JSON-RPC errors are forwarded to the client
 	t.Run("UpstreamError", func(t *testing.T) {
 		util.ResetGock()
-		gock.EnableNetworking()
-		gock.NetworkingFilter(func(req *http.Request) bool {
-			return strings.Split(req.URL.Host, ":")[0] == "127.0.0.1"
-		})
 		util.SetupMocksForEvmStatePoller()
 		defer util.ResetGock()
 
@@ -623,11 +630,11 @@ func TestWebSocket_Subscriptions(t *testing.T) {
 				switch method {
 				case "eth_subscribe":
 					subId := "0xdeadbeef12345678"
-					conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": subId})
+					mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": subId})
 
 					go func() {
 						time.Sleep(200 * time.Millisecond)
-						conn.WriteJSON(map[string]interface{}{
+						mockWriteJSON(conn, map[string]interface{}{
 							"jsonrpc": "2.0",
 							"method":  "eth_subscription",
 							"params": map[string]interface{}{
@@ -641,9 +648,9 @@ func TestWebSocket_Subscriptions(t *testing.T) {
 						}
 					}()
 				case "eth_unsubscribe":
-					conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": true})
+					mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": true})
 				default:
-					conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x1"})
+					mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x1"})
 				}
 			})
 		})
@@ -730,9 +737,9 @@ func TestWebSocket_Subscriptions(t *testing.T) {
 			standardMockWsHandler(conn, func(method string, id interface{}, req map[string]interface{}) {
 				switch method {
 				case "eth_subscribe":
-					conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0xsub123"})
+					mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0xsub123"})
 				default:
-					conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x1"})
+					mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x1"})
 				}
 			})
 		})
@@ -778,9 +785,9 @@ func TestWebSocket_UpstreamClient(t *testing.T) {
 			standardMockWsHandler(conn, func(method string, id interface{}, req map[string]interface{}) {
 				switch method {
 				case "eth_getBalance":
-					conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0xws_upstream_balance"})
+					mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0xws_upstream_balance"})
 				default:
-					conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x1"})
+					mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x1"})
 				}
 			})
 		})
@@ -857,7 +864,7 @@ func TestWebSocket_UpstreamClient(t *testing.T) {
 				id := req["id"]
 				method, _ := req["method"].(string)
 				if method == "eth_chainId" {
-					conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x7b"})
+					mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x7b"})
 				}
 				time.Sleep(100 * time.Millisecond)
 				conn.Close()
@@ -868,9 +875,9 @@ func TestWebSocket_UpstreamClient(t *testing.T) {
 			standardMockWsHandler(conn, func(method string, id interface{}, req map[string]interface{}) {
 				switch method {
 				case "eth_getBalance":
-					conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0xreconnected"})
+					mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0xreconnected"})
 				default:
-					conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x1"})
+					mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x1"})
 				}
 			})
 		})
@@ -921,20 +928,20 @@ func TestWebSocket_SubscriptionRecovery(t *testing.T) {
 
 				switch method {
 				case "eth_chainId":
-					conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x7b"})
+					mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x7b"})
 				case "eth_getBlockByNumber":
-					conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": map[string]interface{}{"number": "0x1"}})
+					mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": map[string]interface{}{"number": "0x1"}})
 				case "eth_syncing":
-					conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": false})
+					mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": false})
 				case "eth_subscribe":
-					conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0xsub123"})
+					mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0xsub123"})
 					// Wait for signal then kill the connection
 					go func() {
 						<-closeUpstream
 						conn.Close()
 					}()
 				default:
-					conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x1"})
+					mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x1"})
 				}
 			}
 		})
@@ -1019,13 +1026,13 @@ func TestWebSocket_SubscriptionDedup(t *testing.T) {
 					subscribeCount++
 					count := subscribeCount
 					subMu.Unlock()
-					conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": upstreamSubId})
+					mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": upstreamSubId})
 
 					// Send a notification only on first subscribe to avoid duplicates
 					if count == 1 {
 						go func() {
 							time.Sleep(500 * time.Millisecond)
-							conn.WriteJSON(map[string]interface{}{
+							mockWriteJSON(conn, map[string]interface{}{
 								"jsonrpc": "2.0",
 								"method":  "eth_subscription",
 								"params": map[string]interface{}{
@@ -1036,9 +1043,9 @@ func TestWebSocket_SubscriptionDedup(t *testing.T) {
 						}()
 					}
 				case "eth_unsubscribe":
-					conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": true})
+					mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": true})
 				default:
-					conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x1"})
+					mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x1"})
 				}
 			})
 		})
@@ -1221,9 +1228,9 @@ func TestWebSocket_GracefulShutdown(t *testing.T) {
 			standardMockWsHandler(conn, func(method string, id interface{}, req map[string]interface{}) {
 				switch method {
 				case "eth_subscribe":
-					conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0xshutdownsub"})
+					mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0xshutdownsub"})
 				default:
-					conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x1"})
+					mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x1"})
 				}
 			})
 		})
@@ -1376,9 +1383,9 @@ func TestWebSocket_RegressionBootstrapRetriedOnEverySubscribe(t *testing.T) {
 			switch method {
 			case "eth_subscribe":
 				atomic.AddInt64(&subscribeCount, 1)
-				conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0xabc"})
+				mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0xabc"})
 			default:
-				conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x1"})
+				mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x1"})
 			}
 		})
 	})
@@ -1429,7 +1436,7 @@ func TestWebSocket_RegressionSuggestLatestBlockOnEveryUpstream(t *testing.T) {
 	upSubId := "0xupsub"
 
 	deliverNotification := func(conn *websocket.Conn, blockHash string) {
-		conn.WriteJSON(map[string]interface{}{
+		mockWriteJSON(conn, map[string]interface{}{
 			"jsonrpc": "2.0",
 			"method":  "eth_subscription",
 			"params": map[string]interface{}{
@@ -1447,13 +1454,13 @@ func TestWebSocket_RegressionSuggestLatestBlockOnEveryUpstream(t *testing.T) {
 			standardMockWsHandler(conn, func(method string, id interface{}, req map[string]interface{}) {
 				switch method {
 				case "eth_subscribe":
-					conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": upSubId})
+					mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": upSubId})
 					go func() {
 						time.Sleep(300 * time.Millisecond)
 						deliverNotification(conn, "0xsamehash")
 					}()
 				default:
-					conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x1"})
+					mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x1"})
 				}
 			})
 		})
@@ -1501,7 +1508,7 @@ func TestWebSocket_RegressionFilterFanOutAcrossUpstreams(t *testing.T) {
 	logSubId := "0xlogsub"
 
 	deliverLog := func(conn *websocket.Conn, blockHash, txHash, logIndex string) {
-		conn.WriteJSON(map[string]interface{}{
+		mockWriteJSON(conn, map[string]interface{}{
 			"jsonrpc": "2.0",
 			"method":  "eth_subscription",
 			"params": map[string]interface{}{
@@ -1529,17 +1536,17 @@ func TestWebSocket_RegressionFilterFanOutAcrossUpstreams(t *testing.T) {
 					params, _ := req["params"].([]interface{})
 					if len(params) > 0 && params[0] == "logs" {
 						atomic.AddInt64(&subscribeCount, 1)
-						conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": logSubId})
+						mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": logSubId})
 						go func() {
 							time.Sleep(300 * time.Millisecond)
 							// Both upstreams deliver the same log.
 							deliverLog(conn, "0xblock1", "0xtx1", "0x0")
 						}()
 					} else {
-						conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0xothersub"})
+						mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0xothersub"})
 					}
 				default:
-					conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x1"})
+					mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x1"})
 				}
 			})
 		})
@@ -1594,11 +1601,11 @@ func TestWebSocket_RegressionUnsubscribeDoesNotPanicOnReconnect(t *testing.T) {
 			if method == "eth_subscribe" {
 				params, _ := req["params"].([]interface{})
 				if len(params) > 0 && params[0] == "logs" {
-					conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": logSubId})
+					mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": logSubId})
 					return
 				}
 			}
-			conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0xothersub"})
+			mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0xothersub"})
 		})
 	})
 	defer mockUpstream.Close()
@@ -1652,10 +1659,10 @@ func TestWebSocket_RegressionInternalRequestIdsDontCollide(t *testing.T) {
 					subscribeIds = append(subscribeIds, int64(f))
 				}
 				idMu.Unlock()
-				conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0xabc"})
+				mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0xabc"})
 				return
 			}
-			conn.WriteJSON(map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x1"})
+			mockWriteJSON(conn, map[string]interface{}{"jsonrpc": "2.0", "id": id, "result": "0x1"})
 		})
 	})
 	defer mockUpstream.Close()

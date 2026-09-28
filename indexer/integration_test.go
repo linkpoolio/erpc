@@ -142,7 +142,7 @@ func headEvent(networkID, sourceID string, num int64, hash, parent string) index
 		Kind:      indexer.KindNewHead,
 		NetworkId: networkID,
 		SourceId:  sourceID,
-		Block:     indexer.BlockRef{Number: num, Hash: hash, ParentHash: parent},
+		Block:     indexer.BlockRef{Number: num, Hash: hash},
 		Payload:   payload,
 	}
 }

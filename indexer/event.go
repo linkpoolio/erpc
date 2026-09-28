@@ -1,9 +1,6 @@
 package indexer
 
-import (
-	"encoding/json"
-	"time"
-)
+import "encoding/json"
 
 // EventKind is a tagged-union discriminant for events flowing through the
 // indexer pipeline. Separate types for each kind would force sum-type
@@ -40,15 +37,14 @@ func (k EventKind) String() string {
 // BlockRef identifies a block on a network. Zero-valued for KindPendingTx
 // (pending txs don't carry a block reference until mined).
 type BlockRef struct {
-	Number     int64
-	Hash       string
-	ParentHash string
+	Number int64
+	Hash   string
 }
 
 // Zero reports whether the BlockRef is the zero value — i.e. no block
 // reference is attached (pending tx).
 func (b BlockRef) Zero() bool {
-	return b.Number == 0 && b.Hash == "" && b.ParentHash == ""
+	return b.Number == 0 && b.Hash == ""
 }
 
 // StreamEvent is what an ingress emits. It is pre-dedup and may duplicate
@@ -72,8 +68,6 @@ type StreamEvent struct {
 	// quirks and to let non-JSON egresses (protobuf, flatbuf) decode once
 	// and cache beside the event.
 	Payload json.RawMessage
-	// ObservedAt is set by ingresses; the indexer does not read it.
-	ObservedAt time.Time
 }
 
 // IndexedEvent is what the Indexer emits to every registered egress after

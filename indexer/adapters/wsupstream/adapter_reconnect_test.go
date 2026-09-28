@@ -27,7 +27,6 @@ import (
 type fakeNetworkHandle struct{}
 
 func (fakeNetworkHandle) Id() string                                        { return "evm:123" }
-func (fakeNetworkHandle) FinalityDepth() int64                              { return 0 }
 func (fakeNetworkHandle) SuggestLatestBlock(string, int64, json.RawMessage) {}
 
 type fakeSink struct {
@@ -287,9 +286,7 @@ func TestAdapterResubscribesAllFiltersAfterReconnect(t *testing.T) {
 	}
 	delivered := make(map[string]bool)
 	for len(delivered) < numFilters {
-		if ev := nextEvent(t, sink, indexer.KindLog); ev.Block.Number == 2 {
-			delivered[ev.FilterHash] = true
-		}
+		delivered[nextEvent(t, sink, indexer.KindLog).FilterHash] = true
 	}
 
 	select {

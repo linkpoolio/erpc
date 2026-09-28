@@ -14,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/erpc/erpc/clients"
@@ -70,10 +69,6 @@ type Adapter struct {
 
 	nw   indexer.NetworkHandle
 	sink indexer.Sink
-
-	// stopped is also read by notification handlers, which can run until
-	// Stop has released their subscriptions.
-	stopped atomic.Bool
 
 	// subsMu guards all mutable state below. Never held across an RPC.
 	subsMu sync.Mutex
@@ -204,7 +199,7 @@ func (a *Adapter) startResubscribe() {
 	epoch := a.wsClient.Epoch()
 	a.subsMu.Lock()
 	defer a.subsMu.Unlock()
-	if epoch == 0 || epoch == a.resubEpoch || a.stopped.Load() {
+	if epoch == 0 || epoch == a.resubEpoch {
 		return
 	}
 	if a.resubCancel != nil {
@@ -255,30 +250,6 @@ func (a *Adapter) RemoveFilter(ctx context.Context, subType, paramsHash string) 
 	delete(a.filters, key)
 	a.subsMu.Unlock()
 	if ok {
-		a.drop(ctx, &sub.upstreamSub)
-	}
-	return nil
-}
-
-// Stop tears down all upstream subscriptions and removes the reconnect
-// hook. Best-effort — upstream RPCs may fail if the connection is
-// already gone; we only care that the adapter's state is released.
-func (a *Adapter) Stop(ctx context.Context) error {
-	cbID := a.Name()
-	a.wsClient.RemoveOnReconnect(cbID)
-	a.wsClient.RemoveOnDisconnect(cbID)
-	a.stopped.Store(true)
-
-	a.subsMu.Lock()
-	if a.resubCancel != nil {
-		a.resubCancel()
-	}
-	subs := a.filters
-	a.filters = make(map[string]*filterSub)
-	a.subsMu.Unlock()
-
-	a.drop(ctx, &a.heads)
-	for _, sub := range subs {
 		a.drop(ctx, &sub.upstreamSub)
 	}
 	return nil
@@ -370,7 +341,7 @@ func (a *Adapter) subscribeFilterLocked(ctx context.Context, sub *filterSub) err
 // otherwise it is released so nothing is left subscribed upstream.
 func (a *Adapter) subscribeLocked(ctx context.Context, sub *upstreamSub, params []interface{}, handler func(params []byte)) error {
 	a.subsMu.Lock()
-	skip := sub.id != "" || sub.removed || a.stopped.Load()
+	skip := sub.id != "" || sub.removed
 	a.subsMu.Unlock()
 	if skip {
 		return nil
@@ -389,7 +360,7 @@ func (a *Adapter) subscribeLocked(ctx context.Context, sub *upstreamSub, params 
 
 	a.subsMu.Lock()
 	connUp := ws.Epoch == a.wsClient.Epoch()
-	commit := connUp && !sub.removed && !a.stopped.Load()
+	commit := connUp && !sub.removed
 	if commit {
 		sub.id, sub.epoch = ws.ID, ws.Epoch
 	}
@@ -449,9 +420,6 @@ func (a *Adapter) send(ctx context.Context, method string, params []interface{})
 // handleNewHeads converts a newHeads notification into a StreamEvent and
 // pushes it at the indexer's Sink.
 func (a *Adapter) handleNewHeads(raw []byte) {
-	if a.stopped.Load() {
-		return
-	}
 	var outer struct {
 		Subscription string          `json:"subscription"`
 		Result       json.RawMessage `json:"result"`
@@ -461,9 +429,8 @@ func (a *Adapter) handleNewHeads(raw []byte) {
 		return
 	}
 	var header struct {
-		Number     string `json:"number"`
-		Hash       string `json:"hash"`
-		ParentHash string `json:"parentHash"`
+		Number string `json:"number"`
+		Hash   string `json:"hash"`
 	}
 	if err := common.SonicCfg.Unmarshal(outer.Result, &header); err != nil {
 		a.logger.Warn().Err(err).Msg("failed to parse newHeads result")
@@ -475,20 +442,16 @@ func (a *Adapter) handleNewHeads(raw []byte) {
 		return
 	}
 	a.sink.Ingest(indexer.StreamEvent{
-		Kind:       indexer.KindNewHead,
-		NetworkId:  a.networkID,
-		SourceId:   a.Name(),
-		Block:      indexer.BlockRef{Number: num, Hash: header.Hash, ParentHash: header.ParentHash},
-		Payload:    outer.Result,
-		ObservedAt: time.Now(),
+		Kind:      indexer.KindNewHead,
+		NetworkId: a.networkID,
+		SourceId:  a.Name(),
+		Block:     indexer.BlockRef{Number: num, Hash: header.Hash},
+		Payload:   outer.Result,
 	})
 }
 
 // handleFilter converts a filter notification into a StreamEvent.
 func (a *Adapter) handleFilter(subType, paramsHash string, raw []byte) {
-	if a.stopped.Load() {
-		return
-	}
 	var outer struct {
 		Subscription string          `json:"subscription"`
 		Result       json.RawMessage `json:"result"`
@@ -507,20 +470,6 @@ func (a *Adapter) handleFilter(subType, paramsHash string, raw []byte) {
 		SourceId:   a.Name(),
 		FilterHash: paramsHash,
 		Payload:    outer.Result,
-		ObservedAt: time.Now(),
-	}
-	// For logs, opportunistically extract the BlockRef so the indexer
-	// can lifecycle-tag it and feed the canonical-chain tracker.
-	if kind == indexer.KindLog {
-		var logProbe struct {
-			BlockNumber string `json:"blockNumber"`
-			BlockHash   string `json:"blockHash"`
-		}
-		if err := common.SonicCfg.Unmarshal(outer.Result, &logProbe); err == nil {
-			if n, err := common.HexToInt64(logProbe.BlockNumber); err == nil {
-				ev.Block = indexer.BlockRef{Number: n, Hash: logProbe.BlockHash}
-			}
-		}
 	}
 	a.sink.Ingest(ev)
 }

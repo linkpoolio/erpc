@@ -252,7 +252,7 @@ func enforceNonNullBlock(ctx context.Context, nq *common.NormalizedRequest, nr *
 	// isn't produced/confirmed yet and legitimately returns null on every upstream —
 	// it isn't missing/pruned data, so don't convert it to an error and churn retries.
 	// Mirrors the upstream-level markUnexpectedEmpty guard so the two layers agree.
-	if emptyResultBeyondConfidence(ctx, nq) {
+	if EmptyResultBeyondConfidence(ctx, nq) {
 		return nr, nil
 	}
 

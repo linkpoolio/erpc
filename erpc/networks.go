@@ -2296,12 +2296,15 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 			maxLoopIterations = 1
 		}
 		attempted := make(map[string]struct{}, maxLoopIterations)
-		// Capture the pre-escalation upsList size for the error reporting
-		// path below. If the per-request fallback escape hatch fires, we
-		// replace upsList with the appended fallback set, but the
-		// ErrUpstreamsExhausted.upstreams field is meant to describe the
-		// routable set the policy selected — not the escape-hatch override.
-		originalUpsListLen := len(upsList)
+		// The fallback escape below swaps in a pick over its own local list,
+		// leaving the request's routed list untouched for later retries.
+		nextUpstream := effectiveReq.NextUpstream
+		// An empty result is a miss (rather than a legitimate answer, like a
+		// pending tx's null receipt) only for a concrete block the network is
+		// confident about.
+		emptyIsMiss := func(ctx context.Context) bool {
+			return requestBlockNumber(ctx, effectiveReq) > 0 && !evm.EmptyResultBeyondConfidence(ctx, effectiveReq)
+		}
 
 	escalationLoop:
 		for {
@@ -2323,7 +2326,7 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 					return nil, cause
 				}
 
-				u, selErr := effectiveReq.NextUpstream()
+				u, selErr := nextUpstream()
 				if selErr != nil {
 					loopSpan.SetAttributes(
 						attribute.Bool("upstreams_exhausted", true),
@@ -2365,13 +2368,12 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 				// Pre-forward: block availability gating → skip to next upstream
 				if skipErr, isRetryable := n.checkUpstreamBlockAvailability(loopCtx, u, effectiveReq, method); skipErr != nil {
 					n.handleBlockSkip(loopCtx, loopSpan, &ulg, u, effectiveReq, method, skipErr, isRetryable)
-					// Track the skip as the loop's last error so the per-request
-					// fallback escape hatch (after the loop) can see it. Record
-					// BOTH retryable and non-retryable skips: "non-retryable"
-					// means "don't retry the SAME upstream", not "don't try OTHER
-					// upstreams" — exactly what the escape hatch is for, and
-					// fallbacks ahead of a stalled primary need this path reachable.
-					lastErr = skipErr
+					// Seen by the fallback escape below: "non-retryable" means
+					// "don't retry this upstream", not "don't try others". A
+					// consensus slot keeps reporting a skip as no attempt.
+					if !oneUpstreamOnly {
+						lastErr = skipErr
+					}
 					loopSpan.End()
 					continue
 				}
@@ -2448,16 +2450,11 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 					common.SetTraceSpanError(loopSpan, err)
 				} else if r != nil {
 					bestResp = r
-					if r.IsResultEmptyish() {
-						// Soft miss (e.g. eth_getBlockByNumber null): seed
-						// lastErr so the fallback escape hatch can fire after
-						// primaries are exhausted. Without this, emptyish
-						// responses leave lastErr nil and block escalation.
+					loopSpan.SetStatus(codes.Ok, "")
+					if r.IsResultEmptyish() && emptyIsMiss(loopCtx) {
 						lastErr = common.NewErrEndpointMissingData(
 							fmt.Errorf("upstream responded emptyish"), u,
 						)
-					} else {
-						loopSpan.SetStatus(codes.Ok, "")
 					}
 				}
 				loopSpan.End()
@@ -2495,70 +2492,45 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 				return nil, cause
 			}
 
-			// === Per-request fallback escape hatch ===
-			//
-			// If the inner loop exhausted upsList with a retryable error (the
-			// selectionPolicy has cordoned fallbacks while primaries are down)
-			// and failover is enabled, append the fallback-tier upstreams that
-			// are bootstrapped + CB-closed + method-allowed and re-enter the
-			// inner loop once. The client gets the fallback's response on the
-			// same call that would otherwise return ErrUpstreamsExhausted.
-			//
-			// Bounds:
-			//   - At most one escalation per request (MarkEscalatedToFallbacks).
-			//   - Emptyish bestResp still escapes: methods like
-			//     eth_getBlockByNumber return null for missing blocks without
-			//     setting err, and that soft miss must escalate to fallbacks
-			//     the same way a gate-reject does. Non-empty bestResp means we
-			//     already have a usable candidate — leave it for failsafe.
-			//   - Deterministic client errors return from the inner loop
-			//     immediately, so any non-nil lastErr here means "this upstream
-			//     couldn't serve; try a different one" — exactly the escape's job.
-			//   - Consensus requires strict per-upstream semantics; don't modify
-			//     the candidate set mid-execution.
-			bestRespEmptyish := bestResp != nil && bestResp.IsResultEmptyish()
-			if (bestResp == nil || bestRespEmptyish) &&
-				!effectiveReq.HasEscalatedToFallbacks() &&
-				lastErr != nil &&
-				n.cfg.Failover != nil && n.cfg.Failover.Enabled() &&
-				!failsafeExecutor.HasConsensus() {
-
-				fallbacks := n.upstreamsRegistry.GetFallbackEscapeUpstreams(
-					execSpanCtx, n.networkId, method,
-				)
-				if len(fallbacks) > 0 {
-					// Replace upsList with ALL eligible fallbacks. Clear their
-					// stored errors and consumed reservations so NextUpstream
-					// re-selects them; primaries are removed from upsList so they
-					// won't be picked again, but their state in attempted /
-					// ErrorsByUpstream is preserved for eventual error reporting.
-					if bestRespEmptyish {
+			// Per-request fallback escape: once the routed upstreams are
+			// exhausted without a usable result, sweep the fallback tier
+			// (bootstrapped, not down, method-allowed) not yet tried here, at
+			// most once per request. An error every upstream would repeat
+			// (non-retryable toward the network) does not escalate, and
+			// consensus keeps its fixed participant set.
+			if (bestResp == nil || (bestResp.IsResultEmptyish() && emptyIsMiss(execSpanCtx))) &&
+				lastErr != nil && common.IsRetryableTowardNetwork(lastErr) &&
+				n.cfg.Failover.Enabled() && !failsafeExecutor.HasConsensus() {
+				var fallbacks []common.Upstream
+				for _, fb := range n.upstreamsRegistry.GetFallbackEscapeUpstreams(execSpanCtx, n.networkId, method) {
+					if _, seen := attempted[fb.Id()]; !seen {
+						fallbacks = append(fallbacks, fb)
+					}
+				}
+				if len(fallbacks) > 0 && effectiveReq.MarkEscalatedToFallbacks() {
+					if bestResp != nil {
 						bestResp.Release()
 						bestResp = nil
 					}
-					fbCommon := make([]common.Upstream, 0, len(fallbacks))
-					for _, fb := range fallbacks {
-						fbCommon = append(fbCommon, fb)
-						effectiveReq.ErrorsByUpstream.Delete(common.Upstream(fb))
-						effectiveReq.ConsumedUpstreams.Delete(common.Upstream(fb))
-					}
-					effectiveReq.SetUpstreams(fbCommon)
-					upsList = fbCommon
-					maxLoopIterations = len(fallbacks)
-					attempted = make(map[string]struct{}, len(fallbacks))
-					effectiveReq.MarkEscalatedToFallbacks()
-					// Reset lastErr so the next pass either replaces it (new
-					// failure) or leaves it nil (success).
 					lastErr = nil
+					maxLoopIterations = len(fallbacks)
+					nextUpstream = func() (common.Upstream, error) {
+						for len(fallbacks) > 0 {
+							fb := fallbacks[0]
+							fallbacks = fallbacks[1:]
+							// Skip one a sibling hedge is already running.
+							if _, loaded := effectiveReq.ConsumedUpstreams.LoadOrStore(fb, true); !loaded {
+								return fb, nil
+							}
+						}
+						return nil, common.NewErrNoUpstreamsLeftToSelect(effectiveReq, "no more fallback upstreams left")
+					}
 
 					telemetry.MetricNetworkFallbackEscapeTotal.WithLabelValues(
 						n.projectId, n.Label(), method,
 					).Inc()
-
 					lg.Debug().
-						Str("networkId", n.networkId).
-						Str("method", method).
-						Int("fallbacks", len(fallbacks)).
+						Int("fallbacks", maxLoopIterations).
 						Msg("activated per-request fallback escape after primary set exhausted")
 
 					continue escalationLoop
@@ -2601,7 +2573,7 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 			s.Attempts,
 			s.Retries,
 			s.Hedges,
-			originalUpsListLen,
+			len(upsList),
 		)
 		common.SetTraceSpanError(execSpan, exhaustedErr)
 		return nil, exhaustedErr

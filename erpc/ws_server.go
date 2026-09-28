@@ -131,6 +131,16 @@ func (s *HttpServer) handleWebSocket(
 	wsc.Close()
 }
 
+// isWebSocketUpgradeRequest reports whether r is a WebSocket opening
+// handshake (RFC 6455 section 4.1: a GET carrying the "upgrade" Connection
+// token and the "websocket" Upgrade token, both case-insensitive). Every place
+// that treats a request differently because it is an upgrade must use this one
+// check, so a request that only resembles an upgrade is never exempted from
+// what applies to ordinary HTTP requests.
+func isWebSocketUpgradeRequest(r *http.Request) bool {
+	return r.Method == http.MethodGet && websocket.IsWebSocketUpgrade(r)
+}
+
 // checkWsOrigin validates the WebSocket upgrade request origin against
 // the project's CORS policy. If no CORS config is set, all origins are allowed.
 func checkWsOrigin(r *http.Request, project *PreparedProject) bool {

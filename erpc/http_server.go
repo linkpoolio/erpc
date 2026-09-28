@@ -26,7 +26,6 @@ import (
 	"github.com/erpc/erpc/indexer"
 	"github.com/erpc/erpc/telemetry"
 	"github.com/erpc/erpc/util"
-	"github.com/gorilla/websocket"
 	"github.com/klauspost/compress/gzip"
 	"github.com/rs/zerolog"
 	"go.opentelemetry.io/otel/attribute"
@@ -385,7 +384,7 @@ func (s *HttpServer) createRequestHandler() http.Handler {
 		}
 
 		// WebSocket upgrade: handle before body reading since WS upgrades don't have a JSON body
-		if websocket.IsWebSocketUpgrade(r) {
+		if isWebSocketUpgradeRequest(r) {
 			s.handleWebSocket(httpCtx, w, r, &lg, project, architecture, chainId)
 			return
 		}
@@ -1080,7 +1079,7 @@ func (s *HttpServer) parseUrlPath(
 		return "", "", "", false, false, common.NewErrInvalidUrlPath("architecture is not valid (must be 'evm' or 'svm')", ps)
 	}
 
-	if !isPost && !isOptions && r.Header.Get("Upgrade") != "websocket" {
+	if !isPost && !isOptions && !isWebSocketUpgradeRequest(r) {
 		isHealthCheck = true
 	}
 
@@ -2244,6 +2243,14 @@ func gzipHandler(next http.Handler) http.Handler {
 	var gzPool = util.NewGzipWriterPool()
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A WebSocket handshake has no body to compress and must reach the
+		// upgrader with a ResponseWriter that can be hijacked, which the
+		// gzip writer cannot.
+		if isWebSocketUpgradeRequest(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		// The response representation depends on Accept-Encoding, so caches
 		// must be told regardless of whether this response ends up compressed.
 		w.Header().Set("Vary", "Accept-Encoding")

@@ -34,13 +34,9 @@ type timeoutHandler struct {
 }
 
 func (h *timeoutHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// WebSocket upgrades need direct access to the underlying connection via Hijack().
-	// The timeout writer buffers responses and doesn't implement http.Hijacker,
-	// so we bypass the timeout handler entirely for WS connections.
-	// WS connections are long-lived and use their own ping/pong for liveness;
-	// each request carried over one is bounded by the same max timeout in
-	// ws_server.go. Only a genuine upgrade handshake qualifies — any other
-	// request that merely carries an Upgrade header stays under the deadline.
+	// The timeout writer cannot be hijacked, which a WebSocket upgrade
+	// needs. Each request over the connection gets the same deadline in
+	// ws_server.go instead.
 	if isWebSocketUpgradeRequest(r) {
 		h.handler.ServeHTTP(w, r)
 		return

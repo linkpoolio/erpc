@@ -244,10 +244,9 @@ func NewHttpServer(
 		if srv.serverV6 != nil {
 			srv.serverV6.SetKeepAlivesEnabled(false)
 		}
-		// Hijacked WebSocket connections are not drained by the above, and
-		// subscriptions stop receiving events once upstream ingress stops, so
-		// close them now: clients reconnect to healthy instances while
-		// in-flight requests get the grace window to finish.
+		// Hijacked WebSocket connections are not affected by the above, so
+		// close them now: clients reconnect elsewhere while in-flight
+		// requests get the grace window to finish.
 		var grace time.Duration
 		if srv.serverCfg.WaitBeforeShutdown != nil {
 			grace = srv.serverCfg.WaitBeforeShutdown.Duration()
@@ -392,9 +391,8 @@ func (s *HttpServer) createRequestHandler() http.Handler {
 			}
 		}
 
-		// WebSocket upgrade: handle before body reading since WS upgrades don't have a JSON body
+		// A WebSocket connection serves the one network in its URL.
 		if isWebSocketUpgradeRequest(r) {
-			// A connection serves one network; there is no per-message network.
 			if architecture == "" || chainId == "" {
 				handleErrorResponse(
 					httpCtx,
@@ -2002,9 +2000,6 @@ func (s *HttpServer) createTLSConfig() (*tls.Config, error) {
 func (s *HttpServer) Shutdown(logger *zerolog.Logger) error {
 	logger.Info().Msg("stopping http servers...")
 
-	// Close all active WebSocket connections first with GoingAway status.
-	// This sends a close frame to clients so they know to reconnect,
-	// and cleans up all subscriptions before the HTTP server stops.
 	s.shutdownWebSockets(logger, 0)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

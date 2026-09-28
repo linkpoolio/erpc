@@ -75,16 +75,21 @@ type WsJsonRpcClient struct {
 	connMu      sync.Mutex
 	conn        *websocket.Conn
 	connectedAt time.Time
+	// epoch identifies the current connection (0 while disconnected);
+	// written under connMu, epochs counts connections ever installed.
+	epoch  atomic.Uint64
+	epochs uint64
 
 	// Write synchronization (gorilla/websocket requires synchronized writes)
 	writeMu sync.Mutex
 
-	// Pending request tracking: wire id -> response channel. Whoever
-	// deletes an entry owns it, so duplicate responses are dropped.
+	// Pending request tracking: wire id -> request. Whoever deletes an
+	// entry owns it, so duplicate responses are dropped.
 	pendingMu sync.Mutex
-	pending   map[string]chan *wsPendingResult
+	pending   map[string]*wsPending
 
-	// Subscription notification callbacks: upstreamSubID -> handler
+	// Subscription notification callbacks: upstreamSubID -> handler, for
+	// the current connection only (ids are connection-scoped).
 	subHandlersMu sync.RWMutex
 	subHandlers   map[string]func(params []byte)
 
@@ -101,8 +106,6 @@ type WsJsonRpcClient struct {
 	// Error extractor for architecture-specific error normalization
 	errorExtractor common.JsonRpcErrorExtractor
 
-	connected atomic.Bool
-
 	// metricLabels are the labels the connectivity gauge was last set under.
 	metricMu     sync.Mutex
 	metricLabels []string
@@ -111,6 +114,39 @@ type WsJsonRpcClient struct {
 	// concurrent requests with the same caller-supplied id do not collide
 	// in pending. The caller's id is restored on the response.
 	wireIDCounter atomic.Uint64
+}
+
+// WsSubscription ties an eth_subscribe or eth_unsubscribe request to the
+// connection it is scoped to. The client only sends these methods when the
+// request context carries one (see WithWsSubscription): a subscription
+// created by a routed request would have no owner to receive or cancel it.
+type WsSubscription struct {
+	// Handler receives the subscription's notifications (eth_subscribe
+	// only). It is registered before the next frame is read, so nothing
+	// sent right after the subscribe response is missed.
+	Handler func(params []byte)
+	// ID and Epoch are set when an eth_subscribe succeeds. eth_unsubscribe
+	// must carry the Epoch of the subscription it cancels; it is not sent
+	// once that connection is gone, since ids are reused across connections.
+	ID    string
+	Epoch uint64
+}
+
+type wsSubscriptionCtxKey struct{}
+
+// WithWsSubscription returns ctx carrying sub for an eth_subscribe or
+// eth_unsubscribe sent through SendRequest.
+func WithWsSubscription(ctx context.Context, sub *WsSubscription) context.Context {
+	return context.WithValue(ctx, wsSubscriptionCtxKey{}, sub)
+}
+
+type wsPending struct {
+	ch chan *wsPendingResult
+	// sub is set for eth_subscribe. If the caller gives up, the entry is
+	// kept (abandoned, guarded by pendingMu) so a late success is
+	// unsubscribed instead of leaked.
+	sub       *WsSubscription
+	abandoned bool
 }
 
 type wsPendingResult struct {
@@ -124,6 +160,7 @@ type wsMessage struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      interface{}     `json:"id,omitempty"`
 	Method  string          `json:"method,omitempty"`
+	Result  json.RawMessage `json:"result,omitempty"`
 	Params  json.RawMessage `json:"params,omitempty"`
 }
 
@@ -158,8 +195,8 @@ func NewWsJsonRpcClient(
 		upstream:        upstream,
 		appCtx:          appCtx,
 		logger:          logger,
-		pending:         make(map[string]chan *wsPendingResult),
-		subHandlers:     make(map[string]func(params []byte)),
+		pending:         make(map[string]*wsPending),
+		subHandlers:    make(map[string]func(params []byte)),
 		onDisconnectCbs: make(map[string]func()),
 		onReconnectCbs:  make(map[string]func()),
 		errorExtractor:  extractor,
@@ -187,7 +224,13 @@ func (c *WsJsonRpcClient) GetType() ClientType {
 
 // IsConnected returns true if the upstream WebSocket connection is currently established.
 func (c *WsJsonRpcClient) IsConnected() bool {
-	return c.connected.Load()
+	return c.epoch.Load() != 0
+}
+
+// Epoch identifies the current connection, or is 0 while disconnected. It
+// changes on every reconnect.
+func (c *WsJsonRpcClient) Epoch() uint64 {
+	return c.epoch.Load()
 }
 
 func (c *WsJsonRpcClient) SendRequest(ctx context.Context, req *common.NormalizedRequest) (*common.NormalizedResponse, error) {
@@ -217,10 +260,11 @@ func (c *WsJsonRpcClient) SendRequest(ctx context.Context, req *common.Normalize
 	// Serialize the JSON-RPC request with the rewritten wire id
 	jrReq.RLock()
 	originalID := jrReq.ID
+	method := jrReq.Method
 	requestBody, err := common.SonicCfg.Marshal(map[string]interface{}{
 		"jsonrpc": jrReq.JSONRPC,
 		"id":      wireID,
-		"method":  jrReq.Method,
+		"method":  method,
 		"params":  jrReq.Params,
 	})
 	jrReq.RUnlock()
@@ -230,23 +274,45 @@ func (c *WsJsonRpcClient) SendRequest(ctx context.Context, req *common.Normalize
 			err,
 			c.upstream,
 			req.NetworkId(),
-			jrReq.Method,
+			method,
 			0, 0, 0, 0,
 		)
 	}
 
+	pending := &wsPending{ch: make(chan *wsPendingResult, 1)}
+	var unsubscribe *WsSubscription
+	if method == "eth_subscribe" || method == "eth_unsubscribe" {
+		sub, _ := ctx.Value(wsSubscriptionCtxKey{}).(*WsSubscription)
+		if sub == nil {
+			return nil, common.NewErrUpstreamRequestSkipped(
+				fmt.Errorf("%s is scoped to the upstream connection and only sent by its subscription owner", method),
+				c.upstream.Id(),
+			)
+		}
+		if method == "eth_subscribe" {
+			pending.sub = sub
+		} else {
+			unsubscribe = sub
+		}
+	}
+
 	// Register under connMu so the entry belongs to exactly this conn:
 	// teardown swaps conn and drains pending under the same lock.
-	respCh := make(chan *wsPendingResult, 1)
 	c.connMu.Lock()
 	conn := c.conn
-	if conn != nil {
+	stale := unsubscribe != nil && unsubscribe.Epoch != c.epoch.Load()
+	if conn != nil && !stale {
 		c.pendingMu.Lock()
-		c.pending[idKey] = respCh
+		c.pending[idKey] = pending
 		c.pendingMu.Unlock()
 	}
 	c.connMu.Unlock()
 
+	if stale {
+		// The subscription died with its connection; its id may since have
+		// been reused on the new one.
+		return nil, common.NewErrUpstreamRequestSkipped(errors.New("subscription's connection is already closed"), c.upstream.Id())
+	}
 	if conn == nil {
 		// Re-dial in progress: fail fast so the request fails over.
 		err := common.NewErrEndpointTransportFailure(c.Url, errWsNotConnected)
@@ -267,7 +333,7 @@ func (c *WsJsonRpcClient) SendRequest(ctx context.Context, req *common.Normalize
 
 	// Wait for response
 	select {
-	case result := <-respCh:
+	case result := <-pending.ch:
 		if result.err != nil {
 			common.SetTraceSpanError(span, result.err)
 			return nil, result.err
@@ -284,7 +350,7 @@ func (c *WsJsonRpcClient) SendRequest(ctx context.Context, req *common.Normalize
 		}
 		return nr, nil
 	case <-ctx.Done():
-		c.removePending(idKey)
+		c.abandonPending(idKey)
 		err := ctx.Err()
 		if errors.Is(err, context.DeadlineExceeded) {
 			err = common.NewErrEndpointRequestTimeout(time.Since(startedAt), err)
@@ -294,7 +360,7 @@ func (c *WsJsonRpcClient) SendRequest(ctx context.Context, req *common.Normalize
 		common.SetTraceSpanError(span, err)
 		return nil, err
 	case <-c.appCtx.Done():
-		c.removePending(idKey)
+		c.abandonPending(idKey)
 		return nil, common.NewErrEndpointRequestCanceled(c.appCtx.Err())
 	}
 }
@@ -305,18 +371,28 @@ func (c *WsJsonRpcClient) removePending(idKey string) {
 	c.pendingMu.Unlock()
 }
 
-// RegisterSubscriptionHandler registers a callback for a specific upstream subscription ID.
-// When the upstream sends a notification for this subscription, the handler is called with the raw params bytes.
-func (c *WsJsonRpcClient) RegisterSubscriptionHandler(upstreamSubID string, handler func(params []byte)) {
-	c.subHandlersMu.Lock()
-	c.subHandlers[upstreamSubID] = handler
-	c.subHandlersMu.Unlock()
+// abandonPending drops a request whose caller gave up. A subscribe stays
+// registered so readLoop can cancel it if the upstream still creates it.
+func (c *WsJsonRpcClient) abandonPending(idKey string) {
+	c.pendingMu.Lock()
+	if p, ok := c.pending[idKey]; ok {
+		if p.sub != nil {
+			p.abandoned = true
+		} else {
+			delete(c.pending, idKey)
+		}
+	}
+	c.pendingMu.Unlock()
 }
 
-// UnregisterSubscriptionHandler removes the callback for a specific upstream subscription ID.
-func (c *WsJsonRpcClient) UnregisterSubscriptionHandler(upstreamSubID string) {
+// UnregisterSubscriptionHandler removes the handler of a subscription made
+// on connection epoch. A no-op once that connection is gone: its handlers
+// were dropped with it, and the id may be reused by the next connection.
+func (c *WsJsonRpcClient) UnregisterSubscriptionHandler(upstreamSubID string, epoch uint64) {
 	c.subHandlersMu.Lock()
-	delete(c.subHandlers, upstreamSubID)
+	if c.epoch.Load() == epoch {
+		delete(c.subHandlers, upstreamSubID)
+	}
 	c.subHandlersMu.Unlock()
 }
 
@@ -389,7 +465,8 @@ func (c *WsJsonRpcClient) connect() error {
 	}
 	c.conn = conn
 	c.connectedAt = time.Now()
-	c.connected.Store(true)
+	c.epochs++
+	c.epoch.Store(c.epochs)
 	c.connMu.Unlock()
 	c.setConnectedMetric()
 
@@ -397,24 +474,27 @@ func (c *WsJsonRpcClient) connect() error {
 	return nil
 }
 
-// teardownConn closes conn, marks the client disconnected and fails every
-// request pending on it.
+// teardownConn closes conn, marks the client disconnected, fails every
+// request pending on it and drops its subscription handlers.
 func (c *WsJsonRpcClient) teardownConn(conn *websocket.Conn, cause error) {
 	c.connMu.Lock()
 	c.conn = nil
-	c.connected.Store(false)
+	c.epoch.Store(0)
 	c.pendingMu.Lock()
 	pending := c.pending
-	c.pending = make(map[string]chan *wsPendingResult)
+	c.pending = make(map[string]*wsPending)
 	c.pendingMu.Unlock()
 	c.connMu.Unlock()
 
 	if conn != nil {
 		_ = conn.Close()
 	}
+	c.subHandlersMu.Lock()
+	clear(c.subHandlers)
+	c.subHandlersMu.Unlock()
 	c.setConnectedMetric()
-	for _, ch := range pending {
-		ch <- &wsPendingResult{err: cause}
+	for _, p := range pending {
+		p.ch <- &wsPendingResult{err: cause}
 	}
 }
 
@@ -454,7 +534,7 @@ func (c *WsJsonRpcClient) readLoop() {
 		}
 
 		c.connMu.Lock()
-		conn, connectedAt := c.conn, c.connectedAt
+		conn, connectedAt, epoch := c.conn, c.connectedAt, c.epoch.Load()
 		c.connMu.Unlock()
 
 		if conn == nil {
@@ -508,7 +588,7 @@ func (c *WsJsonRpcClient) readLoop() {
 		// deadline forward.
 		_ = conn.SetReadDeadline(time.Now().Add(c.pongWait))
 
-		c.handleMessage(message)
+		c.handleMessage(message, epoch)
 	}
 }
 
@@ -528,7 +608,8 @@ func (c *WsJsonRpcClient) fireCallbacks(mu *sync.RWMutex, cbs map[string]func())
 	}
 }
 
-func (c *WsJsonRpcClient) handleMessage(message []byte) {
+// handleMessage dispatches one frame read from connection epoch.
+func (c *WsJsonRpcClient) handleMessage(message []byte, epoch uint64) {
 	var msg wsMessage
 	if err := common.SonicCfg.Unmarshal(message, &msg); err != nil {
 		c.logger.Warn().Err(err).Str("raw", string(message)).Msg("failed to parse websocket message")
@@ -546,15 +627,31 @@ func (c *WsJsonRpcClient) handleMessage(message []byte) {
 		idKey := normalizeIDKey(msg.ID)
 
 		c.pendingMu.Lock()
-		ch, ok := c.pending[idKey]
+		p, ok := c.pending[idKey]
 		delete(c.pending, idKey)
+		abandoned := ok && p.abandoned
 		c.pendingMu.Unlock()
 
 		if !ok {
 			c.logger.Debug().Str("id", idKey).Msg("received response for unknown request ID")
 			return
 		}
-		ch <- &wsPendingResult{message: message}
+		var subID string
+		if p.sub != nil && common.SonicCfg.Unmarshal(msg.Result, &subID) == nil && subID != "" {
+			if abandoned {
+				go c.unsubscribeOrphan(subID, epoch)
+				return
+			}
+			// Register before the next frame is read so no notification
+			// is dropped as belonging to an unknown subscription.
+			c.subHandlersMu.Lock()
+			c.subHandlers[subID] = p.sub.Handler
+			c.subHandlersMu.Unlock()
+			p.sub.ID, p.sub.Epoch = subID, epoch
+		}
+		if !abandoned {
+			p.ch <- &wsPendingResult{message: message}
+		}
 		return
 	}
 
@@ -596,6 +693,27 @@ func (c *WsJsonRpcClient) writeToConn(conn *websocket.Conn, messageType int, dat
 		return err
 	}
 	return conn.WriteMessage(messageType, data)
+}
+
+// unsubscribeOrphan cancels a subscription the upstream created after its
+// caller gave up. Fire-and-forget: the response is dropped as unknown.
+func (c *WsJsonRpcClient) unsubscribeOrphan(subID string, epoch uint64) {
+	body, err := common.SonicCfg.Marshal(map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      c.wireIDCounter.Add(1),
+		"method":  "eth_unsubscribe",
+		"params":  []string{subID},
+	})
+	if err != nil {
+		return
+	}
+	c.connMu.Lock()
+	conn := c.conn
+	live := c.epoch.Load() == epoch
+	c.connMu.Unlock()
+	if conn != nil && live {
+		_ = c.writeToConn(conn, websocket.TextMessage, body)
+	}
 }
 
 func (c *WsJsonRpcClient) pingLoop() {

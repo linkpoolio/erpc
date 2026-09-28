@@ -2,10 +2,11 @@ package clients
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -22,11 +23,9 @@ import (
 
 // fakeWsServer is a minimal JSON-RPC WebSocket upstream. Each accepted
 // connection can be "black-holed": the TCP connection stays open but pings
-// are swallowed (no pong reply) and nothing is ever written — exactly what
-// an intermediate proxy does when the real upstream pod vanishes without a
-// FIN/RST. This is the failure mode observed in production when the real
-// upstream pod behind a proxy was deleted: the old client believed such a
-// connection was healthy forever.
+// are swallowed (no pong reply) and nothing is ever written — what an
+// intermediate proxy does when the upstream behind it vanishes without a
+// FIN/RST.
 type fakeWsServer struct {
 	t   *testing.T
 	srv *httptest.Server
@@ -162,25 +161,23 @@ func newTestWsClient(t *testing.T, u *url.URL) *WsJsonRpcClient {
 	return c
 }
 
-func subscribeNewHeads(t *testing.T, c *WsJsonRpcClient) string {
+func subscribeNewHeads(t *testing.T, c *WsJsonRpcClient, handler func(params []byte)) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
+	sub := &WsSubscription{Handler: handler}
 	nq := common.NewNormalizedRequest([]byte(`{"jsonrpc":"2.0","id":1,"method":"eth_subscribe","params":["newHeads"]}`))
-	resp, err := c.SendRequest(ctx, nq)
+	_, err := c.SendRequest(WithWsSubscription(ctx, sub), nq)
 	require.NoError(t, err)
-	jr, err := resp.JsonRpcResponse()
-	require.NoError(t, err)
-	subID := strings.Trim(string(jr.GetResultBytes()), "\"")
-	require.NotEmpty(t, subID)
-	return subID
+	require.NotEmpty(t, sub.ID)
+	require.Equal(t, c.Epoch(), sub.Epoch)
+	return sub.ID
 }
 
-// TestWsClientDetectsSilentPeerAndReconnects is the regression test for a
-// silent peer death: the upstream socket dies WITHOUT a close
-// handshake (peer keeps TCP open but stops responding — equivalent to a
-// proxy black-holing frames after the real upstream pod was deleted). The
-// client must declare the connection dead via the ping/pong liveness
-// deadline, re-dial, and resume delivering subscription notifications.
+// TestWsClientDetectsSilentPeerAndReconnects: the upstream socket dies
+// WITHOUT a close handshake (peer keeps TCP open but stops responding, as
+// a proxy black-holing frames does). The client must declare the
+// connection dead via the ping/pong liveness deadline, re-dial, and resume
+// delivering subscription notifications.
 func TestWsClientDetectsSilentPeerAndReconnects(t *testing.T) {
 	compressWsLiveness(t)
 	server := newFakeWsServer(t)
@@ -208,12 +205,9 @@ func TestWsClientDetectsSilentPeerAndReconnects(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("server never saw the initial connection")
 	}
-	subID1 := subscribeNewHeads(t, client)
-
 	heads := make(chan []byte, 16)
-	client.RegisterSubscriptionHandler(subID1, func(params []byte) {
-		heads <- params
-	})
+	onHead := func(params []byte) { heads <- params }
+	subID1 := subscribeNewHeads(t, client, onHead)
 	conn1.sendNewHead(subID1, "0x1")
 	select {
 	case <-heads:
@@ -244,13 +238,9 @@ func TestWsClientDetectsSilentPeerAndReconnects(t *testing.T) {
 	}
 	assert.True(t, client.IsConnected())
 
-	// Re-subscribe on the new connection (in production the wsupstream
-	// adapter does this from its reconnect hook) and verify notifications
-	// flow again.
-	subID2 := subscribeNewHeads(t, client)
-	client.RegisterSubscriptionHandler(subID2, func(params []byte) {
-		heads <- params
-	})
+	// Re-subscribe on the new connection (the wsupstream adapter does this
+	// from its reconnect hook) and verify notifications flow again.
+	subID2 := subscribeNewHeads(t, client, onHead)
 	conn2.sendNewHead(subID2, "0x2")
 	select {
 	case <-heads:
@@ -364,11 +354,10 @@ func TestWsClientRedialsWhenConnDiesDuringHandler(t *testing.T) {
 	server := newFakeWsServer(t)
 	client := newTestWsClient(t, server.wsURL(t))
 	conn1 := <-server.newConn
-	subID := subscribeNewHeads(t, client)
 
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	client.RegisterSubscriptionHandler(subID, func([]byte) {
+	subID := subscribeNewHeads(t, client, func([]byte) {
 		close(entered)
 		<-release
 	})
@@ -472,4 +461,144 @@ func TestWsClientIgnoresDuplicateResponses(t *testing.T) {
 		require.NoError(t, send("dup"))
 	}
 	require.NoError(t, send("eth_chainId"))
+}
+
+type wsTestRequest struct {
+	ID     json.RawMessage `json:"id"`
+	Method string          `json:"method"`
+	Params []interface{}   `json:"params"`
+}
+
+// newSubscribeServer answers each eth_subscribe after delay with id
+// "0x<n>" from a per-connection counter, immediately followed by one
+// notification for it. Other methods get result true. Every request read
+// is reported on requests.
+func newSubscribeServer(t *testing.T, delay time.Duration, requests chan<- wsTestRequest) *url.URL {
+	return newWsTestServer(t, func(conn *websocket.Conn) {
+		subs := 0
+		for {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			var req wsTestRequest
+			_ = common.SonicCfg.Unmarshal(msg, &req)
+			requests <- req
+			if req.Method != "eth_subscribe" {
+				_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"jsonrpc":"2.0","id":`+string(req.ID)+`,"result":true}`))
+				continue
+			}
+			time.Sleep(delay)
+			subs++
+			subID := fmt.Sprintf("0x%x", subs)
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"jsonrpc":"2.0","id":`+string(req.ID)+`,"result":"`+subID+`"}`))
+			_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"`+subID+`","result":"first"}}`))
+		}
+	})
+}
+
+func sendSubscriptionRPC(ctx context.Context, c *WsJsonRpcClient, sub *WsSubscription, method string, params string) error {
+	if sub != nil {
+		ctx = WithWsSubscription(ctx, sub)
+	}
+	_, err := c.SendRequest(ctx, common.NewNormalizedRequest([]byte(`{"jsonrpc":"2.0","id":1,"method":"`+method+`","params":`+params+`}`)))
+	return err
+}
+
+// TestWsClientDeliversNotificationRightAfterSubscribe: a notification sent
+// right behind the subscribe response must reach the handler.
+func TestWsClientDeliversNotificationRightAfterSubscribe(t *testing.T) {
+	requests := make(chan wsTestRequest, 16)
+	client := newTestWsClient(t, newSubscribeServer(t, 0, requests))
+
+	got := make(chan string, 1)
+	sub := &WsSubscription{Handler: func(params []byte) { got <- string(params) }}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	require.NoError(t, sendSubscriptionRPC(ctx, client, sub, "eth_subscribe", `["logs",{}]`))
+	assert.Equal(t, "0x1", sub.ID)
+
+	select {
+	case params := <-got:
+		assert.Contains(t, params, `"first"`)
+	case <-time.After(2 * time.Second):
+		t.Fatal("notification sent right after the subscribe response was dropped")
+	}
+}
+
+// TestWsClientRejectsUnownedSubscriptionMethods: a routed eth_subscribe or
+// eth_unsubscribe (no WsSubscription in ctx) would create or cancel
+// connection state nobody owns; it must be skipped without reaching the
+// upstream.
+func TestWsClientRejectsUnownedSubscriptionMethods(t *testing.T) {
+	requests := make(chan wsTestRequest, 16)
+	client := newTestWsClient(t, newSubscribeServer(t, 0, requests))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for _, method := range []string{"eth_subscribe", "eth_unsubscribe"} {
+		err := sendSubscriptionRPC(ctx, client, nil, method, `["0x1"]`)
+		assert.True(t, common.HasErrorCode(err, common.ErrCodeUpstreamRequestSkipped), "%s: got %v", method, err)
+		assert.False(t, common.IsRetryableTowardsUpstream(err), method)
+	}
+	require.NoError(t, sendSubscriptionRPC(ctx, client, nil, "eth_chainId", `[]`))
+	assert.Equal(t, "eth_chainId", (<-requests).Method, "the subscription methods must not have been sent")
+}
+
+// TestWsClientUnsubscribesAbandonedSubscribe: when the caller times out
+// but the upstream still creates the subscription, the client cancels it.
+func TestWsClientUnsubscribesAbandonedSubscribe(t *testing.T) {
+	requests := make(chan wsTestRequest, 16)
+	client := newTestWsClient(t, newSubscribeServer(t, 300*time.Millisecond, requests))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	sub := &WsSubscription{Handler: func([]byte) { t.Error("abandoned subscription delivered a notification") }}
+	require.Error(t, sendSubscriptionRPC(ctx, client, sub, "eth_subscribe", `["newHeads"]`))
+
+	assert.Equal(t, "eth_subscribe", (<-requests).Method)
+	select {
+	case req := <-requests:
+		assert.Equal(t, "eth_unsubscribe", req.Method)
+		assert.Equal(t, []interface{}{"0x1"}, req.Params)
+	case <-time.After(2 * time.Second):
+		t.Fatal("late subscription was never unsubscribed")
+	}
+}
+
+// TestWsClientSubscriptionsAreConnectionScoped: ids restart per connection,
+// so after a reconnect an old handler must not receive a reused id's
+// notifications, and an old subscription must not be unsubscribed on the
+// new connection.
+func TestWsClientSubscriptionsAreConnectionScoped(t *testing.T) {
+	compressWsLiveness(t)
+	server := newFakeWsServer(t)
+	client := newTestWsClient(t, server.wsURL(t))
+	conn1 := <-server.newConn
+
+	old := make(chan struct{}, 1)
+	subID := subscribeNewHeads(t, client, func([]byte) { old <- struct{}{} })
+	<-conn1.subscribeCh
+	oldEpoch := client.Epoch()
+
+	_ = conn1.conn.UnderlyingConn().Close()
+	var conn2 *fakeWsConn
+	select {
+	case conn2 = <-server.newConn:
+	case <-time.After(3 * time.Second):
+		t.Fatal("client never re-dialed")
+	}
+	require.Eventually(t, client.IsConnected, time.Second, 5*time.Millisecond)
+	require.NotEqual(t, oldEpoch, client.Epoch())
+
+	conn2.sendNewHead(subID, "0x2")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err := sendSubscriptionRPC(ctx, client, &WsSubscription{Epoch: oldEpoch}, "eth_unsubscribe", `["`+subID+`"]`)
+	assert.True(t, common.HasErrorCode(err, common.ErrCodeUpstreamRequestSkipped), "got %v", err)
+	select {
+	case <-old:
+		t.Fatal("handler from the previous connection received a notification")
+	case <-time.After(100 * time.Millisecond):
+	}
 }

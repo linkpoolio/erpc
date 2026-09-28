@@ -544,57 +544,20 @@ func (s *HttpServer) createRequestHandler() http.Handler {
 					return
 				}
 
-				if project != nil {
-					for _, matchKey := range project.Config.ForwardHeaders {
-						for key, values := range headers {
-							matches, err := common.WildcardMatch(matchKey, key)
-							if err != nil {
-								responses[index] = processErrorBody(&lg, &startedAt, nq, err, &common.TRUE)
-								common.EndRequestSpan(requestCtx, nil, responses[index])
-								return
-							}
-							if matches {
-								for _, value := range values {
-									nq.ForwardHeaders.Add(matchKey, value)
-								}
-							}
-						}
-					}
+				if err := applyForwardHeaders(project, nq, headers); err != nil {
+					responses[index] = processErrorBody(&lg, &startedAt, nq, err, &common.TRUE)
+					common.EndRequestSpan(requestCtx, nil, responses[index])
+					return
 				}
 
 				method, _ := nq.Method()
 				rlg := lg.With().Str("method", method).Logger()
 
-				shouldHandleMethod := true
-
-				if project != nil && project.Config.IgnoreMethods != nil {
-					for _, m := range project.Config.IgnoreMethods {
-						match, err := common.WildcardMatch(m, method)
-						if err != nil {
-							responses[index] = processErrorBody(&rlg, &startedAt, nq, err, &common.TRUE)
-							common.EndRequestSpan(requestCtx, nil, err)
-							return
-						}
-						if match {
-							shouldHandleMethod = false
-							break
-						}
-					}
-				}
-
-				if project != nil && project.Config.AllowMethods != nil {
-					for _, m := range project.Config.AllowMethods {
-						match, err := common.WildcardMatch(m, method)
-						if err != nil {
-							responses[index] = processErrorBody(&rlg, &startedAt, nq, err, &common.TRUE)
-							common.EndRequestSpan(requestCtx, nil, err)
-							return
-						}
-						if match {
-							shouldHandleMethod = true
-							break
-						}
-					}
+				shouldHandleMethod, err := isMethodAllowed(project, method)
+				if err != nil {
+					responses[index] = processErrorBody(&rlg, &startedAt, nq, err, &common.TRUE)
+					common.EndRequestSpan(requestCtx, nil, err)
+					return
 				}
 
 				if !shouldHandleMethod {
@@ -619,7 +582,6 @@ func (s *HttpServer) createRequestHandler() http.Handler {
 				}
 
 				var ap *auth.AuthPayload
-				var err error
 
 				if project != nil {
 					ap, err = auth.NewPayloadFromHttp(method, r.RemoteAddr, headers, queryArgs)
@@ -750,16 +712,7 @@ func (s *HttpServer) createRequestHandler() http.Handler {
 				}
 				nq.SetNetwork(nw)
 
-				nq.ApplyDirectiveDefaults(nw.Config().DirectiveDefaults)
-				// Configure how to store User-Agent (raw vs simplified) based on project config
-				uaMode := common.UserAgentTrackingModeSimplified
-				if project != nil {
-					if project.Config.UserAgentMode != "" {
-						uaMode = project.Config.UserAgentMode
-					}
-					nq.SetAllowClientDirectiveMatcher(project.clientDirectiveMatcherFor(nq.User()))
-				}
-				nq.EnrichFromHttp(headers, queryArgs, uaMode)
+				applyRequestDirectives(project, nw, nq, headers, queryArgs)
 				rlg.Trace().Interface("directives", nq.Directives()).Msgf("applied request directives")
 
 				resp, err := project.Forward(requestCtx, networkId, nq)

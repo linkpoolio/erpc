@@ -1797,42 +1797,20 @@ func (n *Network) EvmLowestFinalizedBlockNumber(ctx context.Context) int64 {
 	return minBlock
 }
 
-// EvmLeaderUpstream returns the upstream whose state poller has the highest
-// latest tip. Fallback-tier upstreams are ignored while any primary is up —
-// otherwise tip re-fetch pins UseUpstream to a cordoned fallback that is not
-// in the ordered primary list. TipHW may still advance from fallback WS
-// (fan-out invariant); unconstrained tip re-fetch + emptyish escape reaches
-// those fallbacks when primaries miss.
 func (n *Network) EvmLeaderUpstream(ctx context.Context) common.Upstream {
-	var leader, fallbackLeader common.Upstream
-	var leaderLastBlock, fallbackLastBlock int64
-	anyPrimaryUp := false
+	var leader common.Upstream
+	var leaderLastBlock int64 = 0
 	upsList := n.upstreamsRegistry.GetNetworkUpstreams(ctx, n.networkId)
 	for _, u := range upsList {
-		statePoller := u.EvmStatePoller()
-		if statePoller == nil {
-			continue
-		}
-		lastBlock := statePoller.LatestBlock()
-		if u.Config() != nil && u.Config().HasTag(common.TagTierFallback) {
-			if lastBlock > fallbackLastBlock {
-				fallbackLeader = u
-				fallbackLastBlock = lastBlock
+		if statePoller := u.EvmStatePoller(); statePoller != nil {
+			lastBlock := statePoller.LatestBlock()
+			if lastBlock > leaderLastBlock {
+				leader = u
+				leaderLastBlock = lastBlock
 			}
-			continue
-		}
-		if !u.IsDown() {
-			anyPrimaryUp = true
-		}
-		if lastBlock > leaderLastBlock {
-			leader = u
-			leaderLastBlock = lastBlock
 		}
 	}
-	if anyPrimaryUp || fallbackLeader == nil {
-		return leader
-	}
-	return fallbackLeader
+	return leader
 }
 
 func (n *Network) getFailsafeExecutor(ctx context.Context, req *common.NormalizedRequest) *networkExecutor {
@@ -2034,28 +2012,13 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 		return nil, err
 	}
 
-	// Block-availability-aware routing: when the request targets a specific
-	// block, prefer upstreams whose state poller has already observed it.
-	// Without this, requests for a block we just delivered to a client via
-	// WS would still get routed to an HTTP-only sibling whose own polling
-	// loop hasn't caught up — checkUpstreamBlockAvailability rejects with
-	// ErrUpstreamBlockUnavailable, retries cascade through the rest of the
-	// lagging siblings, and the request can fail entirely despite the WS
-	// upstream demonstrably having the block. partitionUpstreamsByLatestBlock
-	// is stable so it composes with the tier and score orderings layered
-	// on top.
-	//
-	// Near-tip eth_getBlockByNumber additionally moves EvmLeaderUpstream
-	// (typically the WS ingress that SuggestLatestBlock advanced) to the
-	// front so the first attempt hits the node that already has the head —
-	// same idea as EnforceHighestBlock's tip re-fetch pin, but for direct
-	// client tip reads. This is an ORDERING hint, not a use-upstream
-	// selector: the other upstreams stay eligible, so a leader that answers
-	// null still falls through to its siblings and the fallback escape.
+	// For a specific block, try upstreams whose poller already has it first
+	// (e.g. one a WebSocket head just advanced) rather than a sibling that has
+	// not polled it yet. Ordering hints only: every upstream stays eligible.
 	if n.Architecture() == common.ArchitectureEvm {
 		if bn := requestBlockNumber(ctx, req); bn > 0 {
 			upsList = partitionUpstreamsByLatestBlock(upsList, bn)
-			upsList = n.preferTipLeaderForNearTipGetBlock(ctx, upsList, method, bn)
+			upsList = preferTipLeaderForNearTipGetBlock(upsList, method, bn)
 		}
 	}
 
@@ -3697,112 +3660,70 @@ func tierUpstreamsByGroup(ups []common.Upstream) []common.Upstream {
 }
 
 // partitionUpstreamsByLatestBlock stable-partitions ups so that upstreams
-// whose EvmStatePoller has observed a block number ≥ bn come first, in
-// their input order. Upstreams whose poller is behind bn (or has no
-// poller / isn't EVM) keep their input order and come after.
-//
-// This makes per-request routing consistent with what the indexer already
-// knows: when a WS upstream delivers newHead block N, its state poller's
-// LatestBlock advances to N immediately. If a subsequent eth_call from a
-// client references block N, this partition routes the call to that
-// upstream first instead of to an HTTP-only sibling whose own polling
-// hasn't caught up — which would fail checkUpstreamBlockAvailability and
-// burn retries. The partition is stable, so callers can layer it under
-// other orderings (tier, score) without disturbing them within each
-// partition.
+// whose poller has a known head below bn move behind the rest; order within
+// each partition is kept, so it composes with the tier and score orderings.
+// An upstream with no known head (no poller yet) keeps its place: that is no
+// evidence it lacks the block.
 func partitionUpstreamsByLatestBlock(ups []common.Upstream, bn int64) []common.Upstream {
 	if bn <= 0 || len(ups) < 2 {
 		return ups
 	}
-	// Cheap fast-path: if all upstreams already have ≥ bn, or all are
-	// behind, the partition is the identity and we can avoid the
-	// allocation. We still walk once to compute LatestBlock either way,
-	// so the gain is just the slice copy.
-	haveCount := 0
-	for _, u := range ups {
-		eu, ok := u.(common.EvmUpstream)
-		if !ok {
-			continue
-		}
-		sp := eu.EvmStatePoller()
-		if sp == nil || sp.IsObjectNull() {
-			continue
-		}
-		if sp.LatestBlock() >= bn {
-			haveCount++
-		}
+	behind := func(u common.Upstream) bool {
+		lb := upstreamLatestBlock(u)
+		return lb > 0 && lb < bn
 	}
-	if haveCount == 0 || haveCount == len(ups) {
+	if !slices.ContainsFunc(ups, behind) {
 		return ups
 	}
 	out := make([]common.Upstream, 0, len(ups))
 	for _, u := range ups {
-		eu, ok := u.(common.EvmUpstream)
-		if !ok {
-			continue
-		}
-		sp := eu.EvmStatePoller()
-		if sp != nil && !sp.IsObjectNull() && sp.LatestBlock() >= bn {
+		if !behind(u) {
 			out = append(out, u)
 		}
 	}
 	for _, u := range ups {
-		eu, ok := u.(common.EvmUpstream)
-		if !ok {
-			out = append(out, u)
-			continue
-		}
-		sp := eu.EvmStatePoller()
-		if sp == nil || sp.IsObjectNull() || sp.LatestBlock() < bn {
+		if behind(u) {
 			out = append(out, u)
 		}
 	}
 	return out
 }
 
-// preferTipLeaderForNearTipGetBlock returns ups with EvmLeaderUpstream moved
-// to the front when the request is eth_getBlockByNumber for the leader's tip
-// or tip+1 (the sibling import race window). The rest of the list keeps its
-// order, so the hint composes with the partition and score orderings and
-// never removes an upstream from consideration — unlike a use-upstream
-// selector, which would also scope the network tip to the leader and lock
-// the per-request fallback escape out when the leader answers null.
-func (n *Network) preferTipLeaderForNearTipGetBlock(ctx context.Context, ups []common.Upstream, method string, bn int64) []common.Upstream {
-	if n == nil || method != "eth_getBlockByNumber" || bn <= 0 || len(ups) < 2 {
+// preferTipLeaderForNearTipGetBlock moves the upstream whose head is strictly
+// ahead of every other candidate to the front when the request is
+// eth_getBlockByNumber for that head or the next block (the sibling import
+// race). On a tie the selection policy's order stands. It is an ordering
+// hint only: every upstream stays eligible.
+func preferTipLeaderForNearTipGetBlock(ups []common.Upstream, method string, bn int64) []common.Upstream {
+	if method != "eth_getBlockByNumber" || len(ups) < 2 {
 		return ups
 	}
-	leader := n.EvmLeaderUpstream(ctx)
-	if leader == nil {
-		return ups
-	}
-	eu, ok := leader.(common.EvmUpstream)
-	if !ok {
-		return ups
-	}
-	sp := eu.EvmStatePoller()
-	if sp == nil || sp.IsObjectNull() {
-		return ups
-	}
-	l := sp.LatestBlock()
-	if l <= 0 || bn < l || bn > l+1 {
-		return ups
-	}
-	idx := -1
+	leader, tip, runnerUp := -1, int64(0), int64(0)
 	for i, u := range ups {
-		if u.Id() == leader.Id() {
-			idx = i
-			break
+		if lb := upstreamLatestBlock(u); lb > tip {
+			leader, tip, runnerUp = i, lb, tip
+		} else if lb > runnerUp {
+			runnerUp = lb
 		}
 	}
-	if idx <= 0 {
-		// Absent (e.g. excluded by the selection policy) or already first.
+	if leader <= 0 || tip == runnerUp || bn < tip || bn > tip+1 {
 		return ups
 	}
 	out := make([]common.Upstream, 0, len(ups))
-	out = append(out, ups[idx])
-	out = append(out, ups[:idx]...)
-	out = append(out, ups[idx+1:]...)
+	out = append(out, ups[leader])
+	out = append(out, ups[:leader]...)
+	out = append(out, ups[leader+1:]...)
 	return out
+}
+
+// upstreamLatestBlock is u's polled head, or 0 when unknown.
+func upstreamLatestBlock(u common.Upstream) int64 {
+	if eu, ok := u.(common.EvmUpstream); ok {
+		if sp := eu.EvmStatePoller(); sp != nil && !sp.IsObjectNull() {
+			return sp.LatestBlock()
+		}
+	}
+	return 0
 }
 
 // requestBlockNumber resolves the specific block number a request targets,

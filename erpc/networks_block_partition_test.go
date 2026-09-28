@@ -15,8 +15,8 @@ func upWithLatest(id string, latest int64) common.Upstream {
 	return common.NewFakeUpstream(id, common.WithEvmStatePoller(poller))
 }
 
-// upWithoutPoller returns a FakeUpstream with no state poller — the
-// partition should treat it as "doesn't have the block" without panicking.
+// upWithoutPoller returns a FakeUpstream with no state poller, i.e. an
+// unknown head.
 func upWithoutPoller(id string) common.Upstream {
 	return common.NewFakeUpstream(id)
 }
@@ -75,14 +75,15 @@ func TestPartitionUpstreamsByLatestBlock_EqualLatestIsTreatedAsHavingBlock(t *te
 	assert.Equal(t, []string{"b", "c", "a"}, ids(got))
 }
 
-func TestPartitionUpstreamsByLatestBlock_UpstreamWithoutPollerSortsAsLagging(t *testing.T) {
+func TestPartitionUpstreamsByLatestBlock_UnknownHeadKeepsItsPlace(t *testing.T) {
 	in := []common.Upstream{
 		upWithoutPoller("a"),
-		upWithLatest("b", 110),
-		upWithoutPoller("c"),
+		upWithLatest("b", 90),
+		upWithLatest("c", 110),
+		upWithLatest("d", 0),
 	}
 	got := partitionUpstreamsByLatestBlock(in, 100)
-	assert.Equal(t, []string{"b", "a", "c"}, ids(got), "poller-less upstreams keep input order, partition keeps them after the upstream that demonstrably has the block")
+	assert.Equal(t, []string{"a", "c", "d", "b"}, ids(got), "only a known head below the block moves back")
 }
 
 func TestPartitionUpstreamsByLatestBlock_ZeroOrNegativeBlockIsNoOp(t *testing.T) {
@@ -98,4 +99,19 @@ func TestPartitionUpstreamsByLatestBlock_SingleUpstreamIsNoOp(t *testing.T) {
 	in := []common.Upstream{upWithLatest("a", 50)}
 	got := partitionUpstreamsByLatestBlock(in, 100)
 	assert.Equal(t, in, got, "no other upstream to prefer; partition is a no-op")
+}
+
+func TestPreferTipLeaderForNearTipGetBlock(t *testing.T) {
+	const method = "eth_getBlockByNumber"
+
+	tied := []common.Upstream{upWithLatest("c", 1000), upWithLatest("b", 1000), upWithLatest("a", 1000)}
+	assert.Equal(t, []string{"c", "b", "a"}, ids(preferTipLeaderForNearTipGetBlock(tied, method, 1000)),
+		"tied heads keep the selection policy's order")
+
+	ahead := []common.Upstream{upWithLatest("c", 999), upWithLatest("b", 999), upWithLatest("a", 1000)}
+	assert.Equal(t, []string{"a", "c", "b"}, ids(preferTipLeaderForNearTipGetBlock(ahead, method, 1001)),
+		"a strict leader goes first for its next block")
+	assert.Equal(t, []string{"c", "b", "a"}, ids(preferTipLeaderForNearTipGetBlock(ahead, method, 998)),
+		"blocks every candidate has keep the policy order")
+	assert.Equal(t, []string{"c", "b", "a"}, ids(preferTipLeaderForNearTipGetBlock(ahead, "eth_call", 1000)))
 }

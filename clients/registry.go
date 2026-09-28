@@ -27,13 +27,10 @@ type Client struct {
 	Upstream common.Upstream
 }
 
-// clientCreation memoises the once-per-upstream client construction. Sharing
-// the sync.Once across CreateClient calls is the correctness-critical part:
-// previously `var once sync.Once` was declared locally so every call ran the
-// body, and two concurrent callers that both missed the cache could each
-// spawn a client and its goroutines, with only the last winning Store — the
-// losing client (and its <-appCtx.Done() shutdown waiter, ping/read loops,
-// etc.) leaked for the lifetime of the process.
+// clientCreation memoises the once-per-upstream client construction, so
+// concurrent callers that miss the cache share one client instead of each
+// spawning one (and its background goroutines). Failed creations are not
+// memoised.
 type clientCreation struct {
 	once   sync.Once
 	client ClientInterface
@@ -173,6 +170,8 @@ func (manager *ClientRegistry) CreateClient(appCtx context.Context, ups common.U
 		creation.err = cerr
 		if cerr == nil {
 			manager.clients.Store(upstreamKey, c)
+		} else {
+			manager.clientCreations.CompareAndDelete(upstreamKey, creation)
 		}
 	})
 

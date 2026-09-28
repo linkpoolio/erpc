@@ -243,55 +243,15 @@ func TestIndexer_Log_RefcountFanOutAndTeardown(t *testing.T) {
 	}
 }
 
-func TestIndexer_Log_DedupFanOut(t *testing.T) {
-	idx := newIndexer(t)
-	nw := newFakeNetwork("evm:1")
-	idx.RegisterNetwork(nw)
-
-	params := []interface{}{"logs", map[string]interface{}{}}
-	h, _ := idx.EnsureFilter(context.Background(), "evm:1", "logs", params)
-
-	eg := &fakeEgress{name: "eg1", filters: map[string]struct{}{h: {}}}
-	idx.Attach(eg)
-
-	payload := json.RawMessage(`{"blockHash":"0xB","transactionHash":"0xT","logIndex":"0x0","removed":false}`)
-	ev := StreamEvent{
-		Kind:       KindLog,
-		NetworkId:  "evm:1",
-		SourceId:   "ws:up1",
-		FilterHash: h,
-		Payload:    payload,
-	}
-	idx.Ingest(ev)
-	idx.Ingest(ev) // dup: same identity, same removed state
-
-	if got := eg.count(); got != 1 {
-		t.Fatalf("log dedup: want 1, got %d", got)
-	}
-
-	// Same log with removed=true must deliver (state changed).
-	idx.Ingest(StreamEvent{
-		Kind: KindLog, NetworkId: "evm:1", SourceId: "ws:up1", FilterHash: h,
-		Payload: json.RawMessage(`{"blockHash":"0xB","transactionHash":"0xT","logIndex":"0x0","removed":true}`),
-	})
-	if got := eg.count(); got != 2 {
-		t.Fatalf("log with removed=true must be delivered, got %d", got)
-	}
-	// Last delivered must carry Removed=true.
-	eg.mu.Lock()
-	last := eg.received[len(eg.received)-1]
-	eg.mu.Unlock()
-	if !last.Removed {
-		t.Fatalf("removed flag must propagate to IndexedEvent.Removed")
-	}
-}
-
 // newLogFilter registers "evm:1", ensures an empty logs filter and attaches
 // an egress interested in it. Helper for log dedup tests.
 func newLogFilter(t *testing.T) (*Indexer, string, *fakeEgress) {
 	t.Helper()
 	idx := newIndexer(t)
 	idx.RegisterNetwork(newFakeNetwork("evm:1"))
+	if err := idx.AddIngress(context.Background(), "evm:1", &fakeIngress{name: "ws:up1"}); err != nil {
+		t.Fatal(err)
+	}
 	h, err := idx.EnsureFilter(context.Background(), "evm:1", "logs", []interface{}{"logs", map[string]interface{}{}})
 	if err != nil {
 		t.Fatal(err)
@@ -464,24 +424,33 @@ func TestIndexer_Selector_AllDefaultsFailEscalatesToFallback(t *testing.T) {
 	}
 }
 
-func TestIndexer_Selector_UnknownIngressIsAlwaysIncluded(t *testing.T) {
+// The selector excludes an ingress (e.g. a down upstream) by not naming it.
+// An unnamed ingress must not be subscribed, and must not mask a failed
+// default tier.
+func TestIndexer_Selector_UnnamedIngressIsExcluded(t *testing.T) {
 	idx := newIndexer(t)
 	a, b, c := registerThreeIngresses(t, idx)
-	// Selector only knows about "a" and "b"; "c" stands in for a standalone
-	// ingress (e.g. Kafka) and must receive EnsureFilter unconditionally.
+	a.setErr(errTest("a"))
 	idx.RegisterNetworkSelector("evm:1", &fakeSelector{defaults: []string{"a"}, fallbacks: []string{"b"}})
 
 	if _, err := idx.EnsureFilter(context.Background(), "evm:1", "logs", []interface{}{"logs"}); err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatalf("fallback should have carried the filter: %v", err)
 	}
-	if c.ensureCalls.Load() != 1 {
-		t.Fatalf("standalone ingress must be EnsureFiltered unconditionally, got %d calls", c.ensureCalls.Load())
+	if c.ensureCalls.Load() != 0 {
+		t.Fatalf("unnamed ingress must not be subscribed, got %d calls", c.ensureCalls.Load())
 	}
-	if a.ensureCalls.Load() != 1 {
-		t.Fatalf("default must be called, got %d", a.ensureCalls.Load())
+	if b.ensureCalls.Load() != 1 {
+		t.Fatalf("fallback must be tried when every default failed, got %d calls", b.ensureCalls.Load())
 	}
-	if b.ensureCalls.Load() != 0 {
-		t.Fatalf("fallback must not be called while a default or standalone succeeded, got %d", b.ensureCalls.Load())
+}
+
+func TestIndexer_Selector_NothingSelectedFails(t *testing.T) {
+	idx := newIndexer(t)
+	registerThreeIngresses(t, idx)
+	idx.RegisterNetworkSelector("evm:1", &fakeSelector{})
+
+	if _, err := idx.EnsureFilter(context.Background(), "evm:1", "logs", []interface{}{"logs"}); err == nil {
+		t.Fatal("a filter with no ingress behind it must fail, not return a silent subscription")
 	}
 }
 

@@ -3,6 +3,7 @@ package indexer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 
@@ -140,24 +141,10 @@ func (i *Indexer) RegisterNetworkSelector(networkId string, sel IngressSelector)
 
 // EnsureFilter subscribes a filter on this network's ingresses and tracks
 // a per-filter refcount so ReleaseFilter can decide when to tear it down
-// upstream. Selection rules:
-//
-//   - Ingresses named in the selector's default tier are grouped as
-//     pooled defaults; those named in the fallback tier are pooled
-//     fallbacks.
-//   - Ingresses the selector does not name in either tier are treated as
-//     "always include" — they receive EnsureFilter unconditionally. This
-//     preserves the original fan-out for standalone transports (Kafka,
-//     gRPC streams, …) that a WS-only selector doesn't know about.
-//   - With no selector registered, every ingress is an "always include",
-//     matching the pre-selector behaviour.
-//
-// Success semantics: the subscription is considered established — and
-// EnsureFilter returns (paramsHash, nil) — as soon as any ingress
-// (always-include or pooled default) successfully subscribed. Fallbacks
-// are only attempted when every always-include and every default failed.
-// An error is returned only if every attempted ingress failed; per-ingress
-// errors are otherwise logged and not propagated.
+// upstream. The selector's defaults are tried first; its fallbacks only when
+// every default failed. Ingresses the selector does not name are not used;
+// without a selector every ingress is a default. An error is returned when
+// no ingress subscribed, including when none was selected.
 func (i *Indexer) EnsureFilter(ctx context.Context, networkId, subType string, params []interface{}) (paramsHash string, err error) {
 	nsRaw, ok := i.networks.Load(networkId)
 	if !ok {
@@ -188,44 +175,24 @@ func (i *Indexer) EnsureFilter(ctx context.Context, networkId, subType string, p
 	sel := ns.selector
 	ns.ingressMu.RUnlock()
 
-	always, defaults, fallbacks := partitionIngresses(sel, ings, networkId, subType, params)
+	defaults, fallbacks := partitionIngresses(sel, ings, networkId, subType, params)
 
-	// Nothing to subscribe on — bootstrap ordering or a selector returning
-	// nothing and no standalone ingresses. Preserve the dedup window so
-	// any ingress attached later still delivers into it.
-	if len(always) == 0 && len(defaults) == 0 && len(fallbacks) == 0 {
-		return paramsHash, nil
-	}
-
-	var (
-		successCount int
-		errs         []error
-	)
-	tryOne := func(ing EventIngress) {
-		if err := ing.EnsureFilter(ctx, subType, paramsHash, params); err != nil {
-			errs = append(errs, err)
-			i.logger.Warn().Err(err).Str("ingress", ing.Name()).Str("networkId", networkId).
-				Str("subType", subType).Str("paramsHash", paramsHash).
-				Msg("ingress EnsureFilter failed")
-			return
+	var errs []error
+	for _, tier := range [][]EventIngress{defaults, fallbacks} {
+		subscribed := false
+		for _, ing := range tier {
+			if err := ing.EnsureFilter(ctx, subType, paramsHash, params); err != nil {
+				errs = append(errs, err)
+				i.logger.Warn().Err(err).Str("ingress", ing.Name()).Str("networkId", networkId).
+					Str("subType", subType).Str("paramsHash", paramsHash).
+					Msg("ingress EnsureFilter failed")
+				continue
+			}
+			subscribed = true
 		}
-		successCount++
-	}
-
-	for _, ing := range always {
-		tryOne(ing)
-	}
-	for _, ing := range defaults {
-		tryOne(ing)
-	}
-	if successCount == 0 {
-		for _, ing := range fallbacks {
-			tryOne(ing)
+		if subscribed {
+			return paramsHash, nil
 		}
-	}
-
-	if successCount > 0 {
-		return paramsHash, nil
 	}
 
 	// Every chosen ingress failed. Roll the refcount this caller added
@@ -240,22 +207,22 @@ func (i *Indexer) EnsureFilter(ctx context.Context, networkId, subType string, p
 	}
 	ns.filterMu.Unlock()
 
+	if len(errs) == 0 {
+		return paramsHash, fmt.Errorf("indexer: no ingress selected for %s filter on network %q", subType, networkId)
+	}
 	return paramsHash, errors.Join(errs...)
 }
 
-// partitionIngresses splits the registered ingress set into three groups
-// based on the network's selector: always-include (ingresses the selector
-// does not mention at all), pooled defaults, and pooled fallbacks. Names
-// returned by the selector that do not correspond to a registered ingress
-// are silently dropped. Without a selector, every ingress is treated as
-// always-include.
-func partitionIngresses(sel IngressSelector, ings map[string]EventIngress, networkId, subType string, params []interface{}) (always, defaults, fallbacks []EventIngress) {
+// partitionIngresses resolves the selector's tiers to registered ingresses,
+// dropping unknown and repeated names. Without a selector every ingress is
+// a default.
+func partitionIngresses(sel IngressSelector, ings map[string]EventIngress, networkId, subType string, params []interface{}) (defaults, fallbacks []EventIngress) {
 	if sel == nil {
-		always = make([]EventIngress, 0, len(ings))
+		defaults = make([]EventIngress, 0, len(ings))
 		for _, ing := range ings {
-			always = append(always, ing)
+			defaults = append(defaults, ing)
 		}
-		return always, nil, nil
+		return defaults, nil
 	}
 	dNames, fNames := sel.Select(networkId, subType, params)
 	named := make(map[string]struct{}, len(dNames)+len(fNames))
@@ -272,15 +239,7 @@ func partitionIngresses(sel IngressSelector, ings map[string]EventIngress, netwo
 		}
 		return out
 	}
-	defaults = pick(dNames)
-	fallbacks = pick(fNames)
-	for name, ing := range ings {
-		if _, claimed := named[name]; claimed {
-			continue
-		}
-		always = append(always, ing)
-	}
-	return always, defaults, fallbacks
+	return pick(dNames), pick(fNames)
 }
 
 // ReleaseFilter decrements the refcount on the filter and, when it hits

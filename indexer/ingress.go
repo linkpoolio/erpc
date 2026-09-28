@@ -72,14 +72,8 @@ type EventIngress interface {
 //     the subscription to be considered established.
 //   - fallbacks: tried only if every default failed.
 //
-// Ingresses whose names appear in neither slice are treated as
-// "always include" — they receive EnsureFilter unconditionally alongside
-// the selected tier. This lets a selector that only understands WS
-// upstreams leave standalone ingresses (Kafka topics, gRPC streams, etc.)
-// untouched: they just get every filter automatically.
-//
-// A nil selector preserves the legacy behaviour: every registered ingress
-// is treated as a default.
+// Ingresses named in neither slice are excluded. A nil selector treats
+// every registered ingress as a default.
 type IngressSelector interface {
 	Select(networkId, subType string, params []interface{}) (defaults, fallbacks []string)
 }

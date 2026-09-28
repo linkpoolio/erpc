@@ -106,8 +106,8 @@ type Network struct {
 // lower tip than a head already (or about to be) served on the subscription,
 // which strict clients treat as an inconsistency.
 //
-// The shared floor is published synchronously (bounded timeout) so sibling
-// instances can refresh it before serving HTTP "latest".
+// Only the local update is synchronous; the shared floor is pushed to remote
+// in the background, and only when this call advanced it.
 func (n *Network) NoteObservedLatestBlock(ctx context.Context, blockNumber int64) {
 	if n == nil || blockNumber <= 0 {
 		return
@@ -119,7 +119,7 @@ func (n *Network) NoteObservedLatestBlock(ctx context.Context, blockNumber int64
 		ctx = context.Background()
 	}
 	if n.latestBlockShared != nil {
-		n.latestBlockShared.TryUpdateAndPublish(ctx, blockNumber)
+		n.latestBlockShared.TryUpdate(ctx, blockNumber)
 	}
 	for {
 		cur := n.deliveredLatestBlock.Load()

@@ -1836,66 +1836,51 @@ func TestCounterInt64_FresherLocalPushesToStaleRemote(t *testing.T) {
 	})
 }
 
-func TestCounterInt64_TryUpdateAndPublish_Sync(t *testing.T) {
-	registry, connector, ctx := setupTest("sync-pub")
-
-	published := make(chan struct{}, 1)
-	connector.On("Set", mock.Anything, "test", "value", mock.Anything, mock.Anything).
-		Run(func(args mock.Arguments) {
-			select {
-			case published <- struct{}{}:
-			default:
-			}
-		}).
-		Return(nil)
-	connector.On("PublishCounterInt64", mock.Anything, "test", mock.Anything).Return(nil)
-	// Background reconcile may also Lock/Get after sync publish.
-	lock := &MockLock{}
-	lock.On("Unlock", mock.Anything).Return(nil).Maybe()
-	connector.On("Lock", mock.Anything, "test", mock.Anything).Return(lock, nil).Maybe()
-	connector.On("Get", mock.Anything, ConnectorMainIndex, "test", "value", nil).
-		Return([]byte(`{"v":10,"t":1,"b":"test"}`), nil).Maybe()
+func TestCounterInt64_TryUpdate_NoRemoteWriteWithoutAdvance(t *testing.T) {
+	registry, connector, ctx := setupTest("no-advance")
+	connector.On("PublishCounterInt64", mock.Anything, "test", mock.Anything).Return(nil).Maybe()
+	connector.On("Set", mock.Anything, "test", "value", mock.Anything, mock.Anything).Return(nil).Maybe()
 
 	counter := &counterInt64{
 		registry:         registry,
 		key:              "test",
 		ignoreRollbackOf: 1024,
 	}
+	counter.value.Store(100)
+	counter.updatedAtUnixMs.Store(time.Now().UnixMilli())
 
-	got := counter.TryUpdateAndPublish(ctx, 10)
-	assert.Equal(t, int64(10), got)
-
-	select {
-	case <-published:
-		// sync SET happened before return
-	case <-time.After(50 * time.Millisecond):
-		t.Fatal("expected synchronous Set before TryUpdateAndPublish returned")
-	}
+	assert.Equal(t, int64(100), counter.TryUpdate(ctx, 100))
+	assert.Equal(t, int64(100), counter.TryUpdate(ctx, 99))
+	time.Sleep(50 * time.Millisecond)
+	connector.AssertNotCalled(t, "Set", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+	connector.AssertNotCalled(t, "PublishCounterInt64", mock.Anything, mock.Anything, mock.Anything)
 }
 
-func TestCounterInt64_TryUpdateAndPublish_FallsBackOnPublishError(t *testing.T) {
-	registry, connector, ctx := setupTest("sync-pub-fail")
+// A lagging instance advancing its local value must not overwrite a higher
+// remote value just because its local timestamp is newer.
+func TestCounterInt64_BackgroundPush_DoesNotRegressHigherRemote(t *testing.T) {
+	registry, connector, ctx := setupTest("no-regress")
 
-	connector.On("Set", mock.Anything, "test", "value", mock.Anything, mock.Anything).
-		Return(errors.New("redis down"))
-	// Async fallback still attempts publish/lock.
 	lock := &MockLock{}
-	lock.On("Unlock", mock.Anything).Return(nil).Maybe()
-	connector.On("Lock", mock.Anything, "test", mock.Anything).Return(lock, nil).Maybe()
-	connector.On("Get", mock.Anything, ConnectorMainIndex, "test", "value", nil).
-		Return([]byte(""), errors.New("get failed")).Maybe()
+	lock.On("Unlock", mock.Anything).Return(nil)
+	connector.On("Lock", mock.Anything, "test", mock.Anything).Return(lock, nil)
 	connector.On("PublishCounterInt64", mock.Anything, "test", mock.Anything).Return(nil).Maybe()
-	connector.On("Set", mock.Anything, "test", "value", mock.Anything, mock.Anything).Return(errors.New("redis down")).Maybe()
+	connector.On("Get", mock.Anything, ConnectorMainIndex, "test", "value", nil).
+		Return([]byte(`{"v":105,"t":1,"b":"other-instance"}`), nil)
+	connector.On("Set", mock.Anything, "test", "value", mock.Anything, mock.Anything).Return(nil).Maybe()
 
 	counter := &counterInt64{
 		registry:         registry,
 		key:              "test",
 		ignoreRollbackOf: 1024,
 	}
+	counter.value.Store(100)
+	counter.updatedAtUnixMs.Store(time.Now().UnixMilli())
 
-	got := counter.TryUpdateAndPublish(ctx, 42)
-	assert.Equal(t, int64(42), got, "local tip must advance even when sync publish fails")
-	time.Sleep(50 * time.Millisecond) // allow bg fallback to run
+	counter.TryUpdate(ctx, 101)
+	assert.Eventually(t, func() bool { return counter.GetValue() == 105 }, time.Second, 10*time.Millisecond,
+		"local counter should adopt the higher remote value")
+	connector.AssertNotCalled(t, "Set", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything)
 }
 
 func TestCounterInt64_RefreshFromRemote_AdoptsHigherTip(t *testing.T) {

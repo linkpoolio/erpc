@@ -361,7 +361,7 @@ func TestNetworkHandle_SuggestLatestBlock_FallbackAdvancesTipHWWhenNoPrimaryUp(t
 }
 
 // EvmRefreshHighestLatestBlockNumber must not regress the tip after
-// NoteObservedLatestBlock (sync publish path) has advanced TipHW.
+// NoteObservedLatestBlock has advanced TipHW.
 func TestEvmRefreshHighestLatestBlockNumber_PreservesObservedTip(t *testing.T) {
 	util.ResetGock()
 	defer util.ResetGock()
@@ -428,6 +428,6 @@ func TestEvmRefreshHighestLatestBlockNumber_PreservesObservedTip(t *testing.T) {
 
 	network.NoteObservedLatestBlock(ctx, 1001)
 	assert.Equal(t, int64(1001), network.EvmRefreshHighestLatestBlockNumber(ctx),
-		"refresh after sync TipHW publish must keep the observed tip")
+		"refresh after NoteObservedLatestBlock must keep the observed tip")
 	assert.Equal(t, int64(1001), network.EvmHighestLatestBlockNumber(ctx))
 }

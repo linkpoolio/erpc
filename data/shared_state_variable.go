@@ -22,11 +22,6 @@ type CounterInt64SharedVariable interface {
 	GetValue() int64
 	TryUpdateIfStale(ctx context.Context, staleness time.Duration, getNewValue func(ctx context.Context) (int64, error)) (int64, error)
 	TryUpdate(ctx context.Context, newValue int64) int64
-	// TryUpdateAndPublish advances the local counter then synchronously
-	// publishes SET+pubsub to remote so sibling pods can observe the tip
-	// before the caller fans out a WS newHeads notification. On publish
-	// failure it falls back to the async background push path.
-	TryUpdateAndPublish(ctx context.Context, newValue int64) int64
 	// RefreshFromRemote performs a synchronous Redis GET and adopts the
 	// remote value when it is ahead of the local cache. Used on the HTTP
 	// tip-floor false-negative path (local TipHW appears caught up but a
@@ -437,49 +432,9 @@ func (c *counterInt64) TryUpdate(ctx context.Context, newValue int64) int64 {
 	return c.value.Load()
 }
 
-// tipPublishTimeout bounds the synchronous TipHW SET+pubsub so WS fan-out
-// never stalls hard on a slow Redis. Callers may pass a tighter deadline via ctx.
-const tipPublishTimeout = 100 * time.Millisecond
-
-func (c *counterInt64) TryUpdateAndPublish(ctx context.Context, newValue int64) int64 {
-	ctx, span := common.StartSpan(ctx, "CounterInt64.TryUpdateAndPublish",
-		trace.WithAttributes(
-			attribute.String("key", c.key),
-		),
-	)
-	defer span.End()
-	if common.IsTracingDetailed {
-		span.SetAttributes(
-			attribute.Int64("new_value", newValue),
-		)
-	}
-
-	updated := c.processNewValue(UpdateSourceTryUpdate, newValue)
-	local := c.localState()
-	if local.UpdatedAt <= 0 {
-		return c.value.Load()
-	}
-
-	pubCtx := ctx
-	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
-		var cancel context.CancelFunc
-		pubCtx, cancel = context.WithTimeout(ctx, tipPublishTimeout)
-		defer cancel()
-	}
-
-	if err := c.publishRemoteState(pubCtx, local); err != nil {
-		c.registry.logger.Debug().Err(err).
-			Str("key", c.key).
-			Int64("value", local.Value).
-			Msg("sync tip publish failed; falling back to background push")
-		c.scheduleBackgroundPushCurrent()
-	} else if updated {
-		// Sync publish succeeded for the new tip; still schedule background
-		// reconcile under the distributed lock so remote SET stays consistent.
-		c.scheduleBackgroundPushCurrent()
-	}
-	return c.value.Load()
-}
+// tipRefreshTimeout bounds RefreshFromRemote's GET so the HTTP path never
+// stalls hard on a slow Redis. Callers may pass a tighter deadline via ctx.
+const tipRefreshTimeout = 100 * time.Millisecond
 
 func (c *counterInt64) RefreshFromRemote(ctx context.Context) int64 {
 	ctx, span := common.StartSpan(ctx, "CounterInt64.RefreshFromRemote",
@@ -492,7 +447,7 @@ func (c *counterInt64) RefreshFromRemote(ctx context.Context) int64 {
 	getCtx := ctx
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
 		var cancel context.CancelFunc
-		getCtx, cancel = context.WithTimeout(ctx, tipPublishTimeout)
+		getCtx, cancel = context.WithTimeout(ctx, tipRefreshTimeout)
 		defer cancel()
 	}
 
@@ -732,12 +687,6 @@ func (c *counterInt64) tryGetRemoteState(ctx context.Context) (CounterInt64State
 }
 
 func (c *counterInt64) updateRemoteState(ctx context.Context, st CounterInt64State) {
-	_ = c.publishRemoteState(ctx, st)
-}
-
-// publishRemoteState writes SET + pubsub for the counter. Returns an error
-// when either step fails so sync tip publishers can fall back to the async path.
-func (c *counterInt64) publishRemoteState(ctx context.Context, st CounterInt64State) error {
 	if st.UpdatedBy == "" {
 		st.UpdatedBy = c.registry.instanceId
 	}
@@ -747,7 +696,7 @@ func (c *counterInt64) publishRemoteState(ctx context.Context, st CounterInt64St
 			Str("key", c.key).
 			Int64("value", st.Value).
 			Msg("failed to marshal counter state for remote update")
-		return err
+		return
 	}
 
 	err = c.registry.connector.Set(ctx, c.key, "value", payload, nil)
@@ -759,15 +708,14 @@ func (c *counterInt64) publishRemoteState(ctx context.Context, st CounterInt64St
 			Str("key", c.key).
 			Int64("value", st.Value).
 			Msg("failed to update remote counter value")
-		return err
+	} else {
+		c.registry.logger.Debug().
+			Str("key", c.key).
+			Int64("value", st.Value).
+			Int64("updatedAt", st.UpdatedAt).
+			Str("updatedBy", st.UpdatedBy).
+			Msg("published counter value to remote")
 	}
-	c.registry.logger.Debug().
-		Str("key", c.key).
-		Int64("value", st.Value).
-		Int64("updatedAt", st.UpdatedAt).
-		Str("updatedBy", st.UpdatedBy).
-		Msg("published counter value to remote")
-	return nil
 }
 
 // scheduleBackgroundPushCurrent dedupes and pushes the current local value to the
@@ -836,6 +784,13 @@ func (c *counterInt64) scheduleBackgroundPushCurrent() {
 					_ = c.processNewState(UpdateSourceRemoteCheck, remote)
 					c.updateMu.Unlock()
 					local = c.localState()
+				}
+
+				// Remote ahead by no more than ignoreRollbackOf means we are
+				// lagging: adopt it instead of overwriting it with a lower value.
+				if remoteOk && remote.Value > local.Value && remote.Value-local.Value <= c.ignoreRollbackOf {
+					c.processNewValue(UpdateSourceRemoteCheck, remote.Value)
+					return
 				}
 
 				// If our local state is newer (or remote missing), push it to remote.

@@ -10,17 +10,12 @@ import (
 	"github.com/erpc/erpc/common"
 )
 
-// BuildParamsKey returns a stable short hash of eth_subscribe params. The
-// same (subType, params) tuple always hashes to the same key across
-// processes, so the key doubles as a fan-out lookup across sources and
-// across pods. Uses encoding/json rather than SonicCfg because it sorts map
+// BuildParamsKey returns a short hash of eth_subscribe params that is stable
+// across sources and processes. encoding/json is used because it sorts map
 // keys.
 func BuildParamsKey(params []interface{}) string {
 	data, err := json.Marshal(params)
 	if err != nil {
-		// Fall back to Go's default formatting. Worse than JSON for
-		// cross-process stability, but only hit on marshal errors that
-		// would already have broken the upstream subscribe call.
 		return fmt.Sprintf("%v", params)
 	}
 	h := fnv.New64a()
@@ -28,9 +23,8 @@ func BuildParamsKey(params []interface{}) string {
 	return fmt.Sprintf("%x", h.Sum64())
 }
 
-// ExtractSubscriptionType pulls the subscription type (e.g. "newHeads",
-// "logs") from the first element of an eth_subscribe params array.
-// Returns "" when params is empty or the first element isn't a string.
+// ExtractSubscriptionType returns the subscription type of eth_subscribe
+// params, or "" if the first param is missing or not a string.
 func ExtractSubscriptionType(params []interface{}) string {
 	if len(params) == 0 {
 		return ""
@@ -39,9 +33,8 @@ func ExtractSubscriptionType(params []interface{}) string {
 	return st
 }
 
-// ExtractClientSubID pulls the client-facing subscription ID from an
-// eth_unsubscribe params array. Returns a typed "subscription not found"
-// error when the ID is missing or not a string.
+// ExtractClientSubID returns the subscription ID of eth_unsubscribe params,
+// or a subscription-not-found error if it is missing or not a string.
 func ExtractClientSubID(params []interface{}) (string, error) {
 	if len(params) == 0 {
 		return "", common.NewErrSubscriptionNotFound("")
@@ -53,10 +46,8 @@ func ExtractClientSubID(params []interface{}) (string, error) {
 	return id, nil
 }
 
-// GenerateClientSubID creates a cryptographically random subscription ID
-// formatted as "0x" + 32 hex characters (16 random bytes). The format
-// matches what Ethereum clients emit so consumers can treat our IDs as
-// opaque strings.
+// GenerateClientSubID returns a random subscription ID in the "0x" + 32 hex
+// format Ethereum clients use.
 func GenerateClientSubID() (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {

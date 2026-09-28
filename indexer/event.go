@@ -2,25 +2,17 @@ package indexer
 
 import "encoding/json"
 
-// EventKind is a tagged-union discriminant for events flowing through the
-// indexer pipeline. Separate types for each kind would force sum-type
-// dispatch at every stage (dedup, fan-out) — the discriminant lets every
-// stage operate on a uniform value, which is worth the modest loss of
-// compile-time guarantees on per-kind fields.
+// EventKind discriminates the events flowing through the indexer.
 type EventKind uint8
 
 const (
 	KindUnknown EventKind = iota
-	// KindNewHead: a canonical block header. One-shot per new block.
 	KindNewHead
-	// KindLog: an event log delivered by a filter subscription.
 	KindLog
-	// KindPendingTx: a newly-seen pending transaction hash or object.
 	KindPendingTx
 )
 
-// String returns the name matching Ethereum's eth_subscribe surface (or
-// "unknown").
+// String returns the matching eth_subscribe subscription type.
 func (k EventKind) String() string {
 	switch k {
 	case KindNewHead:
@@ -34,50 +26,37 @@ func (k EventKind) String() string {
 	}
 }
 
-// BlockRef identifies a block on a network. Zero-valued for KindPendingTx
-// (pending txs don't carry a block reference until mined).
+// BlockRef identifies a block. It is zero for events without one.
 type BlockRef struct {
 	Number int64
 	Hash   string
 }
 
-// Zero reports whether the BlockRef is the zero value — i.e. no block
-// reference is attached (pending tx).
 func (b BlockRef) Zero() bool {
 	return b.Number == 0 && b.Hash == ""
 }
 
-// StreamEvent is what an ingress emits. It is pre-dedup and may duplicate
-// events delivered by sibling sources covering the same network. The
-// Indexer converts StreamEvents → IndexedEvents.
+// StreamEvent is what an ingress emits, before dedup: sources covering the
+// same network may emit the same event.
 type StreamEvent struct {
 	Kind      EventKind
 	NetworkId string
-	// SourceId names the ingress that produced this event ("ws:<upstreamId>",
-	// "kafka:<topic>", …). Used for per-source bookkeeping inside the
-	// indexer (e.g. state-poller updates are per upstream) but never
-	// surfaced to egresses.
+	// SourceId is the Name() of the ingress that produced the event.
 	SourceId string
 	Block    BlockRef
-	// FilterHash identifies the filter subscription this event belongs to
-	// for Kind{Log,PendingTx}. Empty for KindNewHead. Matches the hash
-	// returned by BuildParamsKey when clients subscribe.
+	// FilterHash is the BuildParamsKey of the filter the event belongs to;
+	// empty for KindNewHead.
 	FilterHash string
-	// Payload is the upstream-provided notification result, verbatim JSON.
-	// Adapters must not re-marshal — both to preserve upstream formatting
-	// quirks and to let non-JSON egresses (protobuf, flatbuf) decode once
-	// and cache beside the event.
+	// Payload is the upstream's notification result, verbatim.
 	Payload json.RawMessage
 }
 
-// IndexedEvent is what the Indexer emits to every registered egress after
-// dedup: one per observed StreamEvent, minus duplicates. The indexer never
-// synthesizes events — reorged-out logs reach clients only as the
-// upstream's own removed:true notifications, passed through verbatim.
+// IndexedEvent is a deduplicated StreamEvent as delivered to egresses. The
+// indexer never synthesizes events: reorged-out logs reach clients only as
+// the upstream's own removed:true notifications.
 type IndexedEvent struct {
 	StreamEvent
 
-	// Removed mirrors the upstream-asserted "removed" flag of a log
-	// payload. Always false for other kinds.
+	// Removed is the log payload's "removed" flag; false for other kinds.
 	Removed bool
 }

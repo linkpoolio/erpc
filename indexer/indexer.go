@@ -10,21 +10,15 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// Options configures Indexer construction. Defaults (zero values) are
-// sensible for all fields; override only for tuning.
+// Options configures an Indexer. Zero values select the defaults.
 type Options struct {
-	// DedupWindowSize is the per-filter seen-set capacity. 0 = default.
+	// DedupWindowSize is the per-filter dedup capacity.
 	DedupWindowSize int
 }
 
-// Indexer is the transport-neutral core: ingresses push StreamEvents via
-// Sink.Ingest; the indexer dedupes them, then fans out to every interested
-// egress.
-//
-// The Indexer itself implements Sink so adapters can call indexer.Ingest
-// directly — the choice is deliberate: synchronous Ingest keeps
-// "update-before-dedup" ordering guarantees from the ingress goroutine
-// without goroutine-per-event channel gymnastics.
+// Indexer dedupes the StreamEvents ingresses push at it and fans them out
+// to every interested egress. Ingest runs synchronously on the ingress's
+// goroutine, which keeps per-source ordering without extra queues.
 type Indexer struct {
 	logger *zerolog.Logger
 	opts   Options
@@ -46,10 +40,7 @@ type networkState struct {
 
 	ingressMu sync.RWMutex
 	ingresses map[string]EventIngress // Name() -> ingress
-	// selector, when non-nil, narrows per-filter fan-out to a chosen
-	// subset of ingresses (defaults first, fallbacks on total failure).
-	// Nil means "treat every registered ingress as a default."
-	selector IngressSelector
+	selector  IngressSelector         // nil: every ingress is a default
 
 	// headMu serialises newHeads dedup and fan-out, so concurrent sources
 	// can neither deliver the same head twice nor deliver heads out of
@@ -72,38 +63,34 @@ type filterState struct {
 	dedup      *DedupWindow
 }
 
-// New returns an empty Indexer. Networks must be registered via
-// RegisterNetwork before any ingress can push events.
+// New returns an empty Indexer. Events for networks not registered with
+// RegisterNetwork are ignored.
 func New(logger *zerolog.Logger, opts Options) *Indexer {
-	if opts.DedupWindowSize <= 0 {
-		opts.DedupWindowSize = DefaultDedupWindowSize
-	}
 	return &Indexer{
 		logger: logger,
 		opts:   opts,
 	}
 }
 
-// RegisterNetwork installs a NetworkHandle for the indexer to consult when
-// routing per-source state-poller updates. Safe to call more than once for
-// the same network (idempotent on handle identity).
-func (i *Indexer) RegisterNetwork(nw NetworkHandle) *networkState {
-	if ns, ok := i.networks.Load(nw.Id()); ok {
-		return ns.(*networkState)
+// RegisterNetwork registers a network; later calls for the same Id() keep
+// the first handle.
+func (i *Indexer) RegisterNetwork(nw NetworkHandle) {
+	if _, ok := i.networks.Load(nw.Id()); ok {
+		return
 	}
-	ns := &networkState{
+	i.networks.LoadOrStore(nw.Id(), &networkState{
 		handle:    nw,
 		ingresses: make(map[string]EventIngress),
 		filters:   make(map[string]*filterState),
-	}
-	actual, _ := i.networks.LoadOrStore(nw.Id(), ns)
-	return actual.(*networkState)
+	})
 }
 
-// AddIngress starts an ingress and hands it the NetworkHandle registered
-// for networkId. The ingress pushes events at the indexer (which
-// implements Sink). Returns an error if the network has not been
-// registered yet.
+func errNetworkNotRegistered(networkId string) error {
+	return fmt.Errorf("indexer: network %q not registered", networkId)
+}
+
+// AddIngress adds an ingress to a registered network and starts it with
+// the indexer as its Sink.
 func (i *Indexer) AddIngress(ctx context.Context, networkId string, ing EventIngress) error {
 	nsRaw, ok := i.networks.Load(networkId)
 	if !ok {
@@ -116,18 +103,14 @@ func (i *Indexer) AddIngress(ctx context.Context, networkId string, ing EventIng
 	return ing.Start(ctx, ns.handle, i)
 }
 
-// Attach registers an egress. The returned detach function removes the
-// egress — callers that care about cleanup (client-connection closes)
-// must invoke it.
+// Attach registers an egress until the returned detach is called.
 func (i *Indexer) Attach(eg EventEgress) (detach func()) {
 	i.egresses.Store(eg.Name(), eg)
 	return func() { i.egresses.Delete(eg.Name()) }
 }
 
-// RegisterNetworkSelector installs a per-network IngressSelector that
-// EnsureFilter consults when deciding which ingresses to subscribe. Passing
-// nil restores the legacy "fan out to every registered ingress" behaviour.
-// The network must have been registered first.
+// RegisterNetworkSelector sets the IngressSelector EnsureFilter uses for a
+// registered network; nil selects every ingress.
 func (i *Indexer) RegisterNetworkSelector(networkId string, sel IngressSelector) {
 	nsRaw, ok := i.networks.Load(networkId)
 	if !ok {
@@ -139,10 +122,9 @@ func (i *Indexer) RegisterNetworkSelector(networkId string, sel IngressSelector)
 	ns.ingressMu.Unlock()
 }
 
-// EnsureFilter subscribes a filter on this network's ingresses and tracks
-// a per-filter refcount so ReleaseFilter can decide when to tear it down
-// upstream. Concurrent callers for the same filter wait for the subscribe
-// in flight; if it failed they try again themselves.
+// EnsureFilter takes a reference on a filter, subscribing it on the
+// network's ingresses if needed. Concurrent callers for the same filter wait
+// for the subscribe in flight and retry it themselves if it failed.
 func (i *Indexer) EnsureFilter(ctx context.Context, networkId, subType string, params []interface{}) (paramsHash string, err error) {
 	nsRaw, ok := i.networks.Load(networkId)
 	if !ok {
@@ -187,8 +169,6 @@ func (i *Indexer) EnsureFilter(ctx context.Context, networkId, subType string, p
 func (i *Indexer) subscribe(ctx context.Context, ns *networkState, subType, paramsHash string, params []interface{}) error {
 	networkId := ns.handle.Id()
 
-	// Snapshot the ingress set and selector under rlock, then do the
-	// potentially slow per-ingress RPC calls without holding any lock.
 	ns.ingressMu.RLock()
 	ings := make(map[string]EventIngress, len(ns.ingresses))
 	for name, ing := range ns.ingresses {
@@ -251,9 +231,8 @@ func partitionIngresses(sel IngressSelector, ings map[string]EventIngress, netwo
 	return pick(dNames), pick(fNames)
 }
 
-// ReleaseFilter decrements the refcount on the filter and, when it hits
-// zero, tears the subscription down on every registered ingress. Callers
-// supply paramsHash (returned by EnsureFilter) rather than params.
+// ReleaseFilter drops a reference taken by EnsureFilter and unsubscribes the
+// filter from every ingress once none remain.
 func (i *Indexer) ReleaseFilter(ctx context.Context, networkId, subType, paramsHash string) {
 	nsRaw, ok := i.networks.Load(networkId)
 	if !ok {
@@ -293,9 +272,8 @@ func (i *Indexer) ReleaseFilter(ctx context.Context, networkId, subType, paramsH
 	ns.filterMu.Unlock()
 }
 
-// removeFromIngresses calls RemoveFilter on every registered ingress;
-// ingresses that never received EnsureFilter for paramsHash are expected
-// to no-op.
+// removeFromIngresses calls RemoveFilter on every ingress; those that never
+// subscribed the filter no-op.
 func (i *Indexer) removeFromIngresses(ctx context.Context, ns *networkState, subType, paramsHash string) {
 	ns.ingressMu.RLock()
 	ings := make([]EventIngress, 0, len(ns.ingresses))
@@ -313,9 +291,8 @@ func (i *Indexer) removeFromIngresses(ctx context.Context, ns *networkState, sub
 	}
 }
 
-// Ingest is the hot-path entry point for ingress adapters. It updates
-// per-source state (via NetworkHandle.SuggestLatestBlock for headed
-// events), dedupes, and fans out to every interested egress.
+// Ingest reports heads to the NetworkHandle, dedupes, and fans out to every
+// interested egress.
 func (i *Indexer) Ingest(ev StreamEvent) {
 	nsRaw, ok := i.networks.Load(ev.NetworkId)
 	if !ok {
@@ -323,16 +300,13 @@ func (i *Indexer) Ingest(ev StreamEvent) {
 	}
 	ns := nsRaw.(*networkState)
 
-	// State-poller update before dedup. Every observation feeds the
-	// per-upstream latest-block tracker, even if the head is a dup at
-	// the indexer level — otherwise a lagging source's state poller
-	// stalls on the first dup.
+	// Before dedup, so every source's head counts even if another source
+	// already delivered it.
 	if ev.Kind == KindNewHead && !ev.Block.Zero() && ev.SourceId != "" {
 		ns.handle.SuggestLatestBlock(ev.SourceId, ev.Block.Number, ev.Payload)
 	}
 
-	// Upstream-asserted removed flag, passed through: the indexer does not
-	// second-guess which chain is canonical.
+	// The upstream's removed flag is trusted as-is.
 	removed := ev.Kind == KindLog && logRemoved(ev.Payload)
 
 	if ev.Kind == KindNewHead {
@@ -346,10 +320,8 @@ func (i *Indexer) Ingest(ev StreamEvent) {
 	i.fanOut(IndexedEvent{StreamEvent: ev, Removed: removed})
 }
 
-// dedupe returns true if the event should be delivered, false if it's a
-// dupe. newHeads dedupe on the most recently delivered (number, hash);
-// filter events on a bounded per-filter DedupWindow keyed by identity, with
-// removed as the per-key state.
+// dedupe reports whether ev should be delivered. Heads are compared to the
+// last delivered head; filter events go through their filter's DedupWindow.
 func (i *Indexer) dedupe(ns *networkState, ev *StreamEvent, removed bool) bool {
 	switch ev.Kind {
 	case KindNewHead:
@@ -367,14 +339,10 @@ func (i *Indexer) dedupe(ns *networkState, ev *StreamEvent, removed bool) bool {
 		f := ns.filters[ev.FilterHash]
 		ns.filterMu.RUnlock()
 		if f == nil {
-			// Filter not registered with this indexer instance (e.g. an
-			// ingress delivered an event for a filter we never EnsureFilter'd).
-			// Allow through — upstream subs we didn't request are rare.
 			return true
 		}
 		key := DedupKeyForFilter(ev.Kind.String(), ev.Payload)
 		if key == "" {
-			// Couldn't extract a key; don't pretend we deduped.
 			return true
 		}
 		return f.dedup.Mark(key, removed)
@@ -383,7 +351,6 @@ func (i *Indexer) dedupe(ns *networkState, ev *StreamEvent, removed bool) bool {
 	}
 }
 
-// fanOut dispatches to every registered egress whose InterestedIn matches.
 func (i *Indexer) fanOut(ev IndexedEvent) {
 	i.egresses.Range(func(_, v any) bool {
 		eg := v.(EventEgress)

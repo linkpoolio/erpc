@@ -8,21 +8,15 @@ import (
 	"github.com/erpc/erpc/common"
 )
 
-// DedupKeyForFilter returns a stable identifier for a filter-subscription
-// notification payload, or "" when the payload's identity cannot be
-// established (caller should then fan out without deduping, since we can't
-// prove it's a dupe).
+// DedupKeyForFilter returns the identity of a filter notification, or "" if
+// it cannot be established (the caller then delivers without deduping).
 //
-//   - logs: blockHash + txHash + logIndex. All three must be present. The
-//     removed flag is deliberately NOT part of the key: it is the state of
-//     the log, tracked per key by DedupWindow, so add → remove → re-add
-//     are each delivered while N upstreams reporting the same transition
-//     collapse to one.
-//   - newPendingTransactions: the tx hash, whether the upstream returned
-//     a raw string or an object with a .hash field.
+//   - logs: blockHash + txHash + logIndex, all required. The removed flag is
+//     not part of the key but the state DedupWindow tracks per key, so
+//     add, remove and re-add are each delivered once.
+//   - newPendingTransactions: the tx hash, from a string or an object's hash.
 //
-// Keys are lowercased because hex on the wire is case-insensitive; the
-// payload itself is never touched.
+// Keys are lowercased because hex on the wire is case-insensitive.
 func DedupKeyForFilter(subType string, result json.RawMessage) string {
 	switch subType {
 	case SubTypeLogs:
@@ -53,12 +47,22 @@ func DedupKeyForFilter(subType string, result json.RawMessage) string {
 	return ""
 }
 
-// DedupWindow is a bounded FIFO map from key to the last delivered state
-// (the log's removed flag; always false for kinds without one). Keys added
-// past the window's capacity evict the oldest entries. It is safe for
-// concurrent use; callers typically hold one per (network, subType,
-// paramsHash) fan-out group. Storage grows with use rather than being
-// preallocated to capacity: most filters see far fewer keys than the cap.
+// logRemoved returns a log payload's "removed" flag, false if unparseable.
+func logRemoved(payload json.RawMessage) bool {
+	if len(payload) == 0 {
+		return false
+	}
+	var probe struct {
+		Removed bool `json:"removed"`
+	}
+	if err := common.SonicCfg.Unmarshal(payload, &probe); err != nil {
+		return false
+	}
+	return probe.Removed
+}
+
+// DedupWindow is a bounded FIFO map from key to its last delivered removed
+// state. Keys past capacity evict the oldest. Safe for concurrent use.
 type DedupWindow struct {
 	size int
 
@@ -67,8 +71,8 @@ type DedupWindow struct {
 	order []string
 }
 
-// NewDedupWindow returns a DedupWindow sized to hold up to `size` keys
-// before the oldest entries are evicted. Pass 0 to use DefaultDedupWindowSize.
+// NewDedupWindow returns a DedupWindow holding up to size keys, or
+// DefaultDedupWindowSize if size is not positive.
 func NewDedupWindow(size int) *DedupWindow {
 	if size <= 0 {
 		size = DefaultDedupWindowSize
@@ -79,10 +83,8 @@ func NewDedupWindow(size int) *DedupWindow {
 	}
 }
 
-// Mark records that key is now in `removed` state and returns true if the
-// caller should deliver: the key is unseen, or its last delivered state
-// differs. Returns false for a repeat of the last delivered state (caller
-// should drop the duplicate).
+// Mark records key in the given removed state and reports whether it should
+// be delivered: the key is new or its last delivered state differs.
 func (w *DedupWindow) Mark(key string, removed bool) bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()

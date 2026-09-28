@@ -85,8 +85,7 @@ func findUpstream(t *testing.T, registry *UpstreamsRegistry, id string) *Upstrea
 	return nil
 }
 
-// TestGetFallbackEscapeUpstreams_FiltersByGroup verifies only fallback-group
-// upstreams are returned.
+// Only fallback-tier upstreams are returned.
 func TestGetFallbackEscapeUpstreams_FiltersByGroup(t *testing.T) {
 	defer util.ResetGock()
 	defer util.AssertNoPendingMocks(t, 0)
@@ -103,10 +102,8 @@ func TestGetFallbackEscapeUpstreams_FiltersByGroup(t *testing.T) {
 		"only group=fallback upstreams should be returned; got %v", ids)
 }
 
-// TestGetFallbackEscapeUpstreams_IgnoresCordon verifies cordoned fallbacks
-// are STILL returned. This is the central property of the escape hatch:
-// the cordon-by-selectionPolicy must NOT exclude upstreams from the escape
-// path, because the cordon is exactly what the escape is designed to bypass.
+// Cordoned fallbacks are still returned: the escape exists to bypass the
+// selection policy's cordon.
 func TestGetFallbackEscapeUpstreams_IgnoresCordon(t *testing.T) {
 	defer util.ResetGock()
 	defer util.AssertNoPendingMocks(t, 0)
@@ -132,9 +129,7 @@ func TestGetFallbackEscapeUpstreams_IgnoresCordon(t *testing.T) {
 		"cordoned fallbacks must still be returned for the escape path; got %v", ids)
 }
 
-// TestGetFallbackEscapeUpstreams_FiltersIgnoreMethods verifies fallbacks
-// whose IgnoreMethods contains the caller method are excluded — the escape
-// path respects per-upstream method capabilities.
+// Fallbacks that ignore the method are excluded.
 func TestGetFallbackEscapeUpstreams_FiltersIgnoreMethods(t *testing.T) {
 	defer util.ResetGock()
 	defer util.AssertNoPendingMocks(t, 0)
@@ -164,9 +159,7 @@ func TestGetFallbackEscapeUpstreams_FiltersIgnoreMethods(t *testing.T) {
 		"eth_getLogs is not ignored; both fallbacks should be returned; got %v", ids2)
 }
 
-// TestGetFallbackEscapeUpstreams_NoFallbacksReturnsEmpty verifies the
-// helper returns an empty slice (not nil-causing-panic) when no fallbacks
-// are configured.
+// With no fallbacks configured the result is empty.
 func TestGetFallbackEscapeUpstreams_NoFallbacksReturnsEmpty(t *testing.T) {
 	util.ResetGock()
 	util.SetupMocksForEvmStatePoller()

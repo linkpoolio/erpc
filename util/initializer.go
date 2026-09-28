@@ -132,10 +132,8 @@ func (t *BootstrapTask) Wait(ctx context.Context) error {
 			case <-ctx.Done():
 				return ctx.Err()
 			case <-ch.(chan struct{}):
-				// Attempt ended — loop back to the terminal-state check so
-				// TimedOut/Fatal/Failed all surface lastErr consistently
-				// (previously only TaskFailed was handled here, so a deadline
-				// TimedOut incorrectly returned nil).
+				// The attempt ended; re-check the terminal state so every
+				// failure kind surfaces lastErr.
 				continue
 			}
 		}
@@ -246,11 +244,8 @@ func (i *Initializer) WaitForTasks(ctx context.Context) error {
 	return i.waitForTasks(ctx, allTasks...)
 }
 
-// Wait for a set of tasks to complete or ctx to expire.
-//
-// Waits run in parallel so one slow/hung task cannot serialize the wait
-// budget across siblings (previously a single hung task at the front of
-// sync.Map iteration burned the whole timeout before others were observed).
+// Wait for a set of tasks to complete or ctx to expire. Waits run in
+// parallel so one hung task cannot consume the budget of the others.
 func (i *Initializer) waitForTasks(ctx context.Context, tasks ...*BootstrapTask) error {
 	if len(tasks) == 0 {
 		return nil
@@ -275,9 +270,8 @@ func (i *Initializer) waitForTasks(ctx context.Context, tasks ...*BootstrapTask)
 			continue
 		}
 		st := TaskState(res.task.state.Load())
-		// Wait-context abort: task still in-flight when Wait returned a
-		// context error. A task that already finished as TimedOut also
-		// surfaces DeadlineExceeded via lastErr — that is a task failure.
+		// A context error for a task still in flight means the wait itself
+		// was aborted; a finished TimedOut task is a task failure.
 		if (errors.Is(res.err, context.Canceled) || errors.Is(res.err, context.DeadlineExceeded)) &&
 			(st == TaskPending || st == TaskRunning) {
 			if ctxErr == nil {
@@ -293,13 +287,10 @@ func (i *Initializer) waitForTasks(ctx context.Context, tasks ...*BootstrapTask)
 	if len(errs) > 0 {
 		total := len(tasks)
 		i.logger.Warn().Errs("tasks", errs).Msgf("initialization failed: %d/%d tasks failed", len(errs), total)
+		// Keep the tasks' own errors reachable for typed error checks.
 		if len(errs) == 1 {
-			// Return the task's own error so typed checks (common.HasErrorCode,
-			// HTTP status mapping) keep working; a fmt wrapper would hide it.
 			return errs[0]
 		}
-		// errors.Join exposes Unwrap() []error, which the typed error checks
-		// traverse; a fmt.Errorf("%w") wrapper around it would not be.
 		return errors.Join(append([]error{fmt.Errorf("initialization failed: %d/%d tasks failed", len(errs), total)}, errs...)...)
 	}
 	return nil
@@ -387,7 +378,7 @@ func (i *Initializer) attemptRemainingTasks(respectBackoff bool) {
 				tasksToRun = append(tasksToRun, t)
 
 				go func(bt *BootstrapTask, doneCh chan struct{}, attemptID int32) {
-					// Close the channel when the function finishes.
+					// Close the channel when the function finishes
 					defer close(doneCh)
 
 					if i.appCtx.Err() != nil {
@@ -410,6 +401,8 @@ func (i *Initializer) attemptRemainingTasks(respectBackoff bool) {
 						// Detect fatal control errors without importing the common package to avoid cycles
 						var fatal interface{ IsTaskFatal() bool }
 						if errors.As(err, &fatal) {
+							// Fatal errors should stop retries
+							// Unwrap underlying error if available
 							underlying := err
 							if uw, ok := err.(interface{ Unwrap() error }); ok && uw.Unwrap() != nil {
 								underlying = uw.Unwrap()
@@ -496,10 +489,8 @@ func (i *Initializer) State() InitializationState {
 		return StateReady
 	}
 
-	// failed + timedOut are retryable; pending/running are in-flight.
-	// Do NOT map "any fatal" → StateFatal while siblings can still recover —
-	// one permanently-misconfigured upstream must not mark a shared
-	// Initializer (dozens of networks) as wholly fatal.
+	// A fatal task must not mark the whole initializer fatal while other
+	// tasks can still recover.
 	retryable := failed + timedOut
 	inFlight := pending + running
 	nonTerminal := inFlight + retryable
@@ -529,12 +520,9 @@ func (i *Initializer) State() InitializationState {
 	return StateInitializing
 }
 
-// reapOverdueRunningTasks force-transitions Running tasks whose attempt has
-// exceeded TaskTimeout to TaskTimedOut. Used after a bounded WaitForTasks so a
-// Fn that ignores ctx cannot keep the auto-retry loop's hasPendingWork true
-// forever as TaskRunning (and cannot block Stop on that goroutine forever —
-// Stop still may time out waiting for the leaked Fn, but the task is
-// retryable again).
+// reapOverdueRunningTasks moves Running tasks whose attempt exceeded
+// TaskTimeout to TaskTimedOut, so a Fn that ignores its ctx leaves the task
+// retryable instead of Running forever.
 func (i *Initializer) reapOverdueRunningTasks() {
 	now := time.Now()
 	i.tasks.Range(func(_, value interface{}) bool {
@@ -603,10 +591,8 @@ func (i *Initializer) MarkTaskAsFailed(name string, err error) {
 func (i *Initializer) Stop(destroyFn func() error) error {
 	i.logger.Debug().Msg("stopping initializer")
 
-	// Cancel the auto-retry loop and wait for it to exit BEFORE taking
-	// tasksMu: the loop acquires tasksMu inside attemptRemainingTasks, so
-	// holding the mutex while waiting for the goroutine can deadlock if the
-	// loop is blocked on the mutex when the cancel lands.
+	// Stop the auto-retry loop before taking tasksMu, which the loop also
+	// acquires.
 	if cancel := i.cancelAutoRetry.Load(); cancel != nil {
 		cancel.(context.CancelFunc)()
 	}
@@ -772,15 +758,11 @@ func (i *Initializer) autoRetryLoop(ctx context.Context) {
 		}
 		i.attempts.Add(1)
 		i.attemptRemainingTasks(false)
-		// Bounded wait: a task hung inside its Fn (e.g. a client dial that
-		// ignores ctx and never returns) stays Running forever; an unbounded
-		// WaitForTasks would then block this loop and stop retries of every
-		// other task.
+		// Bound the wait so a Fn that ignores its ctx cannot stop retries of
+		// every other task.
 		waitCtx, waitCancel := context.WithTimeout(ctx, i.conf.TaskTimeout)
 		err := i.WaitForTasks(waitCtx)
 		waitCancel()
-		// Reap Fns that ignored their deadline so they become TaskTimedOut
-		// (retryable) instead of wedging hasPendingWork as TaskRunning forever.
 		i.reapOverdueRunningTasks()
 		state := i.State()
 		// Stop only once no task can benefit from another attempt (every task

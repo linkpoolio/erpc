@@ -222,3 +222,68 @@ func TestRefreshHighestLatestBlockNumber_FallsBackWithoutRefresher(t *testing.T)
 	got := refreshHighestLatestBlockNumber(context.Background(), n)
 	assert.Equal(t, int64(0), got, "plain Network stubs use EvmHighestLatestBlockNumber")
 }
+
+// tipFetchNetwork serves any concrete block number from Forward so the tip
+// re-fetch in enforceHighestBlock can succeed.
+type tipFetchNetwork struct {
+	testNetwork
+	finalizedTip int64
+}
+
+func (n *tipFetchNetwork) EvmHighestFinalizedBlockNumber(ctx context.Context) int64 {
+	return n.finalizedTip
+}
+
+func (n *tipFetchNetwork) Forward(ctx context.Context, req *common.NormalizedRequest) (*common.NormalizedResponse, error) {
+	rqj, err := req.JsonRpcRequest(ctx)
+	if err != nil {
+		return nil, err
+	}
+	jrr, err := common.NewJsonRpcResponse(rqj.ID, map[string]interface{}{"number": rqj.Params[0]}, nil)
+	if err != nil {
+		return nil, err
+	}
+	return common.NewNormalizedResponse().WithRequest(req).WithJsonRpcResponse(jrr), nil
+}
+
+// A cached response carries no upstream. When it lags the tip, enforcement
+// must re-fetch the tip instead of dereferencing the missing upstream.
+func TestEnforceHighestBlock_CachedResponseWithoutUpstream(t *testing.T) {
+	cases := []struct {
+		tag           string
+		latestTip     int64
+		finalizedTip  int64
+		cachedNumber  string
+		expectedBlock int64
+	}{
+		{tag: "latest", latestTip: 0x101, cachedNumber: "0x100", expectedBlock: 0x101},
+		{tag: "finalized", latestTip: 0x200, finalizedTip: 0x101, cachedNumber: "0x100", expectedBlock: 0x101},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.tag, func(t *testing.T) {
+			network := &tipFetchNetwork{
+				testNetwork:  testNetwork{highestLatest: tc.latestTip},
+				finalizedTip: tc.finalizedTip,
+			}
+			req := common.NewNormalizedRequestFromJsonRpcRequest(
+				common.NewJsonRpcRequest("eth_getBlockByNumber", []interface{}{tc.tag, false}),
+			)
+			req.SetDirectives(&common.RequestDirectives{EnforceHighestBlock: true})
+			jrr, err := common.NewJsonRpcResponse(1, map[string]interface{}{"number": tc.cachedNumber}, nil)
+			assert.NoError(t, err)
+			cached := common.NewNormalizedResponse().WithRequest(req).WithFromCache(true).WithJsonRpcResponse(jrr)
+			assert.Nil(t, cached.Upstream())
+
+			var out *common.NormalizedResponse
+			assert.NotPanics(t, func() {
+				out, err = enforceHighestBlock(context.Background(), network, req, cached, nil)
+			})
+			assert.NoError(t, err)
+			assert.NotNil(t, out)
+			_, bn, err := ExtractBlockReferenceFromResponse(context.Background(), out)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.expectedBlock, bn)
+		})
+	}
+}

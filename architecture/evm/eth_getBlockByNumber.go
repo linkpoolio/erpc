@@ -222,14 +222,15 @@ func enforceHighestBlock(ctx context.Context, network common.Network, nq *common
 		}
 		// fall through to tip re-fetch / refuse-stale (logger already emitted)
 		if respBlockNumber > 0 {
-			ups := nr.Upstream()
-			telemetry.MetricUpstreamStaleLatestBlock.WithLabelValues(
-				network.ProjectId(),
-				ups.VendorName(),
-				network.Label(),
-				ups.Id(),
-				"eth_getBlockByNumber",
-			).Inc()
+			if ups := nr.Upstream(); ups != nil {
+				telemetry.MetricUpstreamStaleLatestBlock.WithLabelValues(
+					network.ProjectId(),
+					ups.VendorName(),
+					network.Label(),
+					ups.Id(),
+					"eth_getBlockByNumber",
+				).Inc()
+			}
 		}
 
 		// Prefer the upstream whose poller already owns this tip
@@ -326,13 +327,14 @@ func enforceHighestBlock(ctx context.Context, network common.Network, nq *common
 			Interface("respBlockNumber", respBlockNumber).
 			Msg("enforcing highest finalized block")
 		if respBlockNumber > 0 {
-			ups := nr.Upstream()
-			telemetry.MetricUpstreamStaleFinalizedBlock.WithLabelValues(
-				network.ProjectId(),
-				ups.VendorName(),
-				network.Label(),
-				ups.Id(),
-			).Inc()
+			if ups := nr.Upstream(); ups != nil {
+				telemetry.MetricUpstreamStaleFinalizedBlock.WithLabelValues(
+					network.ProjectId(),
+					ups.VendorName(),
+					network.Label(),
+					ups.Id(),
+				).Inc()
+			}
 		}
 		useUpstream := ""
 		if respBlockNumber > 0 {

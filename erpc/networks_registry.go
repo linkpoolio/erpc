@@ -176,13 +176,13 @@ func NewNetwork(
 	}
 
 	// Cross-instance delivered-head floor for "latest" (see
-	// Network.latestBlockShared). Tolerates up to 1024-block rollbacks (same
-	// threshold as per-upstream state pollers) so a rare deep reorg can still
-	// correct the value, but routine per-upstream jitter cannot.
+	// Network.latestBlockShared), keyed per project since each project has
+	// its own upstreams. Tolerates the same rollback as per-upstream state
+	// pollers so a rare deep reorg can still correct the value.
 	if upstreamsRegistry != nil {
 		if ssr := upstreamsRegistry.SharedStateRegistry(); ssr != nil {
 			network.latestBlockShared = ssr.GetCounterInt64(
-				fmt.Sprintf("network/%s/latestBlock", netId),
+				fmt.Sprintf("network/%s/%s/latestBlock", projectId, netId),
 				evm.DefaultToleratedBlockHeadRollback,
 			)
 		}

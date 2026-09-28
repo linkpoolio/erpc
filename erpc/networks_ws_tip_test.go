@@ -194,172 +194,39 @@ func TestNetworkHandle_SuggestLatestBlock_AdvancesNetworkTipBeforeFanOut(t *test
 		"process-local high-water mark must cover the delivered WS tip")
 }
 
-// Fallback WS tips must advance TipHW even while primaries are up: Ingest
-// fans out every source, so TipHW must cover any head a client can see.
-func TestNetworkHandle_SuggestLatestBlock_FallbackAdvancesTipHWEvenWhenPrimaryUp(t *testing.T) {
-	util.ResetGock()
+// Only a head from an upstream the selection policy keeps eligible lifts
+// "latest": a fallback-tier (cordoned) or unknown source still feeds its own
+// poller, but must not advertise a block no eligible upstream reports.
+func TestNetworkHandle_SuggestLatestBlock_OnlyTipCandidatesLiftLatest(t *testing.T) {
 	defer util.ResetGock()
-	util.SetupMocksForEvmStatePoller()
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	primary := &common.UpstreamConfig{
-		Type:     common.UpstreamTypeEvm,
-		Id:       "primary-ws",
-		Endpoint: "http://primary.localhost",
-		Evm:      &common.EvmUpstreamConfig{ChainId: 123},
-	}
-	fallback := &common.UpstreamConfig{
-		Type:     common.UpstreamTypeEvm,
-		Id:       "fallback-ws",
-		Endpoint: "http://fallback.localhost",
-		Tags:     []string{common.TagTierFallback},
-		Evm:      &common.EvmUpstreamConfig{ChainId: 123},
-	}
-
-	for _, host := range []string{"primary.localhost", "fallback.localhost"} {
-		gock.New("http://" + host).
-			Post("").
-			Persist().
-			Filter(func(r *http.Request) bool {
-				return strings.Contains(util.SafeReadBody(r), `eth_chainId`)
-			}).
-			Reply(200).
-			JSON([]byte(`{"result":"0x7b"}`))
-	}
-
-	rateLimitersRegistry, _ := upstream.NewRateLimitersRegistry(context.Background(), &common.RateLimiterConfig{}, &log.Logger)
-	metricsTracker := health.NewTracker(&log.Logger, "test", time.Minute)
-
-	vr := thirdparty.NewVendorsRegistry()
-	pr, err := thirdparty.NewProvidersRegistry(&log.Logger, vr, []*common.ProviderConfig{}, nil)
-	require.NoError(t, err)
-
-	ssr, err := data.NewSharedStateRegistry(ctx, &log.Logger, &common.SharedStateConfig{
-		Connector: &common.ConnectorConfig{
-			Driver: "memory",
-			Memory: &common.MemoryConnectorConfig{MaxItems: 100_000, MaxTotalSize: "1GB"},
-		},
+	network, ups, _ := setupFailoverFixture(t, ctx, failoverFixtureOpts{
+		primaryLatest:  "0x3e8", // 1000
+		fallbackLatest: "0x3e8",
 	})
-	require.NoError(t, err)
-
-	upstreamsRegistry := upstream.NewUpstreamsRegistry(
-		ctx, &log.Logger, "test",
-		[]*common.UpstreamConfig{primary, fallback}, ssr, rateLimitersRegistry, vr, pr, nil,
-		metricsTracker, nil,
-	)
-
-	networkConfig := &common.NetworkConfig{
-		Architecture: common.ArchitectureEvm,
-		Evm:          &common.EvmNetworkConfig{ChainId: 123},
-	}
-	network, err := NewNetwork(ctx, &log.Logger, "test", networkConfig,
-		rateLimitersRegistry, upstreamsRegistry, metricsTracker, nil)
-	require.NoError(t, err)
-
-	upstreamsRegistry.Bootstrap(ctx)
-	time.Sleep(200 * time.Millisecond)
-	require.NoError(t, upstreamsRegistry.GetInitializer().WaitForTasks(ctx))
-	require.NoError(t, network.Bootstrap(ctx))
-	time.Sleep(250 * time.Millisecond)
-
-	upsList := upstreamsRegistry.GetNetworkUpstreams(ctx, util.EvmNetworkId(123))
-	require.Len(t, upsList, 2)
-	var primaryUp, fallbackUp *upstream.Upstream
-	for _, u := range upsList {
-		switch u.Id() {
-		case "primary-ws":
-			primaryUp = u
-		case "fallback-ws":
-			fallbackUp = u
+	require.Equal(t, int64(1000), network.EvmHighestLatestBlockNumber(ctx))
+	var fallback *upstream.Upstream
+	for _, u := range ups {
+		if u.Id() == "fallback-1" {
+			fallback = u
 		}
 	}
-	require.NotNil(t, primaryUp)
-	require.NotNil(t, fallbackUp)
-
-	primaryUp.EvmStatePoller().SuggestLatestBlock(1000)
-	time.Sleep(50 * time.Millisecond)
-	require.Equal(t, int64(1000), network.EvmHighestLatestBlockNumber(ctx))
+	require.NotNil(t, fallback)
 
 	handle := &networkHandle{nw: network}
-	wsHeader := []byte(`{"number":"0x3ea","hash":"0xabc","parentHash":"0xdef"}`)
-	handle.SuggestLatestBlock("ws:fallback-ws", 1002, wsHeader)
+	handle.SuggestLatestBlock("ws:fallback-1", 1010, nil)
+	handle.SuggestLatestBlock("ws:unknown", 1020, nil)
 
-	assert.Equal(t, int64(1002), fallbackUp.EvmStatePoller().LatestBlock(),
-		"fallback poller must still advance for selection/escape")
-	assert.Equal(t, int64(1002), network.EvmHighestLatestBlockNumber(ctx),
-		"TipHW must cover fallback fan-out tip while primaries are up")
-	_ = primaryUp
-}
+	assert.Equal(t, int64(1010), fallback.EvmStatePoller().LatestBlock(),
+		"the fallback's own poller still advances")
+	assert.Equal(t, int64(1000), network.EvmHighestLatestBlockNumber(ctx),
+		"a cordoned or unknown source must not lift latest")
 
-// When every primary is down, fallback WS may advance TipHW (same rule as
-// evmHighestBlockNumber).
-func TestNetworkHandle_SuggestLatestBlock_FallbackAdvancesTipHWWhenNoPrimaryUp(t *testing.T) {
-	util.ResetGock()
-	defer util.ResetGock()
-	util.SetupMocksForEvmStatePoller()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	fallback := &common.UpstreamConfig{
-		Type:     common.UpstreamTypeEvm,
-		Id:       "fallback-only",
-		Endpoint: "http://fallback.localhost",
-		Tags:     []string{common.TagTierFallback},
-		Evm:      &common.EvmUpstreamConfig{ChainId: 123},
-	}
-
-	gock.New("http://fallback.localhost").
-		Post("").
-		Persist().
-		Filter(func(r *http.Request) bool {
-			return strings.Contains(util.SafeReadBody(r), `eth_chainId`)
-		}).
-		Reply(200).
-		JSON([]byte(`{"result":"0x7b"}`))
-
-	rateLimitersRegistry, _ := upstream.NewRateLimitersRegistry(context.Background(), &common.RateLimiterConfig{}, &log.Logger)
-	metricsTracker := health.NewTracker(&log.Logger, "test", time.Minute)
-
-	vr := thirdparty.NewVendorsRegistry()
-	pr, err := thirdparty.NewProvidersRegistry(&log.Logger, vr, []*common.ProviderConfig{}, nil)
-	require.NoError(t, err)
-
-	ssr, err := data.NewSharedStateRegistry(ctx, &log.Logger, &common.SharedStateConfig{
-		Connector: &common.ConnectorConfig{
-			Driver: "memory",
-			Memory: &common.MemoryConnectorConfig{MaxItems: 100_000, MaxTotalSize: "1GB"},
-		},
-	})
-	require.NoError(t, err)
-
-	upstreamsRegistry := upstream.NewUpstreamsRegistry(
-		ctx, &log.Logger, "test",
-		[]*common.UpstreamConfig{fallback}, ssr, rateLimitersRegistry, vr, pr, nil,
-		metricsTracker, nil,
-	)
-
-	networkConfig := &common.NetworkConfig{
-		Architecture: common.ArchitectureEvm,
-		Evm:          &common.EvmNetworkConfig{ChainId: 123},
-	}
-	network, err := NewNetwork(ctx, &log.Logger, "test", networkConfig,
-		rateLimitersRegistry, upstreamsRegistry, metricsTracker, nil)
-	require.NoError(t, err)
-
-	upstreamsRegistry.Bootstrap(ctx)
-	time.Sleep(200 * time.Millisecond)
-	require.NoError(t, upstreamsRegistry.GetInitializer().WaitForTasks(ctx))
-	require.NoError(t, network.Bootstrap(ctx))
-	time.Sleep(250 * time.Millisecond)
-
-	handle := &networkHandle{nw: network}
-	handle.SuggestLatestBlock("ws:fallback-only", 2005, []byte(`{"number":"0x7d5","hash":"0xabc","parentHash":"0xdef"}`))
-
-	assert.Equal(t, int64(2005), network.EvmHighestLatestBlockNumber(ctx),
-		"fallback WS may advance TipHW when no primary is up")
+	handle.SuggestLatestBlock("ws:primary-1", 1001, nil)
+	assert.Equal(t, int64(1001), network.EvmHighestLatestBlockNumber(ctx),
+		"an eligible upstream's head floors latest")
 }
 
 // countingSharedCounter counts foreground remote reads of the delivered-head
@@ -412,4 +279,52 @@ func TestDeliveredHeadFloor_AtTipRequestsMakeNoRemoteReads(t *testing.T) {
 		}
 	}
 	assert.Zero(t, counter.remoteReads.Load())
+}
+
+// The delivered-head floor is network-wide: a use-upstream-scoped request is
+// answered from its group's own head.
+func TestDeliveredHeadFloor_SkipsSelectorScopedRequests(t *testing.T) {
+	util.ResetGock()
+	defer util.ResetGock()
+	util.SetupMocksForEvmStatePoller()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	network, _ := setupServedTipNetworkWith(t, ctx, []servedTipFixture{
+		{id: "fast-1", chainID: 123, latestBlock: 1050, tags: []string{"family:fast"}},
+		{id: "fast-2", chainID: 123, latestBlock: 1050, tags: []string{"family:fast"}},
+		{id: "slow-1", chainID: 123, latestBlock: 1000, tags: []string{"family:slow"}},
+		{id: "slow-2", chainID: 123, latestBlock: 1000, tags: []string{"family:slow"}},
+	}, &common.EvmServedTipConfig{})
+	req := common.NewNormalizedRequest([]byte(`{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}`))
+	req.SetDirectives(&common.RequestDirectives{UseUpstream: "family:slow"})
+	slowCtx := context.WithValue(ctx, common.RequestContextKey, req)
+
+	network.NoteObservedLatestBlock(ctx, 1051)
+	assert.Equal(t, int64(1000), network.EvmHighestLatestBlockNumber(slowCtx))
+	assert.Equal(t, int64(1051), network.EvmHighestLatestBlockNumber(ctx))
+}
+
+// Projects sharing a process (and so a shared-state registry) must not floor
+// each other's "latest" for the same chain.
+func TestDeliveredHeadFloor_IsScopedPerProject(t *testing.T) {
+	util.ResetGock()
+	defer util.ResetGock()
+	util.SetupMocksForEvmStatePoller()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	network, _ := setupServedTipNetworkWith(t, ctx, []servedTipFixture{
+		{id: "a", chainID: 123, latestBlock: 1000},
+	}, &common.EvmServedTipConfig{})
+	sibling, err := NewNetwork(ctx, &log.Logger, "sibling", network.cfg,
+		network.rateLimitersRegistry, network.upstreamsRegistry, network.metricsTracker, nil)
+	require.NoError(t, err)
+	require.NotNil(t, sibling.latestBlockShared)
+
+	network.NoteObservedLatestBlock(ctx, 1001)
+	assert.Equal(t, int64(1001), network.latestBlockShared.GetValue())
+	assert.Equal(t, int64(0), sibling.latestBlockShared.GetValue())
 }

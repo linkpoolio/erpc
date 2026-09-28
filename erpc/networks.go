@@ -847,8 +847,12 @@ func (n *Network) EvmHighestLatestBlockNumber(ctx context.Context) int64 {
 
 	if !n.servedTipEnabledFor("latest") {
 		// tipCandidateUpstreams already scopes to the request's selector (if
-		// any), so the head is within-subset.
+		// any), so the head is within-subset. The delivered-head floor is
+		// network-wide, so it only applies to unscoped requests.
 		ref := n.evmHeadReference(ctx, false)
+		if requestSelector(ctx) != "" {
+			return ref.Corroborated
+		}
 		return n.applyDeliveredHeadFloor(ref.Corroborated, ref.Max)
 	}
 	if sel := requestSelector(ctx); sel != "" {

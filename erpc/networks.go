@@ -3046,7 +3046,7 @@ func (n *Network) handleBlockSkip(
 				go func() { // #nosec G118 -- fire-and-forget poll; must not share request lifetime
 					pollCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 					defer cancel()
-					_, _ = sp.PollLatestBlockNumberNow(pollCtx)
+					_, _ = sp.PollLatestBlockNumber(pollCtx)
 				}()
 			}
 		}

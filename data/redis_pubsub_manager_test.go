@@ -71,9 +71,7 @@ func TestSubscriberChannel_SendKeepLatestSequentialDeliversEachValue(t *testing.
 	}
 }
 
-// Once the subscriber has been closed, further sends must not block the
-// publisher — they return immediately. Prevents any single slow consumer
-// from wedging the pub/sub manager goroutine after cleanup.
+// Sends to a closed subscriber return immediately instead of blocking.
 func TestSubscriberChannel_SendKeepLatestReturnsAfterClose(t *testing.T) {
 	sc := newTestSubscriberChannel()
 
@@ -96,8 +94,7 @@ func TestSubscriberChannel_SendKeepLatestReturnsAfterClose(t *testing.T) {
 	}
 }
 
-// close must be idempotent — stop() and the per-subscriber cleanup can
-// both fire for the same subscriber during shutdown.
+// stop() and the per-subscriber cleanup can both close a subscriber.
 func TestSubscriberChannel_CloseIsIdempotent(t *testing.T) {
 	sc := newTestSubscriberChannel()
 	sc.close()
@@ -112,8 +109,7 @@ func TestSubscriberChannel_CloseIsIdempotent(t *testing.T) {
 	}
 }
 
-// End-to-end via notifySubscribers: the manager must honour keep-latest
-// across every subscribed channel for the key without taking any lock.
+// notifySubscribers keeps the latest value on every channel for the key.
 func TestRedisPubSubManager_NotifySubscribersKeepsLatest(t *testing.T) {
 	m := &RedisPubSubManager{}
 	a := newTestSubscriberChannel()
@@ -130,9 +126,7 @@ func TestRedisPubSubManager_NotifySubscribersKeepsLatest(t *testing.T) {
 	}
 }
 
-// Race detector guard: under concurrent publishes + concurrent closes, no
-// send ever panics, no goroutine leaks, and the subscriber eventually sees
-// either the latest value or nothing (if it was already closed).
+// Concurrent sends and closes never panic or block.
 func TestSubscriberChannel_ConcurrentSendAndClose(t *testing.T) {
 	for trial := 0; trial < 20; trial++ {
 		sc := newTestSubscriberChannel()

@@ -841,11 +841,8 @@ func TestCounterInt64_TryUpdateIfStale_NoThunderingHerdOnError(t *testing.T) {
 	connector.AssertExpectations(t)
 }
 
-// TestCounterInt64_TryUpdateIfStale_FnTimeoutFromCtxDeadline verifies that the
-// background refresh fn receives at least the caller-provided context deadline
-// as its timeout, rather than being silently capped at fallbackTimeout. This
-// matters for slow-chain state pollers whose eth_getBlockByNumber
-// legitimately exceeds the default 3s fallbackTimeout.
+// The background refresh gets at least the caller's context deadline rather
+// than being capped at fallbackTimeout.
 func TestCounterInt64_TryUpdateIfStale_FnTimeoutFromCtxDeadline(t *testing.T) {
 	// refreshFn deliberately returns an error so applyRefreshResult short-circuits
 	// before scheduleBackgroundPushCurrent, avoiding a background Publish goroutine

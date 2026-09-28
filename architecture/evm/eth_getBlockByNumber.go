@@ -273,9 +273,9 @@ func enforceNonNullBlock(ctx context.Context, nq *common.NormalizedRequest, nr *
 	)
 }
 
-// forwardGetBlockByNumber re-fetches the tip block for original. The caller's
-// use-upstream selector is kept as-is; without one, the stale responder is
-// excluded since it likely lacks the block (a cache hit has no responder).
+// forwardGetBlockByNumber re-fetches blockNumber for original. Without a
+// caller use-upstream selector, the stale responder is excluded since it
+// likely lacks the block.
 func forwardGetBlockByNumber(
 	ctx context.Context,
 	network common.Network,

@@ -75,8 +75,10 @@ func ExtractBlockReferenceFromRequest(ctx context.Context, r *common.NormalizedR
 				// In case of "*" since it means any block, we can still augment it from response ref, because during cache.Get()
 				// we'll be using reverse index (i.e. ignoring ref), but after reorg invalidation is added a specific block ref is useful.
 				//
-				// For "latest"/"finalized" the cache layer keys by a concrete
-				// block instead (see ResolveCacheBlockRef).
+				// TODO An ideal version stores the data for all eth_getBlockByNumber(latest) and eth_getBlockByNumber(blockNumber),
+				// and eth_getBlockByNumber(blockHash) where blockNumber/blockHash are the actual values returned in the response.
+				// So that if user gets the latest block, then cache is populated for when they provide that specific block as well.
+				// When implementing that feature remember that CacheHash() must be calculated separately for each number/hash combo.
 				blockRef = br
 			}
 			if bn > 0 {
@@ -113,12 +115,10 @@ func ExtractBlockReferenceFromRequest(ctx context.Context, r *common.NormalizedR
 }
 
 // ResolveCacheBlockRef is ExtractBlockReferenceFromRequest for cache keys: a
-// "latest" or "finalized" tag is resolved to a concrete block so each tip
-// advance gets its own key instead of serving one pinned answer until TTL. On
-// SET the response's own block number is used, on GET (and when the response
-// has none) the network's current tip for that tag. The request's EvmBlockRef
-// is left as the tag. Any other ref, including "safe" (whose block the network
-// does not track), is returned unchanged.
+// "latest" or "finalized" tag resolves to a concrete block so each tip advance
+// gets its own key. It uses the response's block number when given (SET), else
+// the network's current tip for the tag (GET). Other refs, including "safe",
+// are returned unchanged.
 func ResolveCacheBlockRef(ctx context.Context, req *common.NormalizedRequest, resp *common.NormalizedResponse) (string, int64, error) {
 	blockRef, blockNumber, err := ExtractBlockReferenceFromRequest(ctx, req)
 	if err != nil {
@@ -131,15 +131,13 @@ func ResolveCacheBlockRef(ctx context.Context, req *common.NormalizedRequest, re
 
 	if resp != nil {
 		if _, respBN, rerr := ExtractBlockReferenceFromResponse(ctx, resp); rerr == nil && respBN > 0 {
-			hex, herr := common.NormalizeHex(respBN)
-			if herr == nil {
+			if hex, herr := common.NormalizeHex(respBN); herr == nil {
 				return hex, respBN, nil
 			}
 		}
 	}
 
-	// Keying is an optimization: if the network state is not reachable, fall
-	// back to the tag-literal key rather than failing the cache operation.
+	// Without a known tip, fall back to the tag-literal key.
 	net := req.Network()
 	if net == nil {
 		return blockRef, blockNumber, nil
@@ -159,8 +157,7 @@ func ResolveCacheBlockRef(ctx context.Context, req *common.NormalizedRequest, re
 		}
 	}()
 	if num > 0 {
-		hex, herr := common.NormalizeHex(num)
-		if herr == nil {
+		if hex, herr := common.NormalizeHex(num); herr == nil {
 			return hex, num, nil
 		}
 	}

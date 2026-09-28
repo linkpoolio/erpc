@@ -502,16 +502,9 @@ func (e *EvmStatePoller) PollLatestBlockNumber(ctx context.Context) (int64, erro
 				e.stateMu.Unlock()
 				return 0, nil
 			} else {
-				// Record as an upstream failure ONLY when the failure bypassed
-				// Upstream.tryForward (which already records its own failures).
-				// The bypass case is failsafe-CB-open: once the CB trips, every
-				// subsequent call short-circuits before tryForward runs, so the
-				// tracker stops seeing samples and the selection policy's
-				// errorRate freezes — preventing failover. By recording the
-				// CB-short-circuit attempts here, the tracker continues to
-				// climb post-CB-open and the policy can react. Non-CB failures
-				// (HTTP 500, transport errors, etc.) already reach tryForward
-				// and record there; recording again here would double-count.
+				// An open circuit breaker short-circuits before tryForward
+				// records the failure, which would freeze the upstream's error
+				// rate; record it here. Other failures are already recorded.
 				if e.tracker != nil && common.HasErrorCode(err, common.ErrCodeFailsafeCircuitBreakerOpen) {
 					e.tracker.RecordUpstreamRequest(e.upstream, "eth_getBlockByNumber", common.DataFinalityStateRealtime)
 					e.tracker.RecordUpstreamFailure(e.upstream, "eth_getBlockByNumber", common.DataFinalityStateRealtime, err)
@@ -808,11 +801,7 @@ func (e *EvmStatePoller) PollFinalizedBlockNumber(ctx context.Context) (int64, e
 				e.stateMu.Unlock()
 				return 0, nil
 			} else {
-				// See PollLatestBlockNumber for the rationale: record as an
-				// upstream failure ONLY when the failure bypassed tryForward
-				// (CB-open short-circuit). Non-CB failures already reach
-				// tryForward's existing recording path; recording again here
-				// would double-count.
+				// See PollLatestBlockNumber.
 				if e.tracker != nil && common.HasErrorCode(err, common.ErrCodeFailsafeCircuitBreakerOpen) {
 					e.tracker.RecordUpstreamRequest(e.upstream, "eth_getBlockByNumber", common.DataFinalityStateFinalized)
 					e.tracker.RecordUpstreamFailure(e.upstream, "eth_getBlockByNumber", common.DataFinalityStateFinalized, err)

@@ -498,9 +498,6 @@ func TestExtractBlockReference(t *testing.T) {
 	}
 }
 
-// TestResolveCacheBlockRef covers the cache-specific helper that rewrites
-// "latest"/"finalized" to a concrete block number so each tip advance
-// produces a distinct cache key.
 func TestResolveCacheBlockRef(t *testing.T) {
 	ctx := context.Background()
 
@@ -513,9 +510,6 @@ func TestResolveCacheBlockRef(t *testing.T) {
 
 		ref, num, err := ResolveCacheBlockRef(ctx, nrq, nil)
 		assert.NoError(t, err)
-		// ExtractBlockReferenceFromRequest normalizes a numeric request ref
-		// to its decimal string form; the helper forwards whatever that
-		// returns for non-tag refs.
 		assert.Equal(t, "4660", ref)
 		assert.Equal(t, int64(0x1234), num)
 	})

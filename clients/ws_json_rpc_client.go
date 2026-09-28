@@ -269,8 +269,13 @@ func (c *WsJsonRpcClient) SendRequest(ctx context.Context, req *common.Normalize
 		}
 		nr := common.NewNormalizedResponse().WithRequest(req).WithBody(io.NopCloser(bytes.NewReader(result.message)))
 		// Restore the caller's original JSON-RPC id on the response.
-		if jrr, perr := nr.JsonRpcResponse(ctx); perr == nil && jrr != nil {
+		jrr, perr := nr.JsonRpcResponse(ctx)
+		if perr == nil && jrr != nil {
 			_ = jrr.SetID(originalID)
+		}
+		if err := classifyJsonRpcError(&http.Response{StatusCode: http.StatusOK, Header: http.Header{}}, nr, jrr, perr, c.errorExtractor, c.upstream); err != nil {
+			common.SetTraceSpanError(span, err)
+			return nr, err
 		}
 		return nr, nil
 	case <-ctx.Done():

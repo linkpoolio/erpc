@@ -295,3 +295,141 @@ func TestWsClientPingWriteFailureForcesReconnect(t *testing.T) {
 		t.Fatal("server never saw the re-dialed connection")
 	}
 }
+
+// newWsTestServer upgrades every request and hands the connection to
+// handle, closing it when handle returns.
+func newWsTestServer(t *testing.T, handle func(conn *websocket.Conn)) *url.URL {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		handle(conn)
+	}))
+	t.Cleanup(srv.Close)
+	u, err := url.Parse(srv.URL)
+	require.NoError(t, err)
+	u.Scheme = "ws"
+	return u
+}
+
+// TestWsClientRedialsWhenConnDiesDuringHandler: the connection dies while
+// readLoop is inside a subscription handler and the ping loop notices
+// first. readLoop must still tear down and re-dial once the handler
+// returns.
+func TestWsClientRedialsWhenConnDiesDuringHandler(t *testing.T) {
+	compressWsLiveness(t)
+	server := newFakeWsServer(t)
+	client := newTestWsClient(t, server.wsURL(t))
+	conn1 := <-server.newConn
+	subID := subscribeNewHeads(t, client)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	client.RegisterSubscriptionHandler(subID, func([]byte) {
+		close(entered)
+		<-release
+	})
+	conn1.sendNewHead(subID, "0x1")
+	<-entered
+
+	_ = conn1.conn.UnderlyingConn().Close()
+	time.Sleep(3 * client.pingInterval) // a ping write fails while readLoop is busy
+	close(release)
+
+	select {
+	case <-server.newConn:
+	case <-time.After(3 * time.Second):
+		t.Fatal("client never re-dialed after the connection died during a handler")
+	}
+}
+
+// TestWsClientBacksOffWhenPeerDropsAfterHandshake: a peer that accepts the
+// handshake and immediately closes must not drive a hot re-dial loop.
+func TestWsClientBacksOffWhenPeerDropsAfterHandshake(t *testing.T) {
+	var handshakes atomic.Int64
+	u := newWsTestServer(t, func(conn *websocket.Conn) {
+		handshakes.Add(1)
+		_ = conn.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.ClosePolicyViolation, ""), time.Now().Add(time.Second))
+	})
+	newTestWsClient(t, u)
+
+	time.Sleep(time.Second)
+	assert.LessOrEqual(t, handshakes.Load(), int64(3))
+}
+
+// TestWsClientFailsFastWhileRedialing: while a re-dial is stuck in a slow
+// handshake, requests must fail fast with a retryable error.
+func TestWsClientFailsFastWhileRedialing(t *testing.T) {
+	var requests atomic.Int64
+	first := make(chan *websocket.Conn, 1)
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) > 1 {
+			time.Sleep(3 * time.Second) // never upgrade within the test
+			return
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		first <- conn
+	}))
+	t.Cleanup(srv.Close)
+	u, err := url.Parse(srv.URL)
+	require.NoError(t, err)
+	u.Scheme = "ws"
+	client := newTestWsClient(t, u)
+
+	_ = (<-first).UnderlyingConn().Close()
+	require.Eventually(t, func() bool { return requests.Load() >= 2 }, 3*time.Second, 5*time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err = client.SendRequest(ctx, common.NewNormalizedRequest([]byte(`{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}`)))
+	require.Error(t, err)
+	assert.Less(t, time.Since(start), time.Second)
+	assert.True(t, common.HasErrorCode(err, common.ErrCodeEndpointTransportFailure), "got %v", err)
+}
+
+// TestWsClientIgnoresDuplicateResponses: repeated responses for one id must
+// not wedge readLoop.
+func TestWsClientIgnoresDuplicateResponses(t *testing.T) {
+	u := newWsTestServer(t, func(conn *websocket.Conn) {
+		for {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			var req struct {
+				ID     interface{} `json:"id"`
+				Method string      `json:"method"`
+			}
+			_ = common.SonicCfg.Unmarshal(msg, &req)
+			resp, _ := common.SonicCfg.Marshal(map[string]interface{}{"jsonrpc": "2.0", "id": req.ID, "result": "0x1"})
+			n := 1
+			if req.Method == "dup" {
+				n = 50
+			}
+			for i := 0; i < n; i++ {
+				_ = conn.WriteMessage(websocket.TextMessage, resp)
+			}
+		}
+	})
+	client := newTestWsClient(t, u)
+
+	send := func(method string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_, err := client.SendRequest(ctx, common.NewNormalizedRequest([]byte(`{"jsonrpc":"2.0","id":1,"method":"`+method+`","params":[]}`)))
+		return err
+	}
+	for i := 0; i < 50; i++ {
+		require.NoError(t, send("dup"))
+	}
+	require.NoError(t, send("eth_chainId"))
+}

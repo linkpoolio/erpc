@@ -1,16 +1,17 @@
 package clients
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,10 +27,11 @@ import (
 )
 
 const (
-	wsWriteWait       = 10 * time.Second
-	wsReconnectMin    = 1 * time.Second
-	wsReconnectMax    = 30 * time.Second
-	wsReconnectFactor = 2.0
+	wsWriteWait        = 10 * time.Second
+	wsHandshakeTimeout = 10 * time.Second
+	wsReconnectMin     = 1 * time.Second
+	wsReconnectMax     = 30 * time.Second
+	wsReconnectFactor  = 2.0
 )
 
 // Liveness windows. The peer must produce SOME traffic (a pong reply or a
@@ -49,6 +51,8 @@ var (
 	wsPongWait     = 75 * time.Second
 )
 
+var errWsNotConnected = errors.New("websocket connection not established")
+
 // WsJsonRpcClient implements ClientInterface for WebSocket-based JSON-RPC upstream connections.
 type WsJsonRpcClient struct {
 	Url     *url.URL
@@ -64,27 +68,20 @@ type WsJsonRpcClient struct {
 	pingInterval time.Duration
 	pongWait     time.Duration
 
-	// Connection state
-	connMu sync.Mutex
-	conn   *websocket.Conn
-
-	// connWake is pulsed by reconnect() once a new connection is in c.conn,
-	// so readLoop can wake up without polling. Capacity 1 coalesces bursts.
-	connWake chan struct{}
+	// Connection state. Only readLoop replaces or tears down conn (besides
+	// the initial dial and shutdown); the dial itself runs without connMu so
+	// requests never wait on a handshake.
+	connMu      sync.Mutex
+	conn        *websocket.Conn
+	connectedAt time.Time
 
 	// Write synchronization (gorilla/websocket requires synchronized writes)
 	writeMu sync.Mutex
 
-	// Pending request tracking: JSON-RPC ID -> response channel.
-	// Uses RWMutex because the hot path (handleMessage dispatching responses)
-	// only needs a read lock, while writes (register/deregister) are less frequent.
-	pendingMu sync.RWMutex
+	// Pending request tracking: wire id -> response channel. Whoever
+	// deletes an entry owns it, so duplicate responses are dropped.
+	pendingMu sync.Mutex
 	pending   map[string]chan *wsPendingResult
-
-	// Signalled when the first connection is established (or app shutdown).
-	// readLoop blocks on this before entering its main loop.
-	connReady chan struct{}
-	connOnce  sync.Once
 
 	// Subscription notification callbacks: upstreamSubID -> handler
 	subHandlersMu sync.RWMutex
@@ -105,36 +102,24 @@ type WsJsonRpcClient struct {
 
 	connected atomic.Bool
 
-	// wireIDCounter generates unique JSON-RPC ids on the WS wire so that
-	// concurrent SendRequest calls with the same caller-supplied id do not
-	// collide on the pending response map. The original caller id is
-	// restored on the response before returning. Seeded at wireIDOffset to
-	// stay in the same numeric range internal subscribers use when they
-	// build outbound requests (see indexer/adapters/wsupstream), so callers
-	// inspecting on-wire ids can tell internal traffic apart from
-	// small-int client traffic.
+	// wireIDCounter generates the JSON-RPC ids used on the wire so that
+	// concurrent requests with the same caller-supplied id do not collide
+	// in pending. The caller's id is restored on the response.
 	wireIDCounter atomic.Uint64
 }
 
-// wireIDOffset keeps rewritten wire ids in the "internal" id range so they
-// don't collide with the small incrementing ints typical of client traffic
-// or upstream-side state-poller requests.
-const wireIDOffset uint64 = 900_000_000
-
 type wsPendingResult struct {
-	resp *common.NormalizedResponse
-	err  error
+	message []byte
+	err     error
 }
 
 // wsMessage is a minimal struct for parsing incoming WS messages to determine if they are
 // responses (have "id") or notifications (have "method").
 type wsMessage struct {
-	JSONRPC string                              `json:"jsonrpc"`
-	ID      interface{}                         `json:"id,omitempty"`
-	Method  string                              `json:"method,omitempty"`
-	Result  json.RawMessage                     `json:"result,omitempty"`
-	Error   *common.ErrJsonRpcExceptionExternal `json:"error,omitempty"`
-	Params  json.RawMessage                     `json:"params,omitempty"`
+	JSONRPC string          `json:"jsonrpc"`
+	ID      interface{}     `json:"id,omitempty"`
+	Method  string          `json:"method,omitempty"`
+	Params  json.RawMessage `json:"params,omitempty"`
 }
 
 // wsNotificationParams is the structure of subscription notification params.
@@ -169,22 +154,16 @@ func NewWsJsonRpcClient(
 		appCtx:          appCtx,
 		logger:          logger,
 		pending:         make(map[string]chan *wsPendingResult),
-		connReady:       make(chan struct{}),
-		connWake:        make(chan struct{}, 1),
 		subHandlers:     make(map[string]func(params []byte)),
 		onDisconnectCbs: make(map[string]func()),
 		onReconnectCbs:  make(map[string]func()),
 		errorExtractor:  extractor,
 	}
-	client.wireIDCounter.Store(wireIDOffset)
 
 	if err := client.connect(); err != nil {
-		// Don't fail on initial connection — start reconnect loop in background.
-		// The upstream may not be available at startup but will be retried.
+		// Don't fail on initial connection — readLoop keeps re-dialing in
+		// the background. The upstream may not be available at startup.
 		logger.Warn().Err(err).Str("url", parsedUrl.String()).Msg("initial websocket connection failed, will retry in background")
-		go client.reconnect()
-	} else {
-		client.connOnce.Do(func() { close(client.connReady) })
 	}
 
 	go client.readLoop()
@@ -227,9 +206,6 @@ func (c *WsJsonRpcClient) SendRequest(ctx context.Context, req *common.Normalize
 		)
 	}
 
-	// Use a unique outbound wire id so concurrent SendRequest calls with the
-	// same caller-supplied JSON-RPC id do not collide in c.pending. The
-	// original id is restored on the response below before returning.
 	wireID := c.wireIDCounter.Add(1)
 	idKey := strconv.FormatUint(wireID, 10)
 
@@ -254,20 +230,27 @@ func (c *WsJsonRpcClient) SendRequest(ctx context.Context, req *common.Normalize
 		)
 	}
 
-	// Register a response channel
+	// Register under connMu so the entry belongs to exactly this conn:
+	// teardown swaps conn and drains pending under the same lock.
 	respCh := make(chan *wsPendingResult, 1)
-	c.pendingMu.Lock()
-	c.pending[idKey] = respCh
-	c.pendingMu.Unlock()
-
-	defer func() {
+	c.connMu.Lock()
+	conn := c.conn
+	if conn != nil {
 		c.pendingMu.Lock()
-		delete(c.pending, idKey)
+		c.pending[idKey] = respCh
 		c.pendingMu.Unlock()
-	}()
+	}
+	c.connMu.Unlock()
 
-	// Write to the WebSocket connection
-	if err := c.writeMessage(websocket.TextMessage, requestBody); err != nil {
+	if conn == nil {
+		// Re-dial in progress: fail fast so the request fails over.
+		err := common.NewErrEndpointTransportFailure(c.Url, errWsNotConnected)
+		common.SetTraceSpanError(span, err)
+		return nil, err
+	}
+
+	if err := c.writeToConn(conn, websocket.TextMessage, requestBody); err != nil {
+		c.removePending(idKey)
 		common.SetTraceSpanError(span, err)
 		return nil, common.NewErrEndpointTransportFailure(c.Url, err)
 	}
@@ -284,15 +267,14 @@ func (c *WsJsonRpcClient) SendRequest(ctx context.Context, req *common.Normalize
 			common.SetTraceSpanError(span, result.err)
 			return nil, result.err
 		}
-		// Restore the caller's original JSON-RPC id on the response, since
-		// the on-wire id was rewritten to our unique counter above.
-		if result.resp != nil {
-			if jrr, perr := result.resp.JsonRpcResponse(ctx); perr == nil && jrr != nil {
-				_ = jrr.SetID(originalID)
-			}
+		nr := common.NewNormalizedResponse().WithRequest(req).WithBody(io.NopCloser(bytes.NewReader(result.message)))
+		// Restore the caller's original JSON-RPC id on the response.
+		if jrr, perr := nr.JsonRpcResponse(ctx); perr == nil && jrr != nil {
+			_ = jrr.SetID(originalID)
 		}
-		return result.resp, nil
+		return nr, nil
 	case <-ctx.Done():
+		c.removePending(idKey)
 		err := ctx.Err()
 		if errors.Is(err, context.DeadlineExceeded) {
 			err = common.NewErrEndpointRequestTimeout(time.Since(startedAt), err)
@@ -302,8 +284,15 @@ func (c *WsJsonRpcClient) SendRequest(ctx context.Context, req *common.Normalize
 		common.SetTraceSpanError(span, err)
 		return nil, err
 	case <-c.appCtx.Done():
+		c.removePending(idKey)
 		return nil, common.NewErrEndpointRequestCanceled(c.appCtx.Err())
 	}
+}
+
+func (c *WsJsonRpcClient) removePending(idKey string) {
+	c.pendingMu.Lock()
+	delete(c.pending, idKey)
+	c.pendingMu.Unlock()
 }
 
 // RegisterSubscriptionHandler registers a callback for a specific upstream subscription ID.
@@ -356,11 +345,8 @@ func (c *WsJsonRpcClient) RemoveOnReconnect(id string) {
 }
 
 func (c *WsJsonRpcClient) connect() error {
-	c.connMu.Lock()
-	defer c.connMu.Unlock()
-
 	dialer := websocket.Dialer{
-		HandshakeTimeout: 10 * time.Second,
+		HandshakeTimeout: wsHandshakeTimeout,
 	}
 
 	if c.Url.Scheme == "wss" {
@@ -384,29 +370,41 @@ func (c *WsJsonRpcClient) connect() error {
 		return conn.SetReadDeadline(time.Now().Add(c.pongWait))
 	})
 
-	if c.conn != nil {
-		// Defensive: never leak a previous connection's FD/goroutine state.
-		_ = c.conn.Close()
+	c.connMu.Lock()
+	if c.appCtx.Err() != nil {
+		// shutdown already ran; don't install a connection behind it.
+		c.connMu.Unlock()
+		_ = conn.Close()
+		return c.appCtx.Err()
 	}
 	c.conn = conn
+	c.connectedAt = time.Now()
 	c.connected.Store(true)
+	c.connMu.Unlock()
 	c.setConnectedMetric(1)
 
 	c.logger.Info().Str("url", c.Url.String()).Msg("websocket connection established")
 	return nil
 }
 
-// teardownConn marks the client disconnected and closes the given
-// connection, clearing c.conn only if it still points at that same
-// connection (a concurrent reconnect may already have replaced it).
-func (c *WsJsonRpcClient) teardownConn(old *websocket.Conn) {
+// teardownConn closes conn, marks the client disconnected and fails every
+// request pending on it.
+func (c *WsJsonRpcClient) teardownConn(conn *websocket.Conn, cause error) {
 	c.connMu.Lock()
-	if c.conn == old {
-		c.conn = nil
-	}
+	c.conn = nil
+	c.connected.Store(false)
+	c.pendingMu.Lock()
+	pending := c.pending
+	c.pending = make(map[string]chan *wsPendingResult)
+	c.pendingMu.Unlock()
 	c.connMu.Unlock()
-	if old != nil {
-		_ = old.Close()
+
+	if conn != nil {
+		_ = conn.Close()
+	}
+	c.setConnectedMetric(0)
+	for _, ch := range pending {
+		ch <- &wsPendingResult{err: cause}
 	}
 }
 
@@ -422,31 +420,37 @@ func (c *WsJsonRpcClient) setConnectedMetric(v float64) {
 	).Set(v)
 }
 
+// readLoop owns the connection lifecycle: it reads the current connection
+// and, when there is none, re-dials with backoff. pingLoop only closes a
+// broken connection, so a nil conn always has a re-dial behind it.
 func (c *WsJsonRpcClient) readLoop() {
-	// Wait until the first connection is established (or the app shuts down)
-	select {
-	case <-c.connReady:
-	case <-c.appCtx.Done():
-		return
-	}
-
+	backoff := wsReconnectMin
 	for {
 		if c.appCtx.Err() != nil {
 			return
 		}
 
 		c.connMu.Lock()
-		conn := c.conn
+		conn, connectedAt := c.conn, c.connectedAt
 		c.connMu.Unlock()
 
 		if conn == nil {
-			// Connection is being re-established after a disconnect; block
-			// until reconnect() pulses connWake (or the app shuts down).
+			// Always wait before dialing so a peer that accepts and then
+			// immediately drops the connection can't drive a hot loop.
+			wait := backoff/2 + rand.N(backoff/2+1)
+			c.logger.Info().Dur("backoff", wait).Msg("attempting websocket reconnection")
 			select {
-			case <-c.connWake:
+			case <-time.After(wait):
 			case <-c.appCtx.Done():
 				return
 			}
+			if err := c.connect(); err != nil {
+				c.logger.Warn().Err(err).Msg("websocket reconnection failed")
+				backoff = min(time.Duration(float64(backoff)*wsReconnectFactor), wsReconnectMax)
+				continue
+			}
+			c.logger.Info().Msg("websocket reconnected successfully")
+			c.fireCallbacks(&c.onReconnectMu, c.onReconnectCbs)
 			continue
 		}
 
@@ -464,13 +468,16 @@ func (c *WsJsonRpcClient) readLoop() {
 			} else {
 				c.logger.Warn().Err(err).Msg("websocket read error, will reconnect")
 			}
-			c.connected.Store(false)
-			c.setConnectedMetric(0)
-			c.teardownConn(conn)
-			c.drainPending(common.NewErrEndpointTransportFailure(c.Url, fmt.Errorf("websocket connection lost: %w", err)))
+			// Only a connection that outlived a liveness window resets the
+			// backoff; one dropped right after the handshake counts as a
+			// failed dial.
+			if time.Since(connectedAt) >= c.pongWait {
+				backoff = wsReconnectMin
+			} else {
+				backoff = min(time.Duration(float64(backoff)*wsReconnectFactor), wsReconnectMax)
+			}
+			c.teardownConn(conn, common.NewErrEndpointTransportFailure(c.Url, fmt.Errorf("websocket connection lost: %w", err)))
 			c.fireCallbacks(&c.onDisconnectMu, c.onDisconnectCbs)
-
-			c.reconnect()
 			continue
 		}
 
@@ -483,16 +490,9 @@ func (c *WsJsonRpcClient) readLoop() {
 }
 
 // fireCallbacks snapshots the callback map under rlock and invokes each
-// callback synchronously. Snapshotting lets callbacks register/deregister
-// other callbacks without deadlocking on the map's RWMutex.
-//
-// Synchronous invocation is load-bearing: readLoop fires disconnect
-// callbacks, then reconnects, then fires reconnect callbacks. Dispatching
-// them in goroutines (as this used to) let a slow-scheduled disconnect
-// callback run AFTER the reconnect callback — for the wsupstream adapter
-// that cancels the fresh resubscribe epoch and clears the new subscription,
-// silently wedging head delivery. Callbacks must therefore be fast and
-// must not block on the WS client's own request path.
+// callback synchronously, so disconnect callbacks always complete before
+// the reconnect callbacks of the next connection run. Callbacks must
+// therefore be fast and must not block on the WS client's request path.
 func (c *WsJsonRpcClient) fireCallbacks(mu *sync.RWMutex, cbs map[string]func()) {
 	mu.RLock()
 	snapshot := make([]func(), 0, len(cbs))
@@ -522,22 +522,16 @@ func (c *WsJsonRpcClient) handleMessage(message []byte) {
 	if msg.ID != nil {
 		idKey := normalizeIDKey(msg.ID)
 
-		c.pendingMu.RLock()
+		c.pendingMu.Lock()
 		ch, ok := c.pending[idKey]
-		c.pendingMu.RUnlock()
+		delete(c.pending, idKey)
+		c.pendingMu.Unlock()
 
 		if !ok {
 			c.logger.Debug().Str("id", idKey).Msg("received response for unknown request ID")
 			return
 		}
-
-		nr := common.NewNormalizedResponse().WithBody(io.NopCloser(strings.NewReader(string(message))))
-
-		if msg.Error != nil {
-			ch <- &wsPendingResult{resp: nr, err: msg.Error}
-		} else {
-			ch <- &wsPendingResult{resp: nr}
-		}
+		ch <- &wsPendingResult{message: message}
 		return
 	}
 
@@ -568,72 +562,6 @@ func (c *WsJsonRpcClient) handleNotification(method string, params []byte) {
 	handler(params)
 }
 
-func (c *WsJsonRpcClient) reconnect() {
-	backoff := wsReconnectMin
-	for {
-		if c.appCtx.Err() != nil {
-			return
-		}
-
-		c.logger.Info().Dur("backoff", backoff).Msg("attempting websocket reconnection")
-
-		if err := c.connect(); err != nil {
-			c.logger.Warn().Err(err).Dur("backoff", backoff).Msg("websocket reconnection failed")
-			select {
-			case <-time.After(backoff):
-			case <-c.appCtx.Done():
-				return
-			}
-			backoff = time.Duration(float64(backoff) * wsReconnectFactor)
-			if backoff > wsReconnectMax {
-				backoff = wsReconnectMax
-			}
-			continue
-		}
-
-		c.logger.Info().Msg("websocket reconnected successfully")
-
-		// Signal readLoop if this is the first successful connection.
-		c.connOnce.Do(func() { close(c.connReady) })
-
-		// Wake readLoop if it's parked waiting for c.conn to be non-nil.
-		// Buffered channel with cap 1 means we coalesce concurrent pulses.
-		select {
-		case c.connWake <- struct{}{}:
-		default:
-		}
-
-		c.fireCallbacks(&c.onReconnectMu, c.onReconnectCbs)
-
-		return
-	}
-}
-
-func (c *WsJsonRpcClient) drainPending(err error) {
-	c.pendingMu.Lock()
-	pending := c.pending
-	c.pending = make(map[string]chan *wsPendingResult)
-	c.pendingMu.Unlock()
-
-	for _, ch := range pending {
-		select {
-		case ch <- &wsPendingResult{err: err}:
-		default:
-		}
-	}
-}
-
-func (c *WsJsonRpcClient) writeMessage(messageType int, data []byte) error {
-	c.connMu.Lock()
-	conn := c.conn
-	c.connMu.Unlock()
-
-	if conn == nil {
-		return fmt.Errorf("websocket connection not established")
-	}
-	return c.writeToConn(conn, messageType, data)
-}
-
 // writeToConn writes to an explicit connection so callers that need to act
 // on a write failure (e.g. pingLoop closing the broken conn) operate on the
 // exact connection they wrote to, not whatever c.conn points at by then.
@@ -654,9 +582,6 @@ func (c *WsJsonRpcClient) pingLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			if !c.connected.Load() {
-				continue
-			}
 			c.connMu.Lock()
 			conn := c.conn
 			c.connMu.Unlock()
@@ -664,16 +589,11 @@ func (c *WsJsonRpcClient) pingLoop() {
 				continue
 			}
 			if err := c.writeToConn(conn, websocket.PingMessage, nil); err != nil {
-				// A failed ping write means this connection is unusable.
-				// Close it so readLoop's blocked ReadMessage fails and the
-				// teardown+reconnect path (owned by readLoop) takes over —
-				// logging alone here previously left the client wedged on a
-				// connection that could never deliver another frame.
-				// teardownConn only clears c.conn if it still points at this
-				// same conn, so a concurrent reconnect's fresh connection is
-				// never the one closed here.
+				// Only close it: readLoop's ReadMessage then fails and it
+				// tears down and re-dials. Clearing c.conn here instead would
+				// leave nobody to re-dial if readLoop was busy in a handler.
 				c.logger.Warn().Err(err).Msg("websocket ping write failed, closing connection to force reconnect")
-				c.teardownConn(conn)
+				_ = conn.Close()
 			}
 		case <-c.appCtx.Done():
 			return
@@ -702,12 +622,8 @@ func normalizeIDKey(id interface{}) string {
 }
 
 func (c *WsJsonRpcClient) shutdown() {
-	c.connected.Store(false)
-	c.setConnectedMetric(0)
-
 	c.connMu.Lock()
 	conn := c.conn
-	c.conn = nil
 	c.connMu.Unlock()
 
 	if conn != nil {
@@ -717,8 +633,6 @@ func (c *WsJsonRpcClient) shutdown() {
 			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
 			time.Now().Add(wsWriteWait),
 		)
-		_ = conn.Close()
 	}
-
-	c.drainPending(common.NewErrEndpointRequestCanceled(fmt.Errorf("websocket client shutting down")))
+	c.teardownConn(conn, common.NewErrEndpointRequestCanceled(fmt.Errorf("websocket client shutting down")))
 }

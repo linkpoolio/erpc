@@ -28,11 +28,10 @@ import (
 )
 
 const (
-	wsWriteWait        = 10 * time.Second
-	wsHandshakeTimeout = 10 * time.Second
-	wsReconnectMin     = 1 * time.Second
-	wsReconnectMax     = 30 * time.Second
-	wsReconnectFactor  = 2.0
+	wsWriteWait       = 10 * time.Second
+	wsReconnectMin    = 1 * time.Second
+	wsReconnectMax    = 30 * time.Second
+	wsReconnectFactor = 2.0
 )
 
 // Liveness windows. The peer must produce SOME traffic (a pong reply or a
@@ -51,8 +50,6 @@ var (
 	wsPingInterval = 30 * time.Second
 	wsPongWait     = 75 * time.Second
 )
-
-var errWsNotConnected = errors.New("websocket connection not established")
 
 // WsJsonRpcClient implements ClientInterface for WebSocket-based JSON-RPC upstream connections.
 type WsJsonRpcClient struct {
@@ -196,7 +193,7 @@ func NewWsJsonRpcClient(
 		appCtx:          appCtx,
 		logger:          logger,
 		pending:         make(map[string]*wsPending),
-		subHandlers:    make(map[string]func(params []byte)),
+		subHandlers:     make(map[string]func(params []byte)),
 		onDisconnectCbs: make(map[string]func()),
 		onReconnectCbs:  make(map[string]func()),
 		errorExtractor:  extractor,
@@ -315,13 +312,15 @@ func (c *WsJsonRpcClient) SendRequest(ctx context.Context, req *common.Normalize
 	}
 	if conn == nil {
 		// Re-dial in progress: fail fast so the request fails over.
-		err := common.NewErrEndpointTransportFailure(c.Url, errWsNotConnected)
+		err := common.NewErrEndpointTransportFailure(c.Url, errors.New("websocket connection not established"))
 		common.SetTraceSpanError(span, err)
 		return nil, err
 	}
 
 	if err := c.writeToConn(conn, websocket.TextMessage, requestBody); err != nil {
-		c.removePending(idKey)
+		c.pendingMu.Lock()
+		delete(c.pending, idKey)
+		c.pendingMu.Unlock()
 		common.SetTraceSpanError(span, err)
 		return nil, common.NewErrEndpointTransportFailure(c.Url, err)
 	}
@@ -363,12 +362,6 @@ func (c *WsJsonRpcClient) SendRequest(ctx context.Context, req *common.Normalize
 		c.abandonPending(idKey)
 		return nil, common.NewErrEndpointRequestCanceled(c.appCtx.Err())
 	}
-}
-
-func (c *WsJsonRpcClient) removePending(idKey string) {
-	c.pendingMu.Lock()
-	delete(c.pending, idKey)
-	c.pendingMu.Unlock()
 }
 
 // abandonPending drops a request whose caller gave up. A subscribe stays
@@ -432,7 +425,7 @@ func (c *WsJsonRpcClient) RemoveOnReconnect(id string) {
 
 func (c *WsJsonRpcClient) connect() error {
 	dialer := websocket.Dialer{
-		HandshakeTimeout: wsHandshakeTimeout,
+		HandshakeTimeout: 10 * time.Second,
 	}
 
 	if c.Url.Scheme == "wss" {
@@ -541,6 +534,7 @@ func (c *WsJsonRpcClient) readLoop() {
 			// Always wait before dialing so a peer that accepts and then
 			// immediately drops the connection can't drive a hot loop.
 			wait := backoff/2 + rand.N(backoff/2+1)
+			backoff = min(time.Duration(float64(backoff)*wsReconnectFactor), wsReconnectMax)
 			c.logger.Info().Dur("backoff", wait).Msg("attempting websocket reconnection")
 			select {
 			case <-time.After(wait):
@@ -549,7 +543,6 @@ func (c *WsJsonRpcClient) readLoop() {
 			}
 			if err := c.connect(); err != nil {
 				c.logger.Warn().Err(err).Msg("websocket reconnection failed")
-				backoff = min(time.Duration(float64(backoff)*wsReconnectFactor), wsReconnectMax)
 				continue
 			}
 			c.logger.Info().Msg("websocket reconnected successfully")
@@ -572,12 +565,9 @@ func (c *WsJsonRpcClient) readLoop() {
 				c.logger.Warn().Err(err).Msg("websocket read error, will reconnect")
 			}
 			// Only a connection that outlived a liveness window resets the
-			// backoff; one dropped right after the handshake counts as a
-			// failed dial.
+			// backoff; one dropped right after the handshake keeps growing it.
 			if time.Since(connectedAt) >= c.pongWait {
 				backoff = wsReconnectMin
-			} else {
-				backoff = min(time.Duration(float64(backoff)*wsReconnectFactor), wsReconnectMax)
 			}
 			c.teardownConn(conn, common.NewErrEndpointTransportFailure(c.Url, fmt.Errorf("websocket connection lost: %w", err)))
 			c.fireCallbacks(&c.onDisconnectMu, c.onDisconnectCbs)

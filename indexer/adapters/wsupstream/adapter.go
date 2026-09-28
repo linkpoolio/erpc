@@ -234,11 +234,11 @@ func (a *Adapter) EnsureFilter(ctx context.Context, subType, paramsHash string, 
 	err := a.subscribeFilterLocked(ctx, sub)
 	if err != nil && !exists {
 		a.subsMu.Lock()
-		sub.removed = true
 		if a.filters[key] == sub {
 			delete(a.filters, key)
 		}
 		a.subsMu.Unlock()
+		a.drop(ctx, &sub.upstreamSub)
 	}
 	return err
 }
@@ -252,17 +252,10 @@ func (a *Adapter) RemoveFilter(ctx context.Context, subType, paramsHash string) 
 
 	a.subsMu.Lock()
 	sub, ok := a.filters[key]
-	if !ok {
-		a.subsMu.Unlock()
-		return nil
-	}
 	delete(a.filters, key)
-	id, epoch := sub.id, sub.epoch
-	sub.id, sub.removed = "", true
 	a.subsMu.Unlock()
-
-	if id != "" {
-		a.release(ctx, id, epoch)
+	if ok {
+		a.drop(ctx, &sub.upstreamSub)
 	}
 	return nil
 }
@@ -276,30 +269,17 @@ func (a *Adapter) Stop(ctx context.Context) error {
 	a.wsClient.RemoveOnDisconnect(cbID)
 	a.stopped.Store(true)
 
-	type liveSub struct {
-		id    string
-		epoch uint64
-	}
-	var live []liveSub
 	a.subsMu.Lock()
 	if a.resubCancel != nil {
 		a.resubCancel()
 	}
-	subs := []*upstreamSub{&a.heads}
-	for _, sub := range a.filters {
-		subs = append(subs, &sub.upstreamSub)
-	}
+	subs := a.filters
 	a.filters = make(map[string]*filterSub)
-	for _, sub := range subs {
-		if sub.id != "" {
-			live = append(live, liveSub{sub.id, sub.epoch})
-		}
-		sub.id, sub.removed = "", true
-	}
 	a.subsMu.Unlock()
 
-	for _, sub := range live {
-		a.release(ctx, sub.id, sub.epoch)
+	a.drop(ctx, &a.heads)
+	for _, sub := range subs {
+		a.drop(ctx, &sub.upstreamSub)
 	}
 	return nil
 }
@@ -404,7 +384,7 @@ func (a *Adapter) subscribeLocked(ctx context.Context, sub *upstreamSub, params 
 		return err
 	}
 	if ws.ID == "" {
-		return fmt.Errorf("upstream returned no subscription id")
+		return errors.New("upstream returned no subscription id")
 	}
 
 	a.subsMu.Lock()
@@ -424,6 +404,18 @@ func (a *Adapter) subscribeLocked(ctx context.Context, sub *upstreamSub, params 
 	}
 	a.logger.Info().Str("upstreamSubId", ws.ID).Interface("subType", params[0]).Msg("subscribed upstream")
 	return nil
+}
+
+// drop marks sub removed, so an in-flight subscribe releases its result
+// instead of committing it, and releases its live subscription if any.
+func (a *Adapter) drop(ctx context.Context, sub *upstreamSub) {
+	a.subsMu.Lock()
+	id, epoch := sub.id, sub.epoch
+	sub.id, sub.removed = "", true
+	a.subsMu.Unlock()
+	if id != "" {
+		a.release(ctx, id, epoch)
+	}
 }
 
 // release drops a subscription's handler and cancels it upstream. Both are

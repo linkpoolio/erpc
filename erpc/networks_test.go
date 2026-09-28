@@ -12355,11 +12355,3 @@ func TestTierUpstreamsByGroup(t *testing.T) {
 		})
 	}
 }
-
-func TestFailoverConfig_Enabled(t *testing.T) {
-	var nilCfg *common.FailoverConfig
-	assert.False(t, nilCfg.Enabled())
-	assert.False(t, (&common.FailoverConfig{}).Enabled())
-	assert.False(t, (&common.FailoverConfig{OnDefaultsExhausted: util.BoolPtr(false)}).Enabled())
-	assert.True(t, (&common.FailoverConfig{OnDefaultsExhausted: util.BoolPtr(true)}).Enabled())
-}

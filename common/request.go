@@ -240,9 +240,8 @@ type NormalizedRequest struct {
 	upstreamList      []Upstream // Available upstreams for this request
 	ConsumedUpstreams *sync.Map  // Tracks upstreams that provided valid responses
 
-	// escalatedToFallbacks marks whether this request has already swept the
-	// fallback tier via Network.Forward's per-request escape, so it happens at
-	// most once across failsafe retries and hedges.
+	// escalatedToFallbacks makes the per-request fallback escape happen at
+	// most once across retries and hedges.
 	escalatedToFallbacks atomic.Bool
 
 	lastValidResponse         atomic.Pointer[NormalizedResponse]
@@ -1273,9 +1272,8 @@ func (r *NormalizedRequest) Upstreams() []Upstream {
 	return out
 }
 
-// MarkEscalatedToFallbacks records that this request has invoked the
-// fallback escape hatch. It reports true only for the first caller, so
-// concurrent hedges escalate at most once.
+// MarkEscalatedToFallbacks reports true only for the first caller, so a
+// request escalates to the fallback tier at most once.
 func (r *NormalizedRequest) MarkEscalatedToFallbacks() bool {
 	if r == nil {
 		return false

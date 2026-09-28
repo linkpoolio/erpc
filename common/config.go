@@ -84,15 +84,13 @@ var LegacyTranslateFn func(*Config) ([]string, error)
 // emitted by LegacyTranslateFn. If nil, warnings are dropped silently.
 var LegacyTranslateLogger func(warning string)
 
-// IndexerConfig tunes the transport-neutral event-stream indexer that
-// powers `eth_subscribe` fan-out. Most deployments can leave this unset.
+// IndexerConfig tunes the event-stream indexer behind eth_subscribe fan-out.
 type IndexerConfig struct {
 	// Deprecated: ignored; the indexer no longer tracks a canonical chain.
 	// Kept so configs that still set it load under strict decoding.
 	CanonicalChainDepth int `yaml:"canonicalChainDepth,omitempty" json:"canonicalChainDepth"`
-	// DedupWindowSize is the per-filter seen-set capacity for log /
-	// pending-tx fan-out across sibling upstreams. 0 uses the internal
-	// default (8192).
+	// DedupWindowSize is the per-filter seen-set capacity for log and
+	// pending-tx fan-out across upstreams. 0 uses the default (8192).
 	DedupWindowSize int `yaml:"dedupWindowSize,omitempty" json:"dedupWindowSize"`
 }
 
@@ -146,34 +144,35 @@ func LoadConfig(fs afero.Fs, filename string, opts *DefaultOptions) (*Config, er
 }
 
 type ServerConfig struct {
-	ListenV4            *bool                  `yaml:"listenV4,omitempty" json:"listenV4"`
-	HttpHostV4          *string                `yaml:"httpHostV4,omitempty" json:"httpHostV4"`
-	ListenV6            *bool                  `yaml:"listenV6,omitempty" json:"listenV6"`
-	HttpHostV6          *string                `yaml:"httpHostV6,omitempty" json:"httpHostV6"`
-	HttpPort            *int                   `yaml:"httpPort,omitempty" json:"httpPort"` // Deprecated: use HttpPortV4
-	HttpPortV4          *int                   `yaml:"httpPortV4,omitempty" json:"httpPortV4"`
-	HttpPortV6          *int                   `yaml:"httpPortV6,omitempty" json:"httpPortV6"`
-	GrpcEnabled         *bool                  `yaml:"grpcEnabled,omitempty" json:"grpcEnabled"`
-	GrpcHostV4          *string                `yaml:"grpcHostV4,omitempty" json:"grpcHostV4"`
-	GrpcPortV4          *int                   `yaml:"grpcPortV4,omitempty" json:"grpcPortV4"`
-	GrpcHostV6          *string                `yaml:"grpcHostV6,omitempty" json:"grpcHostV6"`
-	GrpcPortV6          *int                   `yaml:"grpcPortV6,omitempty" json:"grpcPortV6"`
-	GrpcMaxRecvMsgSize  *int                   `yaml:"grpcMaxRecvMsgSize,omitempty" json:"grpcMaxRecvMsgSize"`
-	GrpcMaxSendMsgSize  *int                   `yaml:"grpcMaxSendMsgSize,omitempty" json:"grpcMaxSendMsgSize"`
-	GrpcReflection      *bool                  `yaml:"grpcReflection,omitempty" json:"grpcReflection"`
-	MaxTimeout          *Duration              `yaml:"maxTimeout,omitempty" json:"maxTimeout" tstype:"Duration"`
-	ReadTimeout         *Duration              `yaml:"readTimeout,omitempty" json:"readTimeout" tstype:"Duration"`
-	WriteTimeout        *Duration              `yaml:"writeTimeout,omitempty" json:"writeTimeout" tstype:"Duration"`
-	EnableGzip          *bool                  `yaml:"enableGzip,omitempty" json:"enableGzip"`
-	TLS                 *TLSConfig             `yaml:"tls,omitempty" json:"tls"`
-	Aliasing            *AliasingConfig        `yaml:"aliasing" json:"aliasing"`
-	WaitBeforeShutdown  *Duration              `yaml:"waitBeforeShutdown,omitempty" json:"waitBeforeShutdown" tstype:"Duration"`
-	WaitAfterShutdown   *Duration              `yaml:"waitAfterShutdown,omitempty" json:"waitAfterShutdown" tstype:"Duration"`
-	IncludeErrorDetails *bool                  `yaml:"includeErrorDetails,omitempty" json:"includeErrorDetails"`
-	TrustedIPForwarders []string               `yaml:"trustedIPForwarders,omitempty" json:"trustedIPForwarders"`
-	TrustedIPHeaders    []string               `yaml:"trustedIPHeaders,omitempty" json:"trustedIPHeaders"`
-	ResponseHeaders     map[string]string      `yaml:"responseHeaders,omitempty" json:"responseHeaders"`
-	WebSocket           *WebSocketServerConfig `yaml:"webSocket,omitempty" json:"webSocket"`
+	ListenV4            *bool             `yaml:"listenV4,omitempty" json:"listenV4"`
+	HttpHostV4          *string           `yaml:"httpHostV4,omitempty" json:"httpHostV4"`
+	ListenV6            *bool             `yaml:"listenV6,omitempty" json:"listenV6"`
+	HttpHostV6          *string           `yaml:"httpHostV6,omitempty" json:"httpHostV6"`
+	HttpPort            *int              `yaml:"httpPort,omitempty" json:"httpPort"` // Deprecated: use HttpPortV4
+	HttpPortV4          *int              `yaml:"httpPortV4,omitempty" json:"httpPortV4"`
+	HttpPortV6          *int              `yaml:"httpPortV6,omitempty" json:"httpPortV6"`
+	GrpcEnabled         *bool             `yaml:"grpcEnabled,omitempty" json:"grpcEnabled"`
+	GrpcHostV4          *string           `yaml:"grpcHostV4,omitempty" json:"grpcHostV4"`
+	GrpcPortV4          *int              `yaml:"grpcPortV4,omitempty" json:"grpcPortV4"`
+	GrpcHostV6          *string           `yaml:"grpcHostV6,omitempty" json:"grpcHostV6"`
+	GrpcPortV6          *int              `yaml:"grpcPortV6,omitempty" json:"grpcPortV6"`
+	GrpcMaxRecvMsgSize  *int              `yaml:"grpcMaxRecvMsgSize,omitempty" json:"grpcMaxRecvMsgSize"`
+	GrpcMaxSendMsgSize  *int              `yaml:"grpcMaxSendMsgSize,omitempty" json:"grpcMaxSendMsgSize"`
+	GrpcReflection      *bool             `yaml:"grpcReflection,omitempty" json:"grpcReflection"`
+	MaxTimeout          *Duration         `yaml:"maxTimeout,omitempty" json:"maxTimeout" tstype:"Duration"`
+	ReadTimeout         *Duration         `yaml:"readTimeout,omitempty" json:"readTimeout" tstype:"Duration"`
+	WriteTimeout        *Duration         `yaml:"writeTimeout,omitempty" json:"writeTimeout" tstype:"Duration"`
+	EnableGzip          *bool             `yaml:"enableGzip,omitempty" json:"enableGzip"`
+	TLS                 *TLSConfig        `yaml:"tls,omitempty" json:"tls"`
+	Aliasing            *AliasingConfig   `yaml:"aliasing" json:"aliasing"`
+	WaitBeforeShutdown  *Duration         `yaml:"waitBeforeShutdown,omitempty" json:"waitBeforeShutdown" tstype:"Duration"`
+	WaitAfterShutdown   *Duration         `yaml:"waitAfterShutdown,omitempty" json:"waitAfterShutdown" tstype:"Duration"`
+	IncludeErrorDetails *bool             `yaml:"includeErrorDetails,omitempty" json:"includeErrorDetails"`
+	TrustedIPForwarders []string          `yaml:"trustedIPForwarders,omitempty" json:"trustedIPForwarders"`
+	TrustedIPHeaders    []string          `yaml:"trustedIPHeaders,omitempty" json:"trustedIPHeaders"`
+	ResponseHeaders     map[string]string `yaml:"responseHeaders,omitempty" json:"responseHeaders"`
+
+	WebSocket *WebSocketServerConfig `yaml:"webSocket,omitempty" json:"webSocket"`
 
 	// ExecutionHeaders controls the per-request diagnostic headers
 	// (X-ERPC-Attempts, X-ERPC-Upstreams-Tried, etc.) that expose how
@@ -742,19 +741,16 @@ type NetworkDefaults struct {
 	Failover          *FailoverConfig          `yaml:"failover,omitempty" json:"failover"`
 }
 
-// FailoverConfig controls within-request escalation to fallback-tier
-// upstreams. Independent of SelectionPolicy (which re-evaluates tiers
-// periodically across requests) — Failover operates per-request only.
+// FailoverConfig controls per-request escalation to fallback-tier upstreams,
+// independent of the selection policy.
 type FailoverConfig struct {
-	// OnDefaultsExhausted, when true, causes the network request loop to
-	// try upstreams not tagged `tier:fallback` first and only advance to the
-	// `tier:fallback` ones if every other upstream failed with an error that
-	// is retryable toward the network within the same request. Deterministic
-	// client errors still short-circuit without advancing.
+	// OnDefaultsExhausted tries upstreams not tagged `tier:fallback` first and
+	// advances to the fallback tier within the same request only once every
+	// other upstream failed with an error retryable toward the network.
 	OnDefaultsExhausted *bool `yaml:"onDefaultsExhausted,omitempty" json:"onDefaultsExhausted"`
 }
 
-// Enabled reports whether any failover behaviour is configured. Nil-safe.
+// Enabled reports whether any failover behaviour is configured.
 func (f *FailoverConfig) Enabled() bool {
 	if f == nil {
 		return false
@@ -891,10 +887,8 @@ func (p *ProviderConfig) MarshalYAML() (interface{}, error) {
 	}, nil
 }
 
-// TagTierFallback marks an upstream as part of the fallback tier (via the
-// `tier:fallback` tag convention): used only when all non-fallback upstreams
-// are unavailable. Referenced by the default selection policy and by
-// failover.onDefaultsExhausted.
+// TagTierFallback marks an upstream as part of the fallback tier, used only
+// when the other upstreams are unavailable.
 const TagTierFallback = "tier:fallback"
 
 // RateLimitCountMode selects the accounting unit an upstream's rate-limit
@@ -2613,16 +2607,10 @@ type EvmNetworkConfig struct {
 	// Default includes common point-lookup methods like eth_getBlockByNumber, eth_getTransactionByHash, etc.
 	MarkEmptyAsErrorMethods []string `yaml:"markEmptyAsErrorMethods,omitempty" json:"markEmptyAsErrorMethods,omitempty"`
 
-	// StripSubscribeFromBlockZero, when true, removes `fromBlock: "0x0"` from
-	// eth_subscribe logs filters before forwarding to upstream WebSockets.
-	// Some clients include `fromBlock: "0x0"` in the filter as a
-	// "from genesis" marker. eth_subscribe is a live-stream RPC — fromBlock
-	// has no standardised meaning there — and on backends that prune
-	// historical data the subscription fails outright. Enabling this flag
-	// for such networks drops the field so the live stream succeeds;
-	// historical logs remain retrievable via eth_getLogs. Only a string
-	// fromBlock that parses to zero is stripped — other values pass through
-	// unchanged. DEFAULT: false.
+	// StripSubscribeFromBlockZero removes a zero `fromBlock` from eth_subscribe
+	// logs filters before forwarding upstream. fromBlock has no meaning for a
+	// live subscription, and backends that prune history reject it.
+	// DEFAULT: false.
 	StripSubscribeFromBlockZero *bool `yaml:"stripSubscribeFromBlockZero,omitempty" json:"stripSubscribeFromBlockZero,omitempty"`
 
 	// DynamicBlockTimeDebounceMultiplier scales the EMA-estimated block time to derive

@@ -3,6 +3,7 @@ package indexer
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 
@@ -12,9 +13,10 @@ import (
 // BuildParamsKey returns a stable short hash of eth_subscribe params. The
 // same (subType, params) tuple always hashes to the same key across
 // processes, so the key doubles as a fan-out lookup across sources and
-// across pods.
+// across pods. Uses encoding/json rather than SonicCfg because it sorts map
+// keys.
 func BuildParamsKey(params []interface{}) string {
-	data, err := common.SonicCfg.Marshal(params)
+	data, err := json.Marshal(params)
 	if err != nil {
 		// Fall back to Go's default formatting. Worse than JSON for
 		// cross-process stability, but only hit on marshal errors that

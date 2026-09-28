@@ -13,6 +13,21 @@ func TestBuildParamsKey_StableAcrossCalls(t *testing.T) {
 	}
 }
 
+func TestBuildParamsKey_IndependentOfMapOrder(t *testing.T) {
+	params := []interface{}{"logs", map[string]interface{}{
+		"address":   "0xabc",
+		"topics":    []interface{}{"0x1", nil},
+		"fromBlock": "latest",
+		"toBlock":   "latest",
+	}}
+	want := BuildParamsKey(params)
+	for i := 0; i < 200; i++ {
+		if got := BuildParamsKey(params); got != want {
+			t.Fatalf("call %d: same params hashed to %q, want %q", i, got, want)
+		}
+	}
+}
+
 func TestBuildParamsKey_DifferentParamsDiffer(t *testing.T) {
 	a := BuildParamsKey([]interface{}{"logs", map[string]interface{}{"topics": []string{"0x1"}}})
 	b := BuildParamsKey([]interface{}{"logs", map[string]interface{}{"topics": []string{"0x2"}}})

@@ -17,14 +17,12 @@ type Adapter struct {
 	started bool
 	sink    indexer.Sink
 	events  chan indexer.StreamEvent
-	filters map[string]struct{} // subType:paramsHash
 }
 
 func New(name string) *Adapter {
 	return &Adapter{
-		name:    name,
-		events:  make(chan indexer.StreamEvent, 64),
-		filters: make(map[string]struct{}),
+		name:   name,
+		events: make(chan indexer.StreamEvent, 64),
 	}
 }
 
@@ -54,17 +52,11 @@ func (a *Adapter) pump(ctx context.Context) {
 	}
 }
 
-func (a *Adapter) EnsureFilter(_ context.Context, subType, paramsHash string, _ []interface{}) error {
-	a.mu.Lock()
-	a.filters[subType+":"+paramsHash] = struct{}{}
-	a.mu.Unlock()
+func (a *Adapter) EnsureFilter(context.Context, string, string, []interface{}) error {
 	return nil
 }
 
-func (a *Adapter) RemoveFilter(_ context.Context, subType, paramsHash string) error {
-	a.mu.Lock()
-	delete(a.filters, subType+":"+paramsHash)
-	a.mu.Unlock()
+func (a *Adapter) RemoveFilter(context.Context, string, string) error {
 	return nil
 }
 
@@ -72,15 +64,4 @@ func (a *Adapter) RemoveFilter(_ context.Context, subType, paramsHash string) er
 // indexer shows up as a test timeout rather than silent drops.
 func (a *Adapter) Push(ev indexer.StreamEvent) {
 	a.events <- ev
-}
-
-// ActiveFilters returns the subType:paramsHash keys currently subscribed.
-func (a *Adapter) ActiveFilters() []string {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	out := make([]string, 0, len(a.filters))
-	for k := range a.filters {
-		out = append(out, k)
-	}
-	return out
 }

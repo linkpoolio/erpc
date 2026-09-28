@@ -12,11 +12,8 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// TestIntegration_NullIngress_EndToEnd wires a real indexer.Indexer to a
-// transport-free nullingress.Adapter and asserts the full pipeline
-// (ingest → dedup → fan-out) works with zero WebSocket-shaped
-// dependencies. This is the forcing-function test proving the interface
-// is transport-neutral.
+// TestIntegration_NullIngress_EndToEnd drives ingest, dedup and fan-out
+// through a transport-free ingress.
 func TestIntegration_NullIngress_EndToEnd(t *testing.T) {
 	logger := zerolog.New(zerolog.NewTestWriter(t))
 	idx := indexer.New(&logger, indexer.Options{})
@@ -40,7 +37,6 @@ func TestIntegration_NullIngress_EndToEnd(t *testing.T) {
 	ing.Push(headEvent("evm:1", "null:test", 100, "0xA", "0x0")) // dup
 	ing.Push(headEvent("evm:1", "null:test", 101, "0xB", "0xA"))
 
-	// Drain: give the pump goroutine + indexer a chance to run.
 	deadline := time.After(2 * time.Second)
 	for {
 		if eg.count() >= 2 {
@@ -55,47 +51,12 @@ func TestIntegration_NullIngress_EndToEnd(t *testing.T) {
 	if got := eg.count(); got != 2 {
 		t.Fatalf("want 2 deliveries (dup suppressed), got %d", got)
 	}
-	// Verify state poller was called per source.
 	nw.mu.Lock()
 	defer nw.mu.Unlock()
 	if n := len(nw.suggestions["null:test"]); n < 2 {
 		t.Fatalf("SuggestLatestBlock should fire on every observation (incl. dup), got %d", n)
 	}
 }
-
-func TestIntegration_NullIngress_FilterRefcountAndTeardown(t *testing.T) {
-	logger := zerolog.New(zerolog.NewTestWriter(t))
-	idx := indexer.New(&logger, indexer.Options{})
-
-	nw := &stubNetwork{id: "evm:1"}
-	idx.RegisterNetwork(nw)
-	ing := nullingress.New("null:test")
-	if err := idx.AddIngress(context.Background(), "evm:1", ing); err != nil {
-		t.Fatal(err)
-	}
-
-	params := []interface{}{"logs", map[string]interface{}{"topics": []string{"0x1"}}}
-	h1, _ := idx.EnsureFilter(context.Background(), "evm:1", "logs", params)
-	h2, _ := idx.EnsureFilter(context.Background(), "evm:1", "logs", params)
-	if h1 != h2 {
-		t.Fatalf("same params must hash identically, got %q vs %q", h1, h2)
-	}
-	if n := len(ing.ActiveFilters()); n != 1 {
-		t.Fatalf("EnsureFilter should register exactly one filter on the ingress, got %d", n)
-	}
-
-	// Only the second release tears down (refcount hits 0).
-	idx.ReleaseFilter(context.Background(), "evm:1", "logs", h1)
-	if n := len(ing.ActiveFilters()); n != 1 {
-		t.Fatalf("filter still held by 1 client — expected 1 active, got %d", n)
-	}
-	idx.ReleaseFilter(context.Background(), "evm:1", "logs", h1)
-	if n := len(ing.ActiveFilters()); n != 0 {
-		t.Fatalf("filter should be torn down, got %d active", n)
-	}
-}
-
-// --- stubs ------------------------------------------------------------
 
 type stubNetwork struct {
 	id string

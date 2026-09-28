@@ -106,6 +106,23 @@ func (s *ServerConfig) Validate() error {
 	if s.MaxTimeout == nil || *s.MaxTimeout == 0 {
 		return fmt.Errorf("server.maxTimeout is required")
 	}
+	if ws := s.WebSocket; ws != nil {
+		if ws.PingInterval == nil || *ws.PingInterval <= 0 {
+			return fmt.Errorf("server.webSocket.pingInterval must be greater than 0")
+		}
+		if ws.ReadBufferSize < 0 || ws.WriteBufferSize < 0 || ws.MaxMessageSize < 0 {
+			return fmt.Errorf("server.webSocket buffer and message sizes must not be negative")
+		}
+		if ws.MaxSubscriptionsPerConnection < 1 {
+			return fmt.Errorf("server.webSocket.maxSubscriptionsPerConnection must be at least 1")
+		}
+		if ws.MaxConcurrentRequestsPerConnection < 1 {
+			return fmt.Errorf("server.webSocket.maxConcurrentRequestsPerConnection must be at least 1")
+		}
+		if ws.SubscriptionBufferSize < 1 {
+			return fmt.Errorf("server.webSocket.subscriptionBufferSize must be at least 1")
+		}
+	}
 
 	// Validate trusted IP forwarders if provided (IPs or CIDRs). Support legacy + new field
 	for _, entry := range s.TrustedIPForwarders {

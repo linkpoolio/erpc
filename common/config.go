@@ -196,6 +196,14 @@ type WebSocketServerConfig struct {
 	MaxMessageSize                int64     `yaml:"maxMessageSize,omitempty" json:"maxMessageSize"`
 	PingInterval                  *Duration `yaml:"pingInterval,omitempty" json:"pingInterval" tstype:"Duration"`
 	MaxSubscriptionsPerConnection int       `yaml:"maxSubscriptionsPerConnection,omitempty" json:"maxSubscriptionsPerConnection"`
+	// MaxConcurrentRequestsPerConnection bounds the requests a connection has
+	// in flight; further frames wait (backpressure) instead of being rejected.
+	MaxConcurrentRequestsPerConnection int `yaml:"maxConcurrentRequestsPerConnection,omitempty" json:"maxConcurrentRequestsPerConnection"`
+	// SubscriptionBufferSize is the number of notifications queued per
+	// subscription for a client that is behind. On overflow newHeads and
+	// newPendingTransactions drop their oldest entry; logs close the
+	// connection instead (1013), so the client knows it missed data.
+	SubscriptionBufferSize int `yaml:"subscriptionBufferSize,omitempty" json:"subscriptionBufferSize"`
 }
 
 // ExecutionHeadersMode controls how much per-request execution detail is

@@ -123,6 +123,12 @@ var (
 		Help:      "Whether the upstream WebSocket connection is currently established (1) or down/wedged (0).",
 	}, []string{"project", "vendor", "network", "upstream"})
 
+	MetricWebsocketSubscriptionNotificationsDroppedTotal = DefineCounter(prometheus.CounterOpts{
+		Namespace: "erpc",
+		Name:      "websocket_subscription_notifications_dropped_total",
+		Help:      "Subscription notifications dropped because a client's per-subscription buffer was full. For logs the client connection is closed with 1013.",
+	}, []string{"project", "network", "kind"})
+
 	// MetricNetworkServedTipBlockNumber is the block number the network actually
 	// advertises/serves as the tip for a block tag (axis=latest|finalized): the
 	// freshest block a strict MAJORITY of eligible upstreams already have (see

@@ -15,12 +15,8 @@ func newTestSubscriberChannel() *subscriberChannel {
 	}
 }
 
-// Regression test for the propagation gap that caused cross-pod finalized-
-// block regressions in production: when two counter updates for the same
-// key arrived faster than the consumer goroutine drained its cap=1 buffer,
-// the newer message was silently dropped. For monotonic counters the
-// freshest value is the only one that matters, so sendKeepLatest must
-// evict the stale buffered value instead of refusing the new one.
+// Updates arriving faster than the consumer drains its buffer must evict the
+// stale buffered value rather than drop the newer one.
 func TestSubscriberChannel_SendKeepLatestEvictsStale(t *testing.T) {
 	sc := newTestSubscriberChannel()
 

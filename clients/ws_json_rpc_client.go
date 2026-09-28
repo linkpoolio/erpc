@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -101,6 +102,10 @@ type WsJsonRpcClient struct {
 	errorExtractor common.JsonRpcErrorExtractor
 
 	connected atomic.Bool
+
+	// metricLabels are the labels the connectivity gauge was last set under.
+	metricMu     sync.Mutex
+	metricLabels []string
 
 	// wireIDCounter generates the JSON-RPC ids used on the wire so that
 	// concurrent requests with the same caller-supplied id do not collide
@@ -386,7 +391,7 @@ func (c *WsJsonRpcClient) connect() error {
 	c.connectedAt = time.Now()
 	c.connected.Store(true)
 	c.connMu.Unlock()
-	c.setConnectedMetric(1)
+	c.setConnectedMetric()
 
 	c.logger.Info().Str("url", c.Url.String()).Msg("websocket connection established")
 	return nil
@@ -407,7 +412,7 @@ func (c *WsJsonRpcClient) teardownConn(conn *websocket.Conn, cause error) {
 	if conn != nil {
 		_ = conn.Close()
 	}
-	c.setConnectedMetric(0)
+	c.setConnectedMetric()
 	for _, ch := range pending {
 		ch <- &wsPendingResult{err: cause}
 	}
@@ -415,14 +420,27 @@ func (c *WsJsonRpcClient) teardownConn(conn *websocket.Conn, cause error) {
 
 // setConnectedMetric publishes the upstream WS connectivity gauge so
 // operators can alert on a wedged/disconnected upstream socket instead of
-// discovering it from silent client subscriptions.
-func (c *WsJsonRpcClient) setConnectedMetric(v float64) {
+// discovering it from silent client subscriptions. Labels are resolved on
+// every publish (pingLoop republishes each tick) because the upstream's
+// network label is only assigned after the client is built; the series
+// under the previous labels is deleted when they change.
+func (c *WsJsonRpcClient) setConnectedMetric() {
 	if c.upstream == nil {
 		return
 	}
-	telemetry.GaugeHandle(telemetry.MetricUpstreamWebsocketConnected,
-		c.projectId, c.upstream.VendorName(), c.upstream.NetworkLabel(), c.upstream.Id(),
-	).Set(v)
+	labels := []string{c.projectId, c.upstream.VendorName(), c.upstream.NetworkLabel(), c.upstream.Id()}
+
+	c.metricMu.Lock()
+	defer c.metricMu.Unlock()
+	if c.metricLabels != nil && !slices.Equal(c.metricLabels, labels) {
+		telemetry.MetricUpstreamWebsocketConnected.DeleteLabelValues(c.metricLabels...)
+	}
+	c.metricLabels = labels
+	v := 0.0
+	if c.IsConnected() {
+		v = 1
+	}
+	telemetry.MetricUpstreamWebsocketConnected.WithLabelValues(labels...).Set(v)
 }
 
 // readLoop owns the connection lifecycle: it reads the current connection
@@ -587,6 +605,7 @@ func (c *WsJsonRpcClient) pingLoop() {
 	for {
 		select {
 		case <-ticker.C:
+			c.setConnectedMetric()
 			c.connMu.Lock()
 			conn := c.conn
 			c.connMu.Unlock()

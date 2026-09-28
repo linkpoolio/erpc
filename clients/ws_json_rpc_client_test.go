@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/erpc/erpc/common"
+	"github.com/erpc/erpc/telemetry"
 	"github.com/gorilla/websocket"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -294,6 +296,44 @@ func TestWsClientPingWriteFailureForcesReconnect(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("server never saw the re-dialed connection")
 	}
+}
+
+// relabelledUpstream reports a network label that can change after the
+// client is built, as upstream.Upstream's does once it joins a network.
+type relabelledUpstream struct {
+	common.Upstream
+	label atomic.Value
+}
+
+func (u *relabelledUpstream) NetworkLabel() string { return u.label.Load().(string) }
+
+// TestWsClientConnectedGaugeFollowsNetworkLabel: the connectivity gauge
+// must move to the upstream's current network label and drop the series
+// published under the old one.
+func TestWsClientConnectedGaugeFollowsNetworkLabel(t *testing.T) {
+	compressWsLiveness(t)
+	server := newFakeWsServer(t)
+	up := &relabelledUpstream{Upstream: common.NewFakeUpstream("test-ws-gauge-upstream")}
+	up.label.Store("n/a")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	logger := zerolog.New(zerolog.NewTestWriter(t)).Level(zerolog.WarnLevel)
+	_, err := NewWsJsonRpcClient(ctx, &logger, "test-project", up, server.wsURL(t), nil, nil)
+	require.NoError(t, err)
+	<-server.newConn
+
+	gauge := telemetry.MetricUpstreamWebsocketConnected
+	labels := func(network string) []string {
+		return []string{"test-project", up.VendorName(), network, up.Id()}
+	}
+	require.Equal(t, 1.0, testutil.ToFloat64(gauge.WithLabelValues(labels("n/a")...)))
+
+	up.label.Store("evm:123")
+	require.Eventually(t, func() bool {
+		return testutil.ToFloat64(gauge.WithLabelValues(labels("evm:123")...)) == 1
+	}, 2*time.Second, 10*time.Millisecond)
+	assert.False(t, gauge.DeleteLabelValues(labels("n/a")...), "series under the stale label should have been deleted")
 }
 
 // newWsTestServer upgrades every request and hands the connection to

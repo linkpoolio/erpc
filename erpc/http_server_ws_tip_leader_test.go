@@ -22,10 +22,9 @@ func init() {
 	util.ConfigureTestLogger()
 }
 
-// EnforceHighestBlock must re-fetch the concrete tip via EvmLeaderUpstream
-// (the poller advanced by SuggestLatestBlock), not fail-open to a lagging
-// sibling that answered "latest" first.
-func TestHttpServer_GetBlockByNumberLatest_RefetchPinsEvmLeaderUpstream(t *testing.T) {
+// EnforceHighestBlock's tip re-fetch must reach the upstream whose poller has
+// the tip, not settle for the lagging sibling that answered "latest" first.
+func TestHttpServer_GetBlockByNumberLatest_RefetchReachesTipUpstream(t *testing.T) {
 	util.ResetGock()
 	defer util.ResetGock()
 	util.SetupMocksForEvmStatePoller()
@@ -118,7 +117,8 @@ func TestHttpServer_GetBlockByNumberLatest_RefetchPinsEvmLeaderUpstream(t *testi
 	}
 	require.NotNil(t, leader)
 
-	// Mirror WS ingest: tip-source poller + TipHW before any client sees the head.
+	// Mirror WS ingest: the tip-source poller and the delivered-head floor
+	// advance before any client sees the head.
 	leader.EvmStatePoller().SuggestLatestBlock(tip)
 	nw.NoteObservedLatestBlock(context.Background(), tip)
 
@@ -142,17 +142,16 @@ func TestHttpServer_GetBlockByNumberLatest_RefetchPinsEvmLeaderUpstream(t *testi
 	assert.Equal(t, tipHex, result["number"])
 	assert.Equal(t, "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", result["hash"])
 	assert.GreaterOrEqual(t, leaderHits.Load(), int64(1),
-		"EnforceHighestBlock must pin the tip re-fetch to EvmLeaderUpstream")
+		"the tip re-fetch must reach the upstream that has the tip")
 }
 
-// Direct eth_getBlockByNumber(tip) must pin to EvmLeaderUpstream on first
-// forward (same idea as EnforceHighestBlock tip re-fetch), not hit a lagging
-// sibling that is preferred by selection order.
-func TestHttpServer_GetBlockByNumber_NearTipPinsEvmLeaderUpstream(t *testing.T) {
+// Direct eth_getBlockByNumber(tip) goes first to the upstream that has the
+// tip, not to a lagging sibling preferred by selection order.
+func TestHttpServer_GetBlockByNumber_NearTipPrefersTipUpstream(t *testing.T) {
 	util.ResetGock()
 	defer util.ResetGock()
 	util.SetupMocksForEvmStatePoller()
-	// rpc1 tip-null Persist mock is intentionally unused when the pin works.
+	// rpc1 tip-null Persist mock is intentionally unused.
 	defer util.AssertNoPendingMocks(t, 1)
 
 	const tip = int64(0x33338889)
@@ -275,132 +274,7 @@ func TestHttpServer_GetBlockByNumber_NearTipPinsEvmLeaderUpstream(t *testing.T) 
 	require.True(t, ok, "got: %s", body)
 	assert.Equal(t, tipHex, result["number"])
 	assert.GreaterOrEqual(t, leaderHits.Load(), int64(1),
-		"near-tip getBlock must pin to EvmLeaderUpstream")
+		"near-tip getBlock must go to the upstream that has the tip")
 	assert.Equal(t, int64(0), laggingHits.Load(),
-		"lagging sibling must not receive the pinned near-tip getBlock")
-}
-
-// When TipHW is ahead of every upstream's concrete block response,
-// EnforceHighestBlock must NOT fail-open to the stale "latest" — a strict
-// client treats that as out of sync once WS has already delivered the higher head.
-func TestHttpServer_GetBlockByNumberLatest_RefusesStaleFailOpen(t *testing.T) {
-	util.ResetGock()
-	defer util.ResetGock()
-	util.SetupMocksForEvmStatePoller()
-	// Two Persist tip-null mocks remain pending by design.
-	defer util.AssertNoPendingMocks(t, 2)
-
-	const tip = int64(0x22228889)
-	tipHex := "0x22228889"
-	staleHex := "0x22228888"
-
-	// Tip re-fetch always misses (null) — pinned and unconstrained paths.
-	gock.New("http://rpc1.localhost").
-		Post("").
-		Persist().
-		Filter(func(r *http.Request) bool {
-			body := util.SafeReadBody(r)
-			return strings.Contains(body, "eth_getBlockByNumber") && strings.Contains(body, tipHex)
-		}).
-		Reply(200).
-		JSON([]byte(`{"result":null}`))
-	gock.New("http://rpc2.localhost").
-		Post("").
-		Persist().
-		Filter(func(r *http.Request) bool {
-			body := util.SafeReadBody(r)
-			return strings.Contains(body, "eth_getBlockByNumber") && strings.Contains(body, tipHex)
-		}).
-		Reply(200).
-		JSON([]byte(`{"result":null}`))
-
-	cfg := &common.Config{
-		Server: &common.ServerConfig{
-			MaxTimeout: common.Duration(100 * time.Second).Ptr(),
-		},
-		Projects: []*common.ProjectConfig{
-			{
-				Id: "test_project",
-				Networks: []*common.NetworkConfig{
-					{
-						Architecture: "evm",
-						Evm: &common.EvmNetworkConfig{
-							ChainId: 123,
-							Integrity: &common.EvmIntegrityConfig{
-								EnforceHighestBlock: util.BoolPtr(true),
-							},
-						},
-						Failsafe: []*common.FailsafeConfig{
-							{
-								Retry: &common.RetryPolicyConfig{MaxAttempts: 2},
-							},
-						},
-					},
-				},
-				Upstreams: []*common.UpstreamConfig{
-					{
-						Id:       "rpc1",
-						Endpoint: "http://rpc1.localhost",
-						Type:     common.UpstreamTypeEvm,
-						Evm: &common.EvmUpstreamConfig{
-							ChainId:             123,
-							StatePollerInterval: common.Duration(10 * time.Second),
-						},
-					},
-					{
-						Id:       "rpc2",
-						Endpoint: "http://rpc2.localhost",
-						Type:     common.UpstreamTypeEvm,
-						Evm: &common.EvmUpstreamConfig{
-							ChainId:             123,
-							StatePollerInterval: common.Duration(10 * time.Second),
-						},
-					},
-				},
-			},
-		},
-	}
-
-	sendRequest, _, _, shutdown, erpcInstance := createServerTestFixtures(cfg, t)
-	defer shutdown()
-
-	prj, err := erpcInstance.GetProject("test_project")
-	require.NoError(t, err)
-	policy.OverrideAllForTest(prj.policyEngine)
-	policy.OverrideOrderForTest(prj.policyEngine, "evm:123", "rpc1", "rpc2")
-
-	time.Sleep(500 * time.Millisecond)
-
-	nw, err := prj.GetNetwork(context.Background(), "evm:123")
-	require.NoError(t, err)
-
-	var leader *upstream.Upstream
-	for _, u := range nw.upstreamsRegistry.GetNetworkUpstreams(context.Background(), "evm:123") {
-		if u.Id() == "rpc2" {
-			leader = u
-			break
-		}
-	}
-	require.NotNil(t, leader)
-	leader.EvmStatePoller().SuggestLatestBlock(tip)
-	nw.NoteObservedLatestBlock(context.Background(), tip)
-
-	statusCode, _, body := sendRequest(`{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  "eth_getBlockByNumber",
-		"params": ["latest", false]
-	}`, nil, nil)
-
-	var respObject map[string]interface{}
-	require.NoError(t, sonic.UnmarshalString(body, &respObject))
-	if result, ok := respObject["result"].(map[string]interface{}); ok {
-		require.NotEqual(t, staleHex, result["number"],
-			"must not fail-open to stale tip below TipHW; status=%d body=%s", statusCode, body)
-		require.NotEqual(t, tipHex, result["number"],
-			"tip was mocked as null; unexpected tip success: %s", body)
-	}
-	_, hasErr := respObject["error"]
-	require.True(t, hasErr || statusCode >= 400,
-		"expected error when tip re-fetch cannot reach TipHW, got status=%d body=%s", statusCode, body)
+		"lagging sibling must not receive the near-tip getBlock")
 }

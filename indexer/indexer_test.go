@@ -263,13 +263,13 @@ func TestIndexer_Log_DedupFanOut(t *testing.T) {
 		Payload:    payload,
 	}
 	idx.Ingest(ev)
-	idx.Ingest(ev) // dup by (blockHash, txHash, logIndex, removed)
+	idx.Ingest(ev) // dup: same identity, same removed state
 
 	if got := eg.count(); got != 1 {
 		t.Fatalf("log dedup: want 1, got %d", got)
 	}
 
-	// Same log with removed=true must deliver (distinct dedup key).
+	// Same log with removed=true must deliver (state changed).
 	idx.Ingest(StreamEvent{
 		Kind: KindLog, NetworkId: "evm:1", SourceId: "ws:up1", FilterHash: h,
 		Payload: json.RawMessage(`{"blockHash":"0xB","transactionHash":"0xT","logIndex":"0x0","removed":true}`),
@@ -283,6 +283,107 @@ func TestIndexer_Log_DedupFanOut(t *testing.T) {
 	eg.mu.Unlock()
 	if !last.Removed {
 		t.Fatalf("removed flag must propagate to IndexedEvent.Removed")
+	}
+}
+
+// newLogFilter registers "evm:1", ensures an empty logs filter and attaches
+// an egress interested in it. Helper for log dedup tests.
+func newLogFilter(t *testing.T) (*Indexer, string, *fakeEgress) {
+	t.Helper()
+	idx := newIndexer(t)
+	idx.RegisterNetwork(newFakeNetwork("evm:1"))
+	h, err := idx.EnsureFilter(context.Background(), "evm:1", "logs", []interface{}{"logs", map[string]interface{}{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eg := &fakeEgress{name: "eg1", filters: map[string]struct{}{h: {}}}
+	idx.Attach(eg)
+	return idx, h, eg
+}
+
+func logEvent(filterHash, source, payload string) StreamEvent {
+	return StreamEvent{
+		Kind: KindLog, NetworkId: "evm:1", SourceId: source, FilterHash: filterHash,
+		Payload: json.RawMessage(payload),
+	}
+}
+
+const (
+	logAddedJSON   = `{"blockHash":"0xB","transactionHash":"0xT","logIndex":"0x0","removed":false}`
+	logRemovedJSON = `{"blockHash":"0xB","transactionHash":"0xT","logIndex":"0x0","removed":true}`
+)
+
+func TestIndexer_Log_DuplicateAddsFromManyUpstreamsDeliverOnce(t *testing.T) {
+	idx, h, eg := newLogFilter(t)
+	for i := 0; i < 4; i++ {
+		idx.Ingest(logEvent(h, fmt.Sprintf("ws:up%d", i), logAddedJSON))
+	}
+	if got := eg.count(); got != 1 {
+		t.Fatalf("same log from N upstreams must deliver once, got %d", got)
+	}
+}
+
+// Reorg A→B→A where the log's block comes back with the same hash: the
+// client must see add, remove, add — the final re-add must not be
+// swallowed as a duplicate of the first add.
+func TestIndexer_Log_AddRemoveReAddDeliversEach(t *testing.T) {
+	idx, h, eg := newLogFilter(t)
+	for _, p := range []string{logAddedJSON, logRemovedJSON, logAddedJSON} {
+		// Two upstreams each report every transition.
+		idx.Ingest(logEvent(h, "ws:up1", p))
+		idx.Ingest(logEvent(h, "ws:up2", p))
+	}
+	eg.mu.Lock()
+	defer eg.mu.Unlock()
+	if len(eg.received) != 3 {
+		t.Fatalf("add, remove, re-add must deliver 3 events, got %d", len(eg.received))
+	}
+	want := []bool{false, true, false}
+	for i, ev := range eg.received {
+		if ev.Removed != want[i] {
+			t.Fatalf("event %d: Removed=%v, want %v", i, ev.Removed, want[i])
+		}
+	}
+}
+
+func TestIndexer_Log_DuplicateRemovesDeliverOnce(t *testing.T) {
+	idx, h, eg := newLogFilter(t)
+	idx.Ingest(logEvent(h, "ws:up1", logAddedJSON))
+	idx.Ingest(logEvent(h, "ws:up1", logRemovedJSON))
+	idx.Ingest(logEvent(h, "ws:up2", logRemovedJSON))
+	idx.Ingest(logEvent(h, "ws:up3", logRemovedJSON))
+	if got := eg.count(); got != 2 {
+		t.Fatalf("duplicate removes must collapse: want 2 deliveries, got %d", got)
+	}
+}
+
+// Logs whose identity can't be established must pass through rather than
+// collapse onto one shared key.
+func TestIndexer_Log_MissingIdentityFieldsPassThrough(t *testing.T) {
+	idx, h, eg := newLogFilter(t)
+	idx.Ingest(logEvent(h, "ws:up1", `{"data":"0x01"}`))
+	idx.Ingest(logEvent(h, "ws:up1", `{"data":"0x02"}`))
+	idx.Ingest(logEvent(h, "ws:up1", `{"blockHash":"0xB","logIndex":"0x0"}`))
+	if got := eg.count(); got != 3 {
+		t.Fatalf("logs without full identity must all pass through, got %d", got)
+	}
+}
+
+// Hex on the wire is case-insensitive: the same log reported with
+// differently-cased hashes by two upstreams is one log. The delivered
+// payload is untouched.
+func TestIndexer_Log_DedupIgnoresHexCase(t *testing.T) {
+	idx, h, eg := newLogFilter(t)
+	upper := `{"blockHash":"0xABCD","transactionHash":"0xEF01","logIndex":"0xA"}`
+	idx.Ingest(logEvent(h, "ws:up1", upper))
+	idx.Ingest(logEvent(h, "ws:up2", `{"blockHash":"0xabcd","transactionHash":"0xef01","logIndex":"0xa"}`))
+	eg.mu.Lock()
+	defer eg.mu.Unlock()
+	if len(eg.received) != 1 {
+		t.Fatalf("case-only differences must dedupe, got %d deliveries", len(eg.received))
+	}
+	if string(eg.received[0].Payload) != upper {
+		t.Fatalf("payload must pass through verbatim, got %s", eg.received[0].Payload)
 	}
 }
 

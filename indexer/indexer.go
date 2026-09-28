@@ -341,25 +341,22 @@ func (i *Indexer) Ingest(ev StreamEvent) {
 		ns.handle.SuggestLatestBlock(ev.SourceId, ev.Block.Number, ev.Payload)
 	}
 
-	// Dedup.
-	if !i.dedupe(ns, &ev) {
+	// Upstream-asserted removed flag, passed through: the indexer does not
+	// second-guess which chain is canonical.
+	removed := ev.Kind == KindLog && logRemoved(ev.Payload)
+
+	if !i.dedupe(ns, &ev, removed) {
 		return
 	}
 
-	out := IndexedEvent{StreamEvent: ev}
-	// Upstream-asserted removed flag, passed through: the indexer does not
-	// second-guess which chain is canonical.
-	if ev.Kind == KindLog {
-		out.Removed = logRemoved(ev.Payload)
-	}
-
-	i.fanOut(out)
+	i.fanOut(IndexedEvent{StreamEvent: ev, Removed: removed})
 }
 
 // dedupe returns true if the event should be delivered, false if it's a
 // dupe. newHeads dedupe on the most recently delivered (number, hash);
-// filter events on a bounded per-filter DedupWindow.
-func (i *Indexer) dedupe(ns *networkState, ev *StreamEvent) bool {
+// filter events on a bounded per-filter DedupWindow keyed by identity, with
+// removed as the per-key state.
+func (i *Indexer) dedupe(ns *networkState, ev *StreamEvent, removed bool) bool {
 	switch ev.Kind {
 	case KindNewHead:
 		// CAS-retry on the packed (num, hash) pointer. On the happy path
@@ -398,7 +395,7 @@ func (i *Indexer) dedupe(ns *networkState, ev *StreamEvent) bool {
 			// Couldn't extract a key; don't pretend we deduped.
 			return true
 		}
-		return win.Mark(key)
+		return win.Mark(key, removed)
 	default:
 		return true
 	}

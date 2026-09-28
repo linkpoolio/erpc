@@ -149,10 +149,6 @@ func (u *UpstreamsRegistry) GetInitializer() *util.Initializer {
 	return u.initializer
 }
 
-func (u *UpstreamsRegistry) SharedStateRegistry() data.SharedStateRegistry {
-	return u.sharedStateRegistry
-}
-
 func (u *UpstreamsRegistry) getNetworkMutex(networkId string) *sync.RWMutex {
 	mutex, _ := u.networkMu.LoadOrStore(networkId, &sync.RWMutex{})
 	return mutex.(*sync.RWMutex)
@@ -160,6 +156,15 @@ func (u *UpstreamsRegistry) getNetworkMutex(networkId string) *sync.RWMutex {
 
 func (u *UpstreamsRegistry) GetProvidersRegistry() *thirdparty.ProvidersRegistry {
 	return u.providersRegistry
+}
+
+// SharedStateRegistry exposes the registry's shared-state backing store so
+// that consumers (e.g., Network) can register their own counters/values for
+// strict-monotonic coordination across pods. The registry is owned here
+// because UpstreamsRegistry is constructed with it; surfacing it via an
+// accessor is cheaper than threading it through Network's constructor.
+func (u *UpstreamsRegistry) SharedStateRegistry() data.SharedStateRegistry {
+	return u.sharedStateRegistry
 }
 
 // NoUpstreamsAvailableAfter is how long a network may keep initializing with
@@ -421,21 +426,10 @@ func (u *UpstreamsRegistry) GetNetworkUpstreams(ctx context.Context, networkId s
 	return cp
 }
 
-// GetFallbackEscapeUpstreams returns fallback-group upstreams for a network
-// that are eligible to serve a per-request escape when the primary set has
-// been exhausted with retryable errors.
-//
-// Filters by:
-//   - Group == UpstreamGroupFallback (the operator's explicit fallback tag)
-//   - Bootstrapped (present in networkUpstreams via GetNetworkUpstreams)
-//   - Not hard-down for method (IsDown: its circuit breaker is closed)
-//   - Method allowed (ShouldHandleMethod respects IgnoreMethods / AllowMethods)
-//
-// Critically does NOT filter by metricsTracker.IsCordoned. The caller's
-// intent is to escape past the selectionPolicy cordon for this single
-// request. The selectionPolicy continues to govern steady-state routing
-// via the score-based sorted list; this escape path is orthogonal and
-// triggered only on per-request exhaustion in Network.Forward's inner loop.
+// GetFallbackEscapeUpstreams returns the network's bootstrapped fallback-tier
+// upstreams that are not down for method and allow it. Selection-policy
+// cordons are deliberately ignored: the per-request escape exists to get past
+// them.
 func (u *UpstreamsRegistry) GetFallbackEscapeUpstreams(ctx context.Context, networkId, method string) []*Upstream {
 	all := u.GetNetworkUpstreams(ctx, networkId)
 	out := make([]*Upstream, 0, len(all))

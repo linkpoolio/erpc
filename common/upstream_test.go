@@ -4,13 +4,11 @@ import (
 	"testing"
 )
 
-// stubUpstreamForKey is a minimal Upstream that only supports the call
-// UniqueUpstreamKey actually makes (Config()). NetworkId is parameterised
-// so we can prove the key does NOT depend on it.
+// stubUpstreamForKey implements only what UniqueUpstreamKey may call.
 type stubUpstreamForKey struct {
 	cfg       *UpstreamConfig
 	networkId string
-	Upstream  // embed nil interface; we only use Config and NetworkId
+	Upstream
 }
 
 func (s *stubUpstreamForKey) Config() *UpstreamConfig { return s.cfg }
@@ -19,10 +17,7 @@ func (s *stubUpstreamForKey) NetworkId() string       { return s.networkId }
 func TestUniqueUpstreamKey_StableAcrossNetworkIdChanges(t *testing.T) {
 	cfg := &UpstreamConfig{Id: "u1", Endpoint: "https://example/0"}
 
-	// Before registration, NetworkId returns "n/a"; after registration it's
-	// the real id. Both calls must produce the same key, otherwise the
-	// per-upstream client cache and shared-state counters get duplicated
-	// across the upstream's lifecycle.
+	// NetworkId reads "n/a" until registration; the key must not change.
 	pre := UniqueUpstreamKey(&stubUpstreamForKey{cfg: cfg, networkId: "n/a"})
 	post := UniqueUpstreamKey(&stubUpstreamForKey{cfg: cfg, networkId: "evm:1"})
 
@@ -41,9 +36,7 @@ func TestUniqueUpstreamKey_DeterministicAcrossHeaderOrder(t *testing.T) {
 		return UniqueUpstreamKey(&stubUpstreamForKey{cfg: cfg, networkId: "evm:1"})
 	}
 
-	// Go map iteration is randomised, so the previous SHA-update order was
-	// non-deterministic per call. Many runs against semantically identical
-	// header maps must all produce the same key.
+	// Map iteration order is randomised; the key must not depend on it.
 	headers := map[string]string{
 		"Authorization": "Bearer xyz",
 		"X-Tenant":      "tenant-a",

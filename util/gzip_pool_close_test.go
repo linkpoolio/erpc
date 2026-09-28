@@ -35,10 +35,7 @@ func gzipped(t *testing.T, payload string) io.Reader {
 	return &buf
 }
 
-// pooledGzipReadCloser.Close MUST close the underlying source.
-// Regression test for the leak in clients/http_json_rpc_client.go single-
-// request path: gzip wrapper close used to leave resp.Body open, pinning the
-// HTTP/2 stream and accumulating http2ClientConn.readLoop goroutines.
+// pooledGzipReadCloser.Close must close the underlying source.
 func TestPooledGzipReadCloser_ClosesSource(t *testing.T) {
 	pool := NewGzipReaderPool()
 	src := &countingCloser{Reader: gzipped(t, "hello")}

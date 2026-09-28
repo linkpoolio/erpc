@@ -49,9 +49,8 @@ logLevel: DEBUG
 	}
 }
 
-// TestLoadConfig_DeprecatedIndexerCanonicalChainDepthAccepted: the indexer
-// no longer tracks a canonical chain, but configs that still set
-// indexer.canonicalChainDepth must keep loading under strict decoding.
+// Configs that still set the ignored indexer.canonicalChainDepth must load
+// under strict decoding.
 func TestLoadConfig_DeprecatedIndexerCanonicalChainDepthAccepted(t *testing.T) {
 	fs := afero.NewMemMapFs()
 	cfg, err := afero.TempFile(fs, "", "erpc.yaml")
@@ -1237,9 +1236,6 @@ projects:
 	})
 }
 
-// TestNetworkConfig_SetDefaults_FailoverInheritsFromDefaults verifies that a
-// failover flag set at the NetworkDefaults level is propagated to networks
-// that don't override it.
 func TestNetworkConfig_SetDefaults_FailoverInheritsFromDefaults(t *testing.T) {
 	enabled := true
 	defaults := &NetworkDefaults{
@@ -1250,6 +1246,15 @@ func TestNetworkConfig_SetDefaults_FailoverInheritsFromDefaults(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotNil(t, n.Failover)
 	assert.True(t, n.Failover.Enabled())
+}
+
+func TestFailoverConfig_Enabled(t *testing.T) {
+	var nilCfg *FailoverConfig
+	assert.False(t, nilCfg.Enabled())
+	assert.False(t, (&FailoverConfig{}).Enabled())
+	disabled, enabled := false, true
+	assert.False(t, (&FailoverConfig{OnDefaultsExhausted: &disabled}).Enabled())
+	assert.True(t, (&FailoverConfig{OnDefaultsExhausted: &enabled}).Enabled())
 }
 
 func TestNetworkConfig_SetDefaults_StripSubscribeFromBlockZeroInheritsFromDefaults(t *testing.T) {

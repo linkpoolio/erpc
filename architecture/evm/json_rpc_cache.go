@@ -666,10 +666,7 @@ func (c *EvmJsonRpcCache) Set(ctx context.Context, req *common.NormalizedRequest
 		attribute.String("network.id", ntwId),
 	)
 
-	// For the SET path we resolve moving tags ("latest", "finalized", "safe")
-	// to the response's concrete block number so each tip advance gets its own
-	// cache key — see ResolveCacheBlockRef. The request's EvmBlockRef is NOT
-	// mutated; the original tag is still visible to downstream callers.
+	// Key "latest"/"finalized" by the response's block (see ResolveCacheBlockRef).
 	blockRef, blockNumber, err := ResolveCacheBlockRef(ctx, req, resp)
 	if err != nil {
 		common.SetTraceSpanError(span, err)
@@ -1089,11 +1086,7 @@ func (c *EvmJsonRpcCache) doGet(ctx context.Context, connector data.Connector, r
 	rpcReq.RLockWithTrace(ctx)
 	defer rpcReq.RUnlock()
 
-	// For the GET path we resolve moving tags ("latest", "finalized", "safe")
-	// to the network's currently-known tip block number so the lookup key
-	// tracks chain progression — see ResolveCacheBlockRef. A burst of
-	// concurrent "latest" queries landing on the same tip will still coalesce
-	// onto one cache entry; across tip advances each block gets its own key.
+	// Key "latest"/"finalized" by the network's current tip (see ResolveCacheBlockRef).
 	blockRef, _, err := ResolveCacheBlockRef(ctx, req, nil)
 	if err != nil {
 		return nil, err

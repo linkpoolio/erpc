@@ -7,18 +7,10 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// upstream helper: a FakeUpstream wired with a FakeEvmStatePoller at the
-// given latest block. id encodes both identity and the original score
-// position so test assertions can read order directly.
+// upWithLatest returns a FakeUpstream whose poller reports latest.
 func upWithLatest(id string, latest int64) common.Upstream {
 	poller := common.NewFakeEvmStatePoller(latest, 0)
 	return common.NewFakeUpstream(id, common.WithEvmStatePoller(poller))
-}
-
-// upWithoutPoller returns a FakeUpstream with no state poller, i.e. an
-// unknown head.
-func upWithoutPoller(id string) common.Upstream {
-	return common.NewFakeUpstream(id)
 }
 
 func ids(ups []common.Upstream) []string {
@@ -50,9 +42,6 @@ func TestPartitionUpstreamsByLatestBlock_NoneHaveTheBlock_NoReorder(t *testing.T
 }
 
 func TestPartitionUpstreamsByLatestBlock_SplitsAndPreservesIntraGroupOrder(t *testing.T) {
-	// Mixed: a (behind), b (has), c (behind), d (has), e (behind).
-	// Expected: b, d, a, c, e. Within "has" group: b before d (input order).
-	// Within "lags" group: a, c, e (input order).
 	in := []common.Upstream{
 		upWithLatest("a", 95),
 		upWithLatest("b", 110),
@@ -65,7 +54,6 @@ func TestPartitionUpstreamsByLatestBlock_SplitsAndPreservesIntraGroupOrder(t *te
 }
 
 func TestPartitionUpstreamsByLatestBlock_EqualLatestIsTreatedAsHavingBlock(t *testing.T) {
-	// Boundary: an upstream at exactly bn has the block.
 	in := []common.Upstream{
 		upWithLatest("a", 99),
 		upWithLatest("b", 100),
@@ -77,7 +65,7 @@ func TestPartitionUpstreamsByLatestBlock_EqualLatestIsTreatedAsHavingBlock(t *te
 
 func TestPartitionUpstreamsByLatestBlock_UnknownHeadKeepsItsPlace(t *testing.T) {
 	in := []common.Upstream{
-		upWithoutPoller("a"),
+		common.NewFakeUpstream("a"),
 		upWithLatest("b", 90),
 		upWithLatest("c", 110),
 		upWithLatest("d", 0),

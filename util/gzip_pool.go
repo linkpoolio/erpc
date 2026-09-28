@@ -53,15 +53,9 @@ func (p *GzipReaderPool) Put(zr *gzip.Reader) {
 	p.pool.Put(zr)
 }
 
-// pooledGzipReadCloser wraps a gzip.Reader so that closing it returns the
-// reader to the pool AND closes the underlying source.
-//
-// The source close is load-bearing: when the source is an http.Response.Body,
-// gzip.Reader.Close only releases the gzip-decoder's internal state — it does
-// not propagate to the underlying transport. Without an explicit source close
-// the HTTP/2 stream stays open, the connection is pinned, and net/http opens
-// a new conn for the next request, leaking http2ClientConn.readLoop
-// goroutines over time.
+// pooledGzipReadCloser wraps a gzip.Reader so that closing it returns it to the
+// pool and closes the source. gzip.Reader.Close does not close its source, so
+// an HTTP response body would otherwise keep its stream open.
 type pooledGzipReadCloser struct {
 	zr     *gzip.Reader
 	pool   *GzipReaderPool
@@ -74,8 +68,7 @@ func (pgrc *pooledGzipReadCloser) Read(b []byte) (int, error) { return pgrc.zr.R
 func (pgrc *pooledGzipReadCloser) Close() error {
 	var err error
 	pgrc.once.Do(func() {
-		// Close underlying gzip reader first, return it to the pool, then
-		// close the source so the http transport can release the stream.
+		// Close underlying gzip reader first, then return to pool exactly once.
 		err = pgrc.zr.Close()
 		pgrc.pool.Put(pgrc.zr)
 		if pgrc.source != nil {
@@ -91,10 +84,8 @@ func (pgrc *pooledGzipReadCloser) Close() error {
 	return err
 }
 
-// WrapGzipReader returns an io.ReadCloser wrapper that will return the
-// gzip.Reader to pool on Close, and close source. source may be nil for
-// callers that close the source themselves (e.g., via defer); when non-nil
-// the wrapper owns its lifetime.
+// WrapGzipReader returns an io.ReadCloser wrapper that will return the gzip.Reader to pool on Close.
+// A non-nil source is closed too; pass nil when the caller closes it.
 func (p *GzipReaderPool) WrapGzipReader(zr *gzip.Reader, source io.Closer) io.ReadCloser {
 	return &pooledGzipReadCloser{zr: zr, pool: p, source: source}
 }

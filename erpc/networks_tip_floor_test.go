@@ -7,15 +7,11 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// newTipFloorTestNetwork builds the minimal Network needed by
-// applyDeliveredHeadFloor: only the logger and networkId are read. With no
-// metricsTracker the bound falls back to defaultMaxRetryableBlockDistance.
+// newTipFloorTestNetwork builds the minimal Network applyDeliveredHeadFloor
+// needs. With no metricsTracker the bound is defaultMaxRetryableBlockDistance.
 func newTipFloorTestNetwork() *Network {
 	logger := zerolog.Nop()
-	return &Network{
-		logger:    &logger,
-		networkId: "evm:1234",
-	}
+	return &Network{logger: &logger}
 }
 
 func TestDeliveredHeadFloor_NoDeliveriesServesComputedHeadAsIs(t *testing.T) {
@@ -43,15 +39,13 @@ func TestDeliveredHeadFloor_SmallLagIsFlooredToDeliveredHead(t *testing.T) {
 func TestDeliveredHeadFloor_BoundIsMeasuredAgainstFreshestLiveHead(t *testing.T) {
 	n := newTipFloorTestNetwork()
 
-	// A stalled sibling drags the corroborated (second-highest) head far
-	// below the freshest upstream. The delivered head came from that
-	// freshest upstream, so it must still floor the tip.
+	// A stalled upstream drags the corroborated head far below the freshest
+	// one, which the delivered head came from.
 	n.NoteObservedLatestBlock(nil, 9001)
 	assert.Equal(t, int64(9001), n.applyDeliveredHeadFloor(1000, 9000),
 		"a floor within reach of the freshest live head is honoured")
 
-	// A stale or poisoned floor that no live upstream comes close to must
-	// not pin the tip, even with a stalled sibling.
+	// A floor no live upstream comes close to is ignored.
 	n.deliveredLatestBlock.Store(9000 + defaultMaxRetryableBlockDistance + 1)
 	assert.Equal(t, int64(1000), n.applyDeliveredHeadFloor(1000, 9000))
 
@@ -63,8 +57,7 @@ func TestDeliveredHeadFloor_BoundIsMeasuredAgainstFreshestLiveHead(t *testing.T)
 func TestDeliveredHeadFloor_NoLiveHeadAdoptsDeliveredHead(t *testing.T) {
 	n := newTipFloorTestNetwork()
 
-	// Pollers cold (no head yet): a head already streamed to a subscriber is
-	// the best available answer, regardless of distance.
+	// With no known head, the delivered head is used regardless of distance.
 	n.NoteObservedLatestBlock(nil, 5_000_000)
 	assert.Equal(t, int64(5_000_000), n.applyDeliveredHeadFloor(0, 0))
 }

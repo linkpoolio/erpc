@@ -461,18 +461,9 @@ func (c *counterInt64) TryUpdateIfStale(ctx context.Context, staleness time.Dura
 	span.SetAttributes(attribute.Bool("foreground_remote_io_disabled", true))
 
 	// Execute the refresh function (e.g., RPC call to get latest block) in background.
-	//
-	// Timeout source: fallbackTimeout is the "remote storage op" default (Redis
-	// get/set, ~3s) and is intentionally tight. But executeNewValueFn often does
-	// work that legitimately takes longer (e.g., polling latest block on a slow
-	// chain). If the caller passes a context with an explicit deadline (the state
-	// poller sets one derived from lockTtl+operationBuffer), honor it when it's
-	// longer than fallbackTimeout — otherwise we silently cap slow-chain polls at
-	// 3s and the shared state never updates, producing a flood of
-	// "context deadline exceeded" logs with no way to raise the bound.
-	//
-	// Note: parent remains c.registry.appCtx (not ctx) so the background fetch
-	// survives foreground cancellation — only the timeout is read from ctx.
+	// fallbackTimeout is sized for remote storage ops; honor a longer caller
+	// deadline since the refresh itself can legitimately take longer. The
+	// parent stays appCtx so the fetch survives foreground cancellation.
 	fnTimeout := c.registry.fallbackTimeout
 	if deadline, ok := ctx.Deadline(); ok {
 		if remaining := time.Until(deadline); remaining > fnTimeout {

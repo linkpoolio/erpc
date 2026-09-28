@@ -346,11 +346,8 @@ func TestExtractJsonRpcError_MempoolPolicyRejections(t *testing.T) {
 	}
 }
 
-// TestExtractJsonRpcError_ReplayAttackIdempotency verifies that the observed
-// TX_REPLAY_ATTACK rejection of an already-accepted transaction is normalized
-// to ErrEndpointNonceException with reason "already known", so
-// eth_sendRawTransaction idempotency handling can convert it to success, and
-// that other "replay attack" wording (e.g. a replay-protection rejection) is not.
+// A TX_REPLAY_ATTACK rejection of an already-accepted transaction normalizes
+// to an "already known" nonce exception; other "replay attack" wording does not.
 func TestExtractJsonRpcError_ReplayAttackIdempotency(t *testing.T) {
 	t.Parallel()
 

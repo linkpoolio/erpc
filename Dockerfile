@@ -35,11 +35,8 @@ RUN go build -v -ldflags="$LDFLAGS" -a -installsuffix cgo -o erpc-server ./cmd/e
 
 # Global typescript related image
 FROM node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 AS ts-core
-# Install exactly the pnpm version package.json pins in `packageManager`.
-# An unpinned `npm install -g pnpm` picks the newest major, which then tries
-# to self-switch to the pinned version through @pnpm/exe — and that package
-# ships no musl binary, so `pnpm install` fails on alpine with
-# ERR_PNPM_PNPM_ENGINE_NO_NATIVE_BINARY whenever this layer is not cached.
+# Install the pnpm version pinned by `packageManager`; a newer major tries to
+# self-switch through a binary that is not built for musl.
 COPY package.json /tmp/pnpm-pin/package.json
 RUN npm install -g "pnpm@$(node -p "require('/tmp/pnpm-pin/package.json').packageManager.split('@').pop()")" \
     && rm -rf /tmp/pnpm-pin

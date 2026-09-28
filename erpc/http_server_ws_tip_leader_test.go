@@ -22,6 +22,63 @@ func init() {
 	util.ConfigureTestLogger()
 }
 
+// setupTipLeaderServer starts a server with two upstreams, rpc1 ordered ahead
+// of rpc2, and returns the network and rpc2.
+func setupTipLeaderServer(t *testing.T, evmCfg *common.EvmNetworkConfig, maxAttempts int) (
+	sendRequest func(body string, headers map[string]string, queryParams map[string]string) (int, map[string]string, string),
+	shutdown func(),
+	nw *Network,
+	leader *upstream.Upstream,
+) {
+	t.Helper()
+	upstreams := make([]*common.UpstreamConfig, 0, 2)
+	for _, id := range []string{"rpc1", "rpc2"} {
+		upstreams = append(upstreams, &common.UpstreamConfig{
+			Id:       id,
+			Endpoint: "http://" + id + ".localhost",
+			Type:     common.UpstreamTypeEvm,
+			Evm: &common.EvmUpstreamConfig{
+				ChainId:             123,
+				StatePollerInterval: common.Duration(10 * time.Second),
+			},
+		})
+	}
+	cfg := &common.Config{
+		Server: &common.ServerConfig{
+			MaxTimeout: common.Duration(100 * time.Second).Ptr(),
+		},
+		Projects: []*common.ProjectConfig{{
+			Id: "test_project",
+			Networks: []*common.NetworkConfig{{
+				Architecture: "evm",
+				Evm:          evmCfg,
+				Failsafe: []*common.FailsafeConfig{{
+					Retry: &common.RetryPolicyConfig{MaxAttempts: maxAttempts},
+				}},
+			}},
+			Upstreams: upstreams,
+		}},
+	}
+
+	sendRequest, _, _, shutdown, erpcInstance := createServerTestFixtures(cfg, t)
+	prj, err := erpcInstance.GetProject("test_project")
+	require.NoError(t, err)
+	policy.OverrideAllForTest(prj.policyEngine)
+	policy.OverrideOrderForTest(prj.policyEngine, "evm:123", "rpc1", "rpc2")
+
+	time.Sleep(500 * time.Millisecond)
+
+	nw, err = prj.GetNetwork(context.Background(), "evm:123")
+	require.NoError(t, err)
+	for _, u := range nw.upstreamsRegistry.GetNetworkUpstreams(context.Background(), "evm:123") {
+		if u.Id() == "rpc2" {
+			leader = u
+		}
+	}
+	require.NotNil(t, leader)
+	return sendRequest, shutdown, nw, leader
+}
+
 // EnforceHighestBlock's tip re-fetch must reach the upstream whose poller has
 // the tip, not settle for the lagging sibling that answered "latest" first.
 func TestHttpServer_GetBlockByNumberLatest_RefetchReachesTipUpstream(t *testing.T) {
@@ -47,75 +104,15 @@ func TestHttpServer_GetBlockByNumberLatest_RefetchReachesTipUpstream(t *testing.
 		Reply(200).
 		JSON([]byte(`{"result":{"number":"0x22228889","hash":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","parentHash":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","timestamp":"0x6702a8f1"}}`))
 
-	cfg := &common.Config{
-		Server: &common.ServerConfig{
-			MaxTimeout: common.Duration(100 * time.Second).Ptr(),
+	// rpc1 lags, so the initial "latest" comes from it and triggers the
+	// EnforceHighestBlock re-fetch.
+	sendRequest, shutdown, nw, leader := setupTipLeaderServer(t, &common.EvmNetworkConfig{
+		ChainId: 123,
+		Integrity: &common.EvmIntegrityConfig{
+			EnforceHighestBlock: util.BoolPtr(true),
 		},
-		Projects: []*common.ProjectConfig{
-			{
-				Id: "test_project",
-				Networks: []*common.NetworkConfig{
-					{
-						Architecture: "evm",
-						Evm: &common.EvmNetworkConfig{
-							ChainId: 123,
-							Integrity: &common.EvmIntegrityConfig{
-								EnforceHighestBlock: util.BoolPtr(true),
-							},
-						},
-						Failsafe: []*common.FailsafeConfig{
-							{
-								Retry: &common.RetryPolicyConfig{MaxAttempts: 3},
-							},
-						},
-					},
-				},
-				Upstreams: []*common.UpstreamConfig{
-					{
-						Id:       "rpc1",
-						Endpoint: "http://rpc1.localhost",
-						Type:     common.UpstreamTypeEvm,
-						Evm: &common.EvmUpstreamConfig{
-							ChainId:             123,
-							StatePollerInterval: common.Duration(10 * time.Second),
-						},
-					},
-					{
-						Id:       "rpc2",
-						Endpoint: "http://rpc2.localhost",
-						Type:     common.UpstreamTypeEvm,
-						Evm: &common.EvmUpstreamConfig{
-							ChainId:             123,
-							StatePollerInterval: common.Duration(10 * time.Second),
-						},
-					},
-				},
-			},
-		},
-	}
-
-	sendRequest, _, _, shutdown, erpcInstance := createServerTestFixtures(cfg, t)
+	}, 3)
 	defer shutdown()
-
-	prj, err := erpcInstance.GetProject("test_project")
-	require.NoError(t, err)
-	policy.OverrideAllForTest(prj.policyEngine)
-	// Prefer lagging rpc1 for the initial "latest" so EnforceHighestBlock re-fetch runs.
-	policy.OverrideOrderForTest(prj.policyEngine, "evm:123", "rpc1", "rpc2")
-
-	time.Sleep(500 * time.Millisecond)
-
-	nw, err := prj.GetNetwork(context.Background(), "evm:123")
-	require.NoError(t, err)
-
-	var leader *upstream.Upstream
-	for _, u := range nw.upstreamsRegistry.GetNetworkUpstreams(context.Background(), "evm:123") {
-		if u.Id() == "rpc2" {
-			leader = u
-			break
-		}
-	}
-	require.NotNil(t, leader)
 
 	// Mirror WS ingest: the tip-source poller and the delivered-head floor
 	// advance before any client sees the head.
@@ -192,71 +189,8 @@ func TestHttpServer_GetBlockByNumber_NearTipPrefersTipUpstream(t *testing.T) {
 		Reply(200).
 		JSON([]byte(`{"result":{"number":"0x33338889","hash":"0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","parentHash":"0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","timestamp":"0x6702a8f1"}}`))
 
-	cfg := &common.Config{
-		Server: &common.ServerConfig{
-			MaxTimeout: common.Duration(100 * time.Second).Ptr(),
-		},
-		Projects: []*common.ProjectConfig{
-			{
-				Id: "test_project",
-				Networks: []*common.NetworkConfig{
-					{
-						Architecture: "evm",
-						Evm: &common.EvmNetworkConfig{
-							ChainId: 123,
-						},
-						Failsafe: []*common.FailsafeConfig{
-							{
-								Retry: &common.RetryPolicyConfig{MaxAttempts: 2},
-							},
-						},
-					},
-				},
-				Upstreams: []*common.UpstreamConfig{
-					{
-						Id:       "rpc1",
-						Endpoint: "http://rpc1.localhost",
-						Type:     common.UpstreamTypeEvm,
-						Evm: &common.EvmUpstreamConfig{
-							ChainId:             123,
-							StatePollerInterval: common.Duration(10 * time.Second),
-						},
-					},
-					{
-						Id:       "rpc2",
-						Endpoint: "http://rpc2.localhost",
-						Type:     common.UpstreamTypeEvm,
-						Evm: &common.EvmUpstreamConfig{
-							ChainId:             123,
-							StatePollerInterval: common.Duration(10 * time.Second),
-						},
-					},
-				},
-			},
-		},
-	}
-
-	sendRequest, _, _, shutdown, erpcInstance := createServerTestFixtures(cfg, t)
+	sendRequest, shutdown, nw, leader := setupTipLeaderServer(t, &common.EvmNetworkConfig{ChainId: 123}, 2)
 	defer shutdown()
-
-	prj, err := erpcInstance.GetProject("test_project")
-	require.NoError(t, err)
-	policy.OverrideAllForTest(prj.policyEngine)
-	policy.OverrideOrderForTest(prj.policyEngine, "evm:123", "rpc1", "rpc2")
-
-	time.Sleep(500 * time.Millisecond)
-
-	nw, err := prj.GetNetwork(context.Background(), "evm:123")
-	require.NoError(t, err)
-
-	var leader *upstream.Upstream
-	for _, u := range nw.upstreamsRegistry.GetNetworkUpstreams(context.Background(), "evm:123") {
-		if u.Id() == "rpc2" {
-			leader = u
-			break
-		}
-	}
-	require.NotNil(t, leader)
 	leader.EvmStatePoller().SuggestLatestBlock(tip)
 	require.Equal(t, "rpc2", nw.EvmLeaderUpstream(context.Background()).Id())
 

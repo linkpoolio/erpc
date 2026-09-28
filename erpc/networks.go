@@ -52,19 +52,12 @@ type Network struct {
 	initializer         *util.Initializer
 	architectureHandler common.ArchitectureHandler
 
-	// latestBlockShared is the cross-instance DELIVERED-HEAD floor for the
-	// network's "latest" tag: the highest head any instance has already pushed
-	// to a WebSocket subscriber (NoteObservedLatestBlock). It is fed by
-	// nothing else — the computed head itself is never remembered, so the
-	// served tip keeps main's fail-open / regression semantics — and reads
-	// are BOUNDED (applyDeliveredHeadFloor): a value no live upstream comes
-	// close to is ignored rather than trusted. Nil in tests or when shared
+	// latestBlockShared is the highest head any instance has delivered to a
+	// WebSocket subscriber (see applyDeliveredHeadFloor). Nil when shared
 	// state is not configured.
 	latestBlockShared data.CounterInt64SharedVariable
-
-	// deliveredLatestBlock is the process-local counterpart of
-	// latestBlockShared: the highest head this instance has delivered on a
-	// WebSocket subscription.
+	// deliveredLatestBlock is the highest head this instance has delivered to
+	// a WebSocket subscriber.
 	deliveredLatestBlock atomic.Int64
 
 	// servedLatest / servedFinalized are STRICT-MONOTONIC at the network level:
@@ -95,20 +88,9 @@ type Network struct {
 	servedTipBlockTimeOverride float64
 }
 
-// NoteObservedLatestBlock records that this Network has observed head
-// blockNumber and is about to deliver it to clients via WebSocket newHeads
-// fan-out. It advances the cross-instance latest floor and the process-local
-// high-water mark consulted by EvmHighestLatestBlockNumber.
-//
-// Callers MUST invoke this before delivering the corresponding newHeads
-// notification to any client. Otherwise a concurrent HTTP
-// eth_getBlockByNumber("latest") / eth_blockNumber can race and return a
-// lower tip than a head already (or about to be) served on the subscription,
-// which strict clients treat as an inconsistency.
-//
-// Only the local update is synchronous: the shared floor is pushed to remote
-// in the background when this call advanced it, and sibling instances pick
-// it up through the shared counter's sync.
+// NoteObservedLatestBlock records a head about to be delivered on a WebSocket
+// newHeads subscription, so "latest" over HTTP never trails it. Callers must
+// invoke it before delivering the notification.
 func (n *Network) NoteObservedLatestBlock(ctx context.Context, blockNumber int64) {
 	if n == nil || blockNumber <= 0 {
 		return
@@ -849,7 +831,7 @@ func (n *Network) EvmHighestLatestBlockNumber(ctx context.Context) int64 {
 	if !n.servedTipEnabledFor("latest") {
 		// tipCandidateUpstreams already scopes to the request's selector (if
 		// any), so the head is within-subset. The delivered-head floor is
-		// network-wide, so it only applies to unscoped requests.
+		// network-wide, so it applies to unscoped requests only.
 		ref := n.evmHeadReference(ctx, false)
 		if requestSelector(ctx) != "" {
 			return ref.Corroborated
@@ -869,9 +851,8 @@ func (n *Network) EvmHighestLatestBlockNumber(ctx context.Context) int64 {
 	pick := n.servedTip(ctx, span, false, "latest", &n.servedLatestAnchor, "")
 	floored := n.applyDeliveredHeadFloor(pick, n.evmHeadReference(ctx, false).Max)
 	if floored > pick {
-		// The floor may lift past the majority, never past a guarantee: a
-		// guaranteed subset that cannot serve the delivered head still bounds
-		// the advertised tip (servedTip already clamped pick to it).
+		// The floor may lift past the majority but never past a guarantee
+		// (servedTip already clamped pick to it).
 		if g := n.guaranteedFloor(ctx, false); g > 0 && g < floored {
 			floored = max(pick, g)
 		}
@@ -1573,57 +1554,33 @@ func (n *Network) EvmHighestFinalizedBlockNumber(ctx context.Context) int64 {
 	return n.servedTip(ctx, span, true, "finalized", &n.servedFinalizedAnchor, "")
 }
 
-// applyDeliveredHeadFloor reconciles the computed network-wide "latest" head
-// with the delivered-head floor: the highest head this instance (local) or
-// any instance (shared) has already pushed to a WebSocket subscriber via
-// NoteObservedLatestBlock. Selector-scoped picks never pass through here — a
-// request pinned to a sub-group is answered from that group's own view.
+// applyDeliveredHeadFloor lifts the computed network-wide "latest" head to the
+// highest head already delivered to a WebSocket subscriber by this or any
+// instance, so a client never sees "latest" regress below a streamed head.
+// Only delivered heads feed the floor; remembering the computed head would
+// turn the served tip into a persisted clamp.
 //
-// Why a floor exists: heads reach clients through more than one path. A
-// subscriber may already have received newHeads for block N while the head
-// computed from upstream pollers still reads N-1, and a client that sees
-// "latest" regress below a head it was just streamed treats eRPC as
-// inconsistent. The same applies across instances behind a load balancer.
-//
-// Why ONLY delivered heads feed it: remembering the computed head itself
-// would turn the served tip into a persisted clamp, which is exactly the
-// wedge the served-tip regression guard exists to avoid (and it would defeat
-// its fail-open and small-reorg pass-through). With no subscriptions the floor
-// is zero and the pick is served exactly as computed.
-//
-// Why the floor is BOUNDED: a legitimate delivered head always originated
-// from some live upstream's own head (SuggestLatestBlock runs before
-// NoteObservedLatestBlock), so it is honoured only while it sits within
-// maxRetryableBlockDistance of the FRESHEST live head (liveMax), or when no
-// head could be observed at all. A value no live upstream comes close to — a
-// stale or poisoned entry in shared state — is ignored; being static while
-// the chain advances, it heals itself within that many blocks. The
-// corroborated head itself may legitimately trail the floor by more (a
-// stalled sibling drags the second-highest head down), which is the case the
-// floor exists for.
-func (n *Network) applyDeliveredHeadFloor(computed int64, liveMax int64) int64 {
+// A delivered head always came from some live upstream, so the floor is
+// honoured only within maxRetryableBlockDistance of the freshest live head
+// (liveMax), or when no head is known at all. A stale shared value is ignored
+// and ages out as the chain advances.
+func (n *Network) applyDeliveredHeadFloor(computed, liveMax int64) int64 {
 	floor := n.deliveredLatestBlock.Load()
 	if n.latestBlockShared != nil {
-		if sv := n.latestBlockShared.GetValue(); sv > floor {
-			floor = sv
-		}
+		floor = max(floor, n.latestBlockShared.GetValue())
 	}
 	if floor <= computed {
 		return computed
 	}
-	ceiling := liveMax
-	if computed > ceiling {
-		ceiling = computed
-	}
+	ceiling := max(liveMax, computed)
 	if ceiling <= 0 || floor-ceiling <= n.maxRetryableBlockDistance() {
 		return floor
 	}
 	n.logger.Debug().
-		Str("networkId", n.networkId).
 		Int64("computed", computed).
 		Int64("liveMax", liveMax).
 		Int64("deliveredFloor", floor).
-		Msg("delivered-head floor is too far ahead of every live head; ignoring it")
+		Msg("ignoring delivered-head floor too far ahead of every live head")
 	return computed
 }
 
@@ -2084,9 +2041,8 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 		return nil, err
 	}
 
-	// For a specific block, try upstreams whose poller already has it first
-	// (e.g. one a WebSocket head just advanced) rather than a sibling that has
-	// not polled it yet. Ordering hints only: every upstream stays eligible.
+	// For a specific block, try upstreams whose poller already has it first.
+	// Ordering hints only: every upstream stays eligible.
 	if n.Architecture() == common.ArchitectureEvm {
 		if bn := requestBlockNumber(ctx, req); bn > 0 {
 			upsList = partitionUpstreamsByLatestBlock(upsList, bn)
@@ -2094,11 +2050,8 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 		}
 	}
 
-	// Failover tiering: when enabled, order default-group upstreams ahead of
-	// fallback-group ones while preserving score order within each tier. The
-	// network request loop then naturally tries defaults first and only
-	// advances to fallbacks once every default has returned a retryable
-	// error within this request.
+	// Failover tiering: try default-tier upstreams before fallback-tier ones,
+	// keeping score order within each tier.
 	if n.cfg.Failover.Enabled() {
 		upsList = tierUpstreamsByGroup(upsList)
 	}
@@ -2331,12 +2284,12 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 			maxLoopIterations = 1
 		}
 		attempted := make(map[string]struct{}, maxLoopIterations)
-		// The fallback escape below swaps in a pick over its own local list,
-		// leaving the request's routed list untouched for later retries.
+		// The fallback escape below swaps in its own picker, leaving the
+		// request's routed list untouched for later retries.
 		nextUpstream := effectiveReq.NextUpstream
 		// An empty result is a miss (rather than a legitimate answer, like a
-		// pending tx's null receipt) only for a concrete block the network is
-		// confident about.
+		// pending tx's null receipt) only for a concrete block the network
+		// is confident about.
 		emptyIsMiss := func(ctx context.Context) bool {
 			return requestBlockNumber(ctx, effectiveReq) > 0 && !evm.EmptyResultBeyondConfidence(ctx, effectiveReq)
 		}
@@ -2403,9 +2356,8 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 				// Pre-forward: block availability gating → skip to next upstream
 				if skipErr, isRetryable := n.checkUpstreamBlockAvailability(loopCtx, u, effectiveReq, method); skipErr != nil {
 					n.handleBlockSkip(loopCtx, loopSpan, &ulg, u, effectiveReq, method, skipErr, isRetryable)
-					// Seen by the fallback escape below: "non-retryable" means
-					// "don't retry this upstream", not "don't try others". A
-					// consensus slot keeps reporting a skip as no attempt.
+					// Lets the fallback escape below see the skip; a consensus
+					// slot keeps reporting it as no attempt.
 					if !oneUpstreamOnly {
 						lastErr = skipErr
 					}
@@ -2527,12 +2479,10 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 				return nil, cause
 			}
 
-			// Per-request fallback escape: once the routed upstreams are
-			// exhausted without a usable result, sweep the fallback tier
-			// (bootstrapped, not down, method-allowed) not yet tried here, at
-			// most once per request. An error every upstream would repeat
-			// (non-retryable toward the network) does not escalate, and
-			// consensus keeps its fixed participant set.
+			// Fallback escape: once the routed upstreams are exhausted without
+			// a usable result, sweep the untried fallback tier once per
+			// request. Errors non-retryable toward the network do not
+			// escalate, and consensus keeps its fixed participant set.
 			if (bestResp == nil || (bestResp.IsResultEmptyish() && emptyIsMiss(execSpanCtx))) &&
 				lastErr != nil && common.IsRetryableTowardNetwork(lastErr) &&
 				n.cfg.Failover.Enabled() && !failsafeExecutor.HasConsensus() {
@@ -2564,22 +2514,19 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 					telemetry.MetricNetworkFallbackEscapeTotal.WithLabelValues(
 						n.projectId, n.Label(), method,
 					).Inc()
-					lg.Debug().
-						Int("fallbacks", maxLoopIterations).
-						Msg("activated per-request fallback escape after primary set exhausted")
+					lg.Debug().Int("fallbacks", maxLoopIterations).Msg("escalating to fallback upstreams")
 
 					continue escalationLoop
 				}
 			}
 
-			// No further escalation possible; exit the outer loop.
 			break escalationLoop
 		}
 
-		// All upstreams (including any escaped-to fallbacks) tried. Return
-		// the best result for failsafe to evaluate delays and retries.
-		// Prefer a valid response over an error so the delay function can
-		// detect empty results and apply emptyResultDelay.
+		// All upstreams tried. Return the best result for the retry/hedge
+		// wrapper to evaluate. Prefer a valid response over an error so
+		// the delay function can detect empty results and apply
+		// emptyResultDelay.
 		if bestResp != nil {
 			st := effectiveReq.ExecState()
 			st.MarkUpstreamAttemptWon(bestResp.UpstreamId())
@@ -3677,60 +3624,41 @@ func (n *Network) acquireRateLimitPermit(ctx context.Context, req *common.Normal
 	return nil
 }
 
-// tierUpstreamsByGroup returns a copy of ups with primary-tier upstreams
-// (those NOT tagged `tier:fallback`) ordered before fallback-tier upstreams.
-// Within each tier, input order is preserved (the caller's score-based
-// sort). If the input contains no fallback-tier upstreams, the original
-// slice is returned unchanged.
+// tierUpstreamsByGroup moves fallback-tier upstreams behind the rest,
+// preserving order within each tier.
 func tierUpstreamsByGroup(ups []common.Upstream) []common.Upstream {
-	hasFallback := false
-	for _, u := range ups {
-		if u.Config() != nil && u.Config().HasTag(common.TagTierFallback) {
-			hasFallback = true
-			break
-		}
-	}
-	if !hasFallback {
-		return ups
-	}
-	tiered := make([]common.Upstream, 0, len(ups))
-	for _, u := range ups {
-		if u.Config() == nil || !u.Config().HasTag(common.TagTierFallback) {
-			tiered = append(tiered, u)
-		}
-	}
-	for _, u := range ups {
-		if u.Config() != nil && u.Config().HasTag(common.TagTierFallback) {
-			tiered = append(tiered, u)
-		}
-	}
-	return tiered
+	return stablePartition(ups, func(u common.Upstream) bool {
+		return u.Config() != nil && u.Config().HasTag(common.TagTierFallback)
+	})
 }
 
-// partitionUpstreamsByLatestBlock stable-partitions ups so that upstreams
-// whose poller has a known head below bn move behind the rest; order within
-// each partition is kept, so it composes with the tier and score orderings.
-// An upstream with no known head (no poller yet) keeps its place: that is no
-// evidence it lacks the block.
+// partitionUpstreamsByLatestBlock moves upstreams whose polled head is known
+// to be below bn behind the rest, preserving order within each group. An
+// upstream with no known head keeps its place.
 func partitionUpstreamsByLatestBlock(ups []common.Upstream, bn int64) []common.Upstream {
 	if bn <= 0 || len(ups) < 2 {
 		return ups
 	}
-	behind := func(u common.Upstream) bool {
+	return stablePartition(ups, func(u common.Upstream) bool {
 		lb := upstreamLatestBlock(u)
 		return lb > 0 && lb < bn
-	}
-	if !slices.ContainsFunc(ups, behind) {
+	})
+}
+
+// stablePartition returns ups with the elements matching last moved to the
+// end, preserving relative order; ups itself when none match.
+func stablePartition(ups []common.Upstream, last func(common.Upstream) bool) []common.Upstream {
+	if !slices.ContainsFunc(ups, last) {
 		return ups
 	}
 	out := make([]common.Upstream, 0, len(ups))
 	for _, u := range ups {
-		if !behind(u) {
+		if !last(u) {
 			out = append(out, u)
 		}
 	}
 	for _, u := range ups {
-		if behind(u) {
+		if last(u) {
 			out = append(out, u)
 		}
 	}
@@ -3738,10 +3666,8 @@ func partitionUpstreamsByLatestBlock(ups []common.Upstream, bn int64) []common.U
 }
 
 // preferTipLeaderForNearTipGetBlock moves the upstream whose head is strictly
-// ahead of every other candidate to the front when the request is
-// eth_getBlockByNumber for that head or the next block (the sibling import
-// race). On a tie the selection policy's order stands. It is an ordering
-// hint only: every upstream stays eligible.
+// ahead of every other to the front for eth_getBlockByNumber of that head or
+// the next block, which its siblings may not have imported yet.
 func preferTipLeaderForNearTipGetBlock(ups []common.Upstream, method string, bn int64) []common.Upstream {
 	if method != "eth_getBlockByNumber" || len(ups) < 2 {
 		return ups
@@ -3774,10 +3700,8 @@ func upstreamLatestBlock(u common.Upstream) int64 {
 	return 0
 }
 
-// requestBlockNumber resolves the specific block number a request targets,
-// or 0 when the request has no block reference. Mirrors the extraction
-// path in checkUpstreamBlockAvailability so routing and gating see the
-// same value.
+// requestBlockNumber returns the block number a request targets, or 0 when
+// it has none, extracted the same way as checkUpstreamBlockAvailability.
 func requestBlockNumber(ctx context.Context, req *common.NormalizedRequest) int64 {
 	if req == nil {
 		return 0

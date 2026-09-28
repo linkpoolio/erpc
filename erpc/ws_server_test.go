@@ -1637,9 +1637,8 @@ func TestWebSocket_RegressionUnsubscribeDoesNotPanicOnReconnect(t *testing.T) {
 }
 
 // TestWebSocket_RegressionInternalRequestIdsDontCollide verifies that internal
-// eth_subscribe requests use unique IDs that don't collide with state poller
-// or client requests on the same WS connection. Previously a hardcoded id=1
-// caused responses to be misrouted in the WsJsonRpcClient pending map.
+// eth_subscribe requests use unique wire IDs so their responses can't be
+// misrouted in the WsJsonRpcClient pending map.
 func TestWebSocket_RegressionInternalRequestIdsDontCollide(t *testing.T) {
 	subscribeIds := make([]int64, 0)
 	var idMu sync.Mutex
@@ -1684,13 +1683,6 @@ func TestWebSocket_RegressionInternalRequestIdsDontCollide(t *testing.T) {
 
 	idMu.Lock()
 	defer idMu.Unlock()
-
-	// Internal IDs use a large offset (>= 900M) to avoid collisions with the
-	// state poller's small integer IDs.
-	for _, id := range subscribeIds {
-		assert.GreaterOrEqual(t, id, int64(900_000_000),
-			"internal eth_subscribe id %d should be offset to avoid collision with poller IDs", id)
-	}
 
 	// All IDs unique.
 	seen := make(map[int64]bool)

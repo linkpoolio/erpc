@@ -26,33 +26,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// NOTE (post-refactor adaptation):
-//
-// This file originally drove a hand-written `selectionPolicy` JS function
-// that keyed off `u.config.group === 'fallback'`. After the policy refactor
-// the per-request `selectionPolicyEvaluator` / `AcquirePermit` API is gone;
-// selection is pre-computed per (network, method) tick by `internal/policy`'s
-// Engine, and fallback-tier upstreams are declared via the
-// `tier:fallback` tag (constant `common.TagTierFallback`).
-//
-// The production default policy (internal/policy/default_policy.js) already
-// expresses exactly the behaviour these tests need via
-//   .preferTag('!tier:fallback', { minHealthy: 1, fallback: 'tier:fallback' })
-// which cordons fallback-tagged upstreams out of the ordered list while at
-// least one primary survives the health excludes, and promotes the
-// fallbacks once every primary is excluded (e.g. by error-rate/lag).
-//
-// So instead of a custom JS function + `AcquirePermit` introspection, these
-// tests now build a real `*policy.Engine` running the default policy and
-// assert OBSERVABLE behaviour:
-//   - tracker metrics moved (errorRate) via GetUpstreamMethodMetrics(..., finality)
-//   - the policy's ordered list (PolicyOrderedUpstreams / the engine's
-//     LatestDecisionOutputForTest) cordons the primary / promotes the fallback
-//   - which upstream actually served the response
-//   - the erpc_network_fallback_escape_total metric count
-//
-// The ticker is frozen (EvalInterval=0); tests drive ticks via
-// `policy.TickForTest`.
+// The fixtures run a real policy.Engine with the built-in default selection
+// policy (fallback-tier upstreams cordoned while a primary is healthy), with a
+// frozen ticker driven by policy.TickForTest.
 
 // mockJsonRpcUpstream wires the standard state-poller mocks for one upstream
 // at a fixed block height. Used to build the multi-primary + multi-fallback
@@ -173,7 +149,7 @@ func failoverUpstreamConfigs() []*common.UpstreamConfig {
 }
 
 // buildFailoverNetwork wires a real Network + UpstreamsRegistry +
-// policy.Engine running the production default selection policy (which
+// policy.Engine running the built-in default selection policy (which
 // cordons `tier:fallback` upstreams while a primary survives). The engine
 // ticker is frozen; the caller drives ticks via policy.TickForTest.
 func buildFailoverNetwork(
@@ -489,13 +465,9 @@ func TestFailover_EscapeHatch(t *testing.T) {
 		// NON-retryable (ErrUpstreamRequestSkipped wrapping
 		// ErrUpstreamBlockUnavailable).
 		//
-		// This mirrors a production incident pattern: primaries fronting a
-		// stalled L2 node return latestBlock far behind the chain head,
-		// while a third-party fallback is at the real head and can
-		// serve. Before the fix, lastErr stayed nil for non-retryable skips,
-		// the escape gate's `lastErr != nil` check failed, and clients got
-		// ErrUpstreamsExhausted. After the fix, lastErr is set unconditionally
-		// in the gate-skip branch and the escape fires.
+		// Scenario: primaries fronting a stalled node report a head far
+		// behind the chain, while a fallback at the real head can serve. The
+		// non-retryable skips must still let the escape fire.
 		network, _, _ := setupFailoverFixture(t, ctx, failoverFixtureOpts{
 			primaryLatest:  "0x3e8",  // 1000
 			fallbackLatest: "0x2710", // 10000

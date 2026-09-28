@@ -60,24 +60,12 @@ type Upstream interface {
 	ShouldHandleMethod(method string) (bool, error)
 }
 
-// UniqueUpstreamKey returns a stable hash for an upstream, derived only from
-// config fields that don't change after the upstream is constructed.
-//
-// Why: this key is the dedup key for the per-upstream client cache
-// (clients/registry.go) and for shared-state counters (latestBlock,
-// finalizedBlock, earliestBlock by probe). If the key changes during the
-// upstream's lifetime, those caches are bypassed — every key flip leaks a
-// client (with its goroutines) and a counter-sync goroutine, and a fresh
-// pod's view of the latest/finalized block diverges from the cluster's.
-//
-// Two prior bugs we fix here:
-//  1. up.NetworkId() returns "n/a" before registration and the real id
-//     after. The endpoint already disambiguates which network the upstream
-//     points at, so NetworkId is redundant — and including it changed the
-//     key mid-lifetime.
-//  2. Iterating cfg.JsonRpc.Headers in map order is non-deterministic, so
-//     two calls in the same process could hash to different values for the
-//     same headers. Sort by key before hashing.
+// UniqueUpstreamKey returns a unique hash for an upstream.
+// It is used to identify the upstream uniquely in shared-state storage and the
+// client cache, so it must not change during the upstream's lifetime: it is
+// derived from static config only (NetworkId reads "n/a" until registration;
+// the endpoint already identifies the network) with headers hashed in sorted
+// order.
 func UniqueUpstreamKey(up Upstream) string {
 	sha := sha256.New()
 	cfg := up.Config()

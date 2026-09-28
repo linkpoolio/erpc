@@ -60,7 +60,7 @@ type EventIngress interface {
 	EnsureFilter(ctx context.Context, subType string, paramsHash string, params []interface{}) error
 	// RemoveFilter unsubscribes the given filter from the transport.
 	// A no-op if the filter was never subscribed. Called when the last
-	// client for a filter unsubscribes.
+	// client for a filter unsubscribes, and after a failed subscribe.
 	RemoveFilter(ctx context.Context, subType string, paramsHash string) error
 }
 

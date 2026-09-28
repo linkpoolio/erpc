@@ -65,10 +65,19 @@ type networkState struct {
 	// the dedup.
 	lastHead atomic.Pointer[headMarker]
 
-	// Per-filter dedup windows: filterHash -> *DedupWindow.
-	filterMu     sync.RWMutex
-	filterDedup  map[string]*DedupWindow
-	filterRefcnt map[string]int // clients × filterHash; triggers RemoveFilter at 0
+	filterMu sync.RWMutex
+	filters  map[string]*filterState // paramsHash -> state
+}
+
+// filterState is one filter subscription shared by every client with the
+// same params.
+type filterState struct {
+	// mu is held across this filter's ingress calls so a subscribe and the
+	// last client's teardown never interleave.
+	mu         sync.Mutex
+	subscribed bool // guarded by mu
+	refs       int  // guarded by networkState.filterMu
+	dedup      *DedupWindow
 }
 
 // New returns an empty Indexer. Networks must be registered via
@@ -91,10 +100,9 @@ func (i *Indexer) RegisterNetwork(nw NetworkHandle) *networkState {
 		return ns.(*networkState)
 	}
 	ns := &networkState{
-		handle:       nw,
-		ingresses:    make(map[string]EventIngress),
-		filterDedup:  make(map[string]*DedupWindow),
-		filterRefcnt: make(map[string]int),
+		handle:    nw,
+		ingresses: make(map[string]EventIngress),
+		filters:   make(map[string]*filterState),
 	}
 	actual, _ := i.networks.LoadOrStore(nw.Id(), ns)
 	return actual.(*networkState)
@@ -141,10 +149,8 @@ func (i *Indexer) RegisterNetworkSelector(networkId string, sel IngressSelector)
 
 // EnsureFilter subscribes a filter on this network's ingresses and tracks
 // a per-filter refcount so ReleaseFilter can decide when to tear it down
-// upstream. The selector's defaults are tried first; its fallbacks only when
-// every default failed. Ingresses the selector does not name are not used;
-// without a selector every ingress is a default. An error is returned when
-// no ingress subscribed, including when none was selected.
+// upstream. Concurrent callers for the same filter wait for the subscribe
+// in flight; if it failed they try again themselves.
 func (i *Indexer) EnsureFilter(ctx context.Context, networkId, subType string, params []interface{}) (paramsHash string, err error) {
 	nsRaw, ok := i.networks.Load(networkId)
 	if !ok {
@@ -154,16 +160,40 @@ func (i *Indexer) EnsureFilter(ctx context.Context, networkId, subType string, p
 	paramsHash = BuildParamsKey(params)
 
 	ns.filterMu.Lock()
-	if _, ok := ns.filterDedup[paramsHash]; !ok {
-		ns.filterDedup[paramsHash] = NewDedupWindow(i.opts.DedupWindowSize)
+	f := ns.filters[paramsHash]
+	if f == nil {
+		f = &filterState{dedup: NewDedupWindow(i.opts.DedupWindowSize)}
+		ns.filters[paramsHash] = f
 	}
-	ns.filterRefcnt[paramsHash]++
-	first := ns.filterRefcnt[paramsHash] == 1
+	f.refs++
 	ns.filterMu.Unlock()
 
-	if !first {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.subscribed {
 		return paramsHash, nil
 	}
+	if err := i.subscribe(ctx, ns, subType, paramsHash, params); err != nil {
+		// Ingresses may keep a filter whose subscribe failed (to retry on
+		// reconnect), so remove it everywhere.
+		i.removeFromIngresses(ctx, ns, subType, paramsHash)
+		ns.filterMu.Lock()
+		f.refs--
+		if f.refs == 0 {
+			delete(ns.filters, paramsHash)
+		}
+		ns.filterMu.Unlock()
+		return paramsHash, err
+	}
+	f.subscribed = true
+	return paramsHash, nil
+}
+
+// subscribe tries the selector's defaults, then its fallbacks only if every
+// default failed. It fails when no ingress subscribed, including when none
+// was selected.
+func (i *Indexer) subscribe(ctx context.Context, ns *networkState, subType, paramsHash string, params []interface{}) error {
+	networkId := ns.handle.Id()
 
 	// Snapshot the ingress set and selector under rlock, then do the
 	// potentially slow per-ingress RPC calls without holding any lock.
@@ -191,26 +221,13 @@ func (i *Indexer) EnsureFilter(ctx context.Context, networkId, subType string, p
 			subscribed = true
 		}
 		if subscribed {
-			return paramsHash, nil
+			return nil
 		}
 	}
-
-	// Every chosen ingress failed. Roll the refcount this caller added
-	// back so the next EnsureFilter attempt starts a fresh subscribe;
-	// only clean the dedup window when no concurrent subscriber is
-	// waiting on this filterHash.
-	ns.filterMu.Lock()
-	ns.filterRefcnt[paramsHash]--
-	if ns.filterRefcnt[paramsHash] <= 0 {
-		delete(ns.filterRefcnt, paramsHash)
-		delete(ns.filterDedup, paramsHash)
-	}
-	ns.filterMu.Unlock()
-
 	if len(errs) == 0 {
-		return paramsHash, fmt.Errorf("indexer: no ingress selected for %s filter on network %q", subType, networkId)
+		return fmt.Errorf("indexer: no ingress selected for %s filter on network %q", subType, networkId)
 	}
-	return paramsHash, errors.Join(errs...)
+	return errors.Join(errs...)
 }
 
 // partitionIngresses resolves the selector's tiers to registered ingresses,
@@ -245,8 +262,6 @@ func partitionIngresses(sel IngressSelector, ings map[string]EventIngress, netwo
 // ReleaseFilter decrements the refcount on the filter and, when it hits
 // zero, tears the subscription down on every registered ingress. Callers
 // supply paramsHash (returned by EnsureFilter) rather than params.
-// Ingresses that never received EnsureFilter for this paramsHash are
-// expected to no-op on RemoveFilter.
 func (i *Indexer) ReleaseFilter(ctx context.Context, networkId, subType, paramsHash string) {
 	nsRaw, ok := i.networks.Load(networkId)
 	if !ok {
@@ -255,17 +270,41 @@ func (i *Indexer) ReleaseFilter(ctx context.Context, networkId, subType, paramsH
 	ns := nsRaw.(*networkState)
 
 	ns.filterMu.Lock()
-	ns.filterRefcnt[paramsHash]--
-	remove := ns.filterRefcnt[paramsHash] <= 0
-	if remove {
-		delete(ns.filterRefcnt, paramsHash)
-		delete(ns.filterDedup, paramsHash)
-	}
-	ns.filterMu.Unlock()
-
-	if !remove {
+	f := ns.filters[paramsHash]
+	if f == nil || f.refs <= 0 {
+		ns.filterMu.Unlock()
 		return
 	}
+	f.refs--
+	last := f.refs == 0
+	ns.filterMu.Unlock()
+	if !last {
+		return
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ns.filterMu.Lock()
+	// While waiting for f.mu a new client may have joined, or an earlier
+	// release already tore the filter down.
+	keep := f.refs > 0 || !f.subscribed
+	ns.filterMu.Unlock()
+	if keep {
+		return
+	}
+	i.removeFromIngresses(ctx, ns, subType, paramsHash)
+	f.subscribed = false
+	ns.filterMu.Lock()
+	if f.refs == 0 {
+		delete(ns.filters, paramsHash)
+	}
+	ns.filterMu.Unlock()
+}
+
+// removeFromIngresses calls RemoveFilter on every registered ingress;
+// ingresses that never received EnsureFilter for paramsHash are expected
+// to no-op.
+func (i *Indexer) removeFromIngresses(ctx context.Context, ns *networkState, subType, paramsHash string) {
 	ns.ingressMu.RLock()
 	ings := make([]EventIngress, 0, len(ns.ingresses))
 	for _, ing := range ns.ingresses {
@@ -275,7 +314,7 @@ func (i *Indexer) ReleaseFilter(ctx context.Context, networkId, subType, paramsH
 
 	for _, ing := range ings {
 		if err := ing.RemoveFilter(ctx, subType, paramsHash); err != nil {
-			i.logger.Warn().Err(err).Str("ingress", ing.Name()).Str("networkId", networkId).
+			i.logger.Warn().Err(err).Str("ingress", ing.Name()).Str("networkId", ns.handle.Id()).
 				Str("subType", subType).Str("paramsHash", paramsHash).
 				Msg("ingress RemoveFilter failed")
 		}
@@ -341,9 +380,9 @@ func (i *Indexer) dedupe(ns *networkState, ev *StreamEvent, removed bool) bool {
 		}
 	case KindLog, KindPendingTx:
 		ns.filterMu.RLock()
-		win := ns.filterDedup[ev.FilterHash]
+		f := ns.filters[ev.FilterHash]
 		ns.filterMu.RUnlock()
-		if win == nil {
+		if f == nil {
 			// Filter not registered with this indexer instance (e.g. an
 			// ingress delivered an event for a filter we never EnsureFilter'd).
 			// Allow through — upstream subs we didn't request are rare.
@@ -354,7 +393,7 @@ func (i *Indexer) dedupe(ns *networkState, ev *StreamEvent, removed bool) bool {
 			// Couldn't extract a key; don't pretend we deduped.
 			return true
 		}
-		return win.Mark(key, removed)
+		return f.dedup.Mark(key, removed)
 	default:
 		return true
 	}

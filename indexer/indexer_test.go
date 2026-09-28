@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/rs/zerolog"
 )
@@ -70,6 +71,11 @@ type fakeIngress struct {
 	// ensureErr, when set, is returned from every EnsureFilter call.
 	errMu     sync.Mutex
 	ensureErr error
+	// active reports whether the ingress holds the filter. Like the WS
+	// adapter, a failed EnsureFilter still stores it.
+	active atomic.Bool
+	// hook, when set, runs at the start of every "ensure"/"remove" call.
+	hook func(op string)
 
 	startedFor NetworkHandle
 	sink       Sink
@@ -92,12 +98,20 @@ func (i *fakeIngress) getErr() error {
 	return i.ensureErr
 }
 func (i *fakeIngress) EnsureFilter(_ context.Context, _ string, paramsHash string, _ []interface{}) error {
+	if i.hook != nil {
+		i.hook("ensure")
+	}
 	i.ensureCalls.Add(1)
 	i.lastParamsHash.Store(paramsHash)
+	i.active.Store(true)
 	return i.getErr()
 }
 func (i *fakeIngress) RemoveFilter(_ context.Context, _, _ string) error {
+	if i.hook != nil {
+		i.hook("remove")
+	}
 	i.removeCalls.Add(1)
+	i.active.Store(false)
 	return nil
 }
 
@@ -344,6 +358,153 @@ func TestIndexer_Log_DedupIgnoresHexCase(t *testing.T) {
 	}
 	if string(eg.received[0].Payload) != upper {
 		t.Fatalf("payload must pass through verbatim, got %s", eg.received[0].Payload)
+	}
+}
+
+// A subscriber arriving while the last one's teardown is still talking to
+// the ingress must end up subscribed, not torn down by the late removal.
+func TestIndexer_Filter_EnsureDuringReleaseStaysSubscribed(t *testing.T) {
+	ctx := context.Background()
+	idx := newIndexer(t)
+	idx.RegisterNetwork(newFakeNetwork("evm:1"))
+	removing, unblock := make(chan struct{}), make(chan struct{})
+	ing := &fakeIngress{name: "a", hook: func(op string) {
+		if op == "remove" {
+			close(removing)
+			<-unblock
+		}
+	}}
+	if err := idx.AddIngress(ctx, "evm:1", ing); err != nil {
+		t.Fatal(err)
+	}
+	params := []interface{}{"logs"}
+	h, err := idx.EnsureFilter(ctx, "evm:1", "logs", params)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	released := make(chan struct{})
+	go func() {
+		idx.ReleaseFilter(ctx, "evm:1", "logs", h)
+		close(released)
+	}()
+	<-removing
+	ensured := make(chan error, 1)
+	go func() {
+		_, err := idx.EnsureFilter(ctx, "evm:1", "logs", params)
+		ensured <- err
+	}()
+	time.Sleep(20 * time.Millisecond) // let the new subscriber reach the indexer
+	close(unblock)
+	<-released
+	if err := <-ensured; err != nil {
+		t.Fatal(err)
+	}
+	if !ing.active.Load() {
+		t.Fatal("subscriber that arrived during teardown must end up subscribed")
+	}
+}
+
+// A subscriber that joins while the first subscribe is still in flight must
+// not be handed a subscription when that subscribe fails, and the failure
+// must not leave a refcount behind that makes later subscribers skip the
+// ingress.
+func TestIndexer_Filter_FailedEnsureIsNotShared(t *testing.T) {
+	ctx := context.Background()
+	idx := newIndexer(t)
+	idx.RegisterNetwork(newFakeNetwork("evm:1"))
+	ensuring, unblock := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	ing := &fakeIngress{name: "a", hook: func(op string) {
+		if op == "ensure" && calls.Add(1) == 1 {
+			close(ensuring)
+			<-unblock
+		}
+	}}
+	ing.setErr(errTest("down"))
+	if err := idx.AddIngress(ctx, "evm:1", ing); err != nil {
+		t.Fatal(err)
+	}
+	params := []interface{}{"logs"}
+
+	first, second := make(chan error, 1), make(chan error, 1)
+	go func() {
+		_, err := idx.EnsureFilter(ctx, "evm:1", "logs", params)
+		first <- err
+	}()
+	<-ensuring
+	go func() {
+		_, err := idx.EnsureFilter(ctx, "evm:1", "logs", params)
+		second <- err
+	}()
+	time.Sleep(20 * time.Millisecond) // let the second subscriber reach the indexer
+	close(unblock)
+	if <-first == nil {
+		t.Fatal("first subscribe must fail")
+	}
+	if <-second == nil {
+		t.Fatal("joining a failed subscribe must not return a silent subscription")
+	}
+
+	ing.setErr(nil)
+	before := ing.ensureCalls.Load()
+	if _, err := idx.EnsureFilter(ctx, "evm:1", "logs", params); err != nil {
+		t.Fatal(err)
+	}
+	if ing.ensureCalls.Load() != before+1 {
+		t.Fatal("after a failed subscribe the next subscriber must subscribe on the ingress")
+	}
+}
+
+func TestIndexer_Filter_ConcurrentEnsureReleaseConverges(t *testing.T) {
+	ctx := context.Background()
+	idx := newIndexer(t)
+	idx.RegisterNetwork(newFakeNetwork("evm:1"))
+	ing := &fakeIngress{name: "a"}
+	if err := idx.AddIngress(ctx, "evm:1", ing); err != nil {
+		t.Fatal(err)
+	}
+	params := []interface{}{"logs"}
+
+	var wg sync.WaitGroup
+	for n := 0; n < 50; n++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			h, err := idx.EnsureFilter(ctx, "evm:1", "logs", params)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			idx.ReleaseFilter(ctx, "evm:1", "logs", h)
+		}()
+	}
+	wg.Wait()
+	if ing.active.Load() {
+		t.Fatal("every client released; the filter must be torn down")
+	}
+	if _, err := idx.EnsureFilter(ctx, "evm:1", "logs", params); err != nil {
+		t.Fatal(err)
+	}
+	if !ing.active.Load() {
+		t.Fatal("a new client must subscribe the filter again")
+	}
+}
+
+// An ingress may keep a filter whose subscribe failed (to retry on
+// reconnect). A failed EnsureFilter must remove it again.
+func TestIndexer_Filter_FailedEnsureRemovesFromIngress(t *testing.T) {
+	idx := newIndexer(t)
+	a, b, _ := registerThreeIngresses(t, idx)
+	a.setErr(errTest("a"))
+	b.setErr(errTest("b"))
+	idx.RegisterNetworkSelector("evm:1", &fakeSelector{defaults: []string{"a"}, fallbacks: []string{"b"}})
+
+	if _, err := idx.EnsureFilter(context.Background(), "evm:1", "logs", []interface{}{"logs"}); err == nil {
+		t.Fatal("expected error")
+	}
+	if a.active.Load() || b.active.Load() {
+		t.Fatalf("failed subscribe left filters behind: a=%v b=%v", a.active.Load(), b.active.Load())
 	}
 }
 

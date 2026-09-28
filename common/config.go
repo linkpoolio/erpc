@@ -893,9 +893,8 @@ func (p *ProviderConfig) MarshalYAML() (interface{}, error) {
 
 // TagTierFallback marks an upstream as part of the fallback tier (via the
 // `tier:fallback` tag convention): used only when all non-fallback upstreams
-// are unavailable. Referenced by default selection policies and by
-// network-level block-number aggregation so that a more-advanced fallback
-// doesn't drag the shared counter ahead of what primaries can actually serve.
+// are unavailable. Referenced by the default selection policy and by
+// failover.onDefaultsExhausted.
 const TagTierFallback = "tier:fallback"
 
 // RateLimitCountMode selects the accounting unit an upstream's rate-limit
@@ -2621,8 +2620,8 @@ type EvmNetworkConfig struct {
 	// has no standardised meaning there — and on backends that prune
 	// historical data the subscription fails outright. Enabling this flag
 	// for such networks drops the field so the live stream succeeds;
-	// historical logs remain retrievable via eth_getLogs. Only the exact
-	// value "0x0" or "0" is stripped — non-zero fromBlocks pass through
+	// historical logs remain retrievable via eth_getLogs. Only a string
+	// fromBlock that parses to zero is stripped — other values pass through
 	// unchanged. DEFAULT: false.
 	StripSubscribeFromBlockZero *bool `yaml:"stripSubscribeFromBlockZero,omitempty" json:"stripSubscribeFromBlockZero,omitempty"`
 

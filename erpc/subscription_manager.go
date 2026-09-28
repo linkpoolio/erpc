@@ -2,10 +2,8 @@ package erpc
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -302,7 +300,7 @@ func (s *subIngressSelector) Select(_, _ string, _ []interface{}) (defaults, fal
 			continue
 		}
 		cfg := up.Config()
-		if cfg == nil || !isWsEndpoint(cfg.Endpoint) || up.IsDown(MethodEthSubscribe) {
+		if cfg == nil || !upstream.IsWsEndpoint(cfg.Endpoint) || up.IsDown(MethodEthSubscribe) {
 			continue
 		}
 		name := "ws:" + up.Id()
@@ -313,14 +311,6 @@ func (s *subIngressSelector) Select(_, _ string, _ []interface{}) (defaults, fal
 		defaults = append(defaults, name)
 	}
 	return defaults, fallbacks
-}
-
-func isWsEndpoint(endpoint string) bool {
-	parsed, err := url.Parse(endpoint)
-	if err != nil {
-		return false
-	}
-	return parsed.Scheme == "ws" || parsed.Scheme == "wss"
 }
 
 // resolveSubscription maps subType to its event kind and, for filter
@@ -435,7 +425,7 @@ func (h *networkHandle) Id() string { return h.nw.networkId }
 // jump is verified asynchronously first), a head from a tip candidate also
 // advances the network's delivered-head floor before clients see it; a
 // fallback-tier or policy-excluded upstream cannot lift "latest".
-func (h *networkHandle) SuggestLatestBlock(sourceId string, blockNumber int64, _ json.RawMessage) {
+func (h *networkHandle) SuggestLatestBlock(sourceId string, blockNumber int64) {
 	upstreamID, ok := strings.CutPrefix(sourceId, "ws:")
 	if !ok {
 		return

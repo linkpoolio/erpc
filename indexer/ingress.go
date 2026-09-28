@@ -1,9 +1,6 @@
 package indexer
 
-import (
-	"context"
-	"encoding/json"
-)
+import "context"
 
 // Sink receives the StreamEvents an ingress produces; the Indexer is the
 // Sink. Duplicates are expected and handled downstream.
@@ -17,7 +14,7 @@ type NetworkHandle interface {
 	// SuggestLatestBlock reports a head observed by source. It is called
 	// before dedup and fan-out, so every source's observation counts and
 	// the network tip moves before clients see the head.
-	SuggestLatestBlock(sourceId string, blockNumber int64, payload json.RawMessage)
+	SuggestLatestBlock(sourceId string, blockNumber int64)
 }
 
 // EventIngress turns a transport-specific subscription into StreamEvents

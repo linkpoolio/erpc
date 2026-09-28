@@ -29,7 +29,7 @@ func newFakeNetwork(id string) *fakeNetwork {
 }
 
 func (n *fakeNetwork) Id() string { return n.id }
-func (n *fakeNetwork) SuggestLatestBlock(sourceId string, block int64, _ json.RawMessage) {
+func (n *fakeNetwork) SuggestLatestBlock(sourceId string, block int64) {
 	n.mu.Lock()
 	n.suggestedBy[sourceId] = append(n.suggestedBy[sourceId], block)
 	n.mu.Unlock()

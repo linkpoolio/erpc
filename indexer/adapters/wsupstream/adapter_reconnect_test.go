@@ -26,8 +26,8 @@ import (
 
 type fakeNetworkHandle struct{}
 
-func (fakeNetworkHandle) Id() string                                        { return "evm:123" }
-func (fakeNetworkHandle) SuggestLatestBlock(string, int64, json.RawMessage) {}
+func (fakeNetworkHandle) Id() string                       { return "evm:123" }
+func (fakeNetworkHandle) SuggestLatestBlock(string, int64) {}
 
 type fakeSink struct {
 	events chan indexer.StreamEvent

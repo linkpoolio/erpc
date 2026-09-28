@@ -192,4 +192,3 @@ func TestGetFallbackEscapeUpstreams_NoFallbacksReturnsEmpty(t *testing.T) {
 	out := registry.GetFallbackEscapeUpstreams(ctx, "evm:123", "eth_call")
 	assert.Empty(t, out, "no fallback-group upstreams configured → empty slice")
 }
-

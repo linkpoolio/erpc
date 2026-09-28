@@ -1,6 +1,7 @@
 package erpc
 
 import (
+	"context"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -29,7 +30,7 @@ func TestDeliveredHeadFloor_SmallLagIsFlooredToDeliveredHead(t *testing.T) {
 
 	// A head already delivered on a subscription sits one block ahead of
 	// what the pollers corroborate.
-	n.NoteObservedLatestBlock(nil, 1001)
+	n.NoteObservedLatestBlock(context.Background(), 1001)
 	assert.Equal(t, int64(1001), n.applyDeliveredHeadFloor(1000, 1001),
 		"a computed head just below the delivered head must be floored")
 	assert.Equal(t, int64(1005), n.applyDeliveredHeadFloor(1005, 1005),
@@ -41,7 +42,7 @@ func TestDeliveredHeadFloor_BoundIsMeasuredAgainstFreshestLiveHead(t *testing.T)
 
 	// A stalled upstream drags the corroborated head far below the freshest
 	// one, which the delivered head came from.
-	n.NoteObservedLatestBlock(nil, 9001)
+	n.NoteObservedLatestBlock(context.Background(), 9001)
 	assert.Equal(t, int64(9001), n.applyDeliveredHeadFloor(1000, 9000),
 		"a floor within reach of the freshest live head is honoured")
 
@@ -58,14 +59,14 @@ func TestDeliveredHeadFloor_NoLiveHeadAdoptsDeliveredHead(t *testing.T) {
 	n := newTipFloorTestNetwork()
 
 	// With no known head, the delivered head is used regardless of distance.
-	n.NoteObservedLatestBlock(nil, 5_000_000)
+	n.NoteObservedLatestBlock(context.Background(), 5_000_000)
 	assert.Equal(t, int64(5_000_000), n.applyDeliveredHeadFloor(0, 0))
 }
 
 func TestNoteObservedLatestBlock_IsMonotonic(t *testing.T) {
 	n := newTipFloorTestNetwork()
-	n.NoteObservedLatestBlock(nil, 200)
-	n.NoteObservedLatestBlock(nil, 150)
-	n.NoteObservedLatestBlock(nil, 0)
+	n.NoteObservedLatestBlock(context.Background(), 200)
+	n.NoteObservedLatestBlock(context.Background(), 150)
+	n.NoteObservedLatestBlock(context.Background(), 0)
 	assert.Equal(t, int64(200), n.deliveredLatestBlock.Load())
 }

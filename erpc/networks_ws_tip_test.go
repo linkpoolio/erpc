@@ -113,8 +113,7 @@ func TestNetworkHandle_SuggestLatestBlock_AdvancesNetworkTipBeforeFanOut(t *test
 	require.Equal(t, int64(90677358), network.EvmHighestLatestBlockNumber(ctx))
 
 	handle := &networkHandle{nw: network}
-	wsHeader := []byte(`{"number":"0x56789cf","hash":"0xabc","parentHash":"0xdef"}`)
-	handle.SuggestLatestBlock("ws:rpc2", 90677359, wsHeader)
+	handle.SuggestLatestBlock("ws:rpc2", 90677359)
 
 	assert.Equal(t, int64(90677359), u.EvmStatePoller().LatestBlock(),
 		"per-upstream poller must advance")
@@ -146,15 +145,15 @@ func TestNetworkHandle_SuggestLatestBlock_OnlyTipCandidatesLiftLatest(t *testing
 	require.NotNil(t, fallback)
 
 	handle := &networkHandle{nw: network}
-	handle.SuggestLatestBlock("ws:fallback-1", 1010, nil)
-	handle.SuggestLatestBlock("ws:unknown", 1020, nil)
+	handle.SuggestLatestBlock("ws:fallback-1", 1010)
+	handle.SuggestLatestBlock("ws:unknown", 1020)
 
 	assert.Equal(t, int64(1010), fallback.EvmStatePoller().LatestBlock(),
 		"the fallback's own poller still advances")
 	assert.Equal(t, int64(1000), network.EvmHighestLatestBlockNumber(ctx),
 		"a cordoned or unknown source must not lift latest")
 
-	handle.SuggestLatestBlock("ws:primary-1", 1001, nil)
+	handle.SuggestLatestBlock("ws:primary-1", 1001)
 	assert.Equal(t, int64(1001), network.EvmHighestLatestBlockNumber(ctx),
 		"an eligible upstream's head floors latest")
 }

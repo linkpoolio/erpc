@@ -1234,3 +1234,29 @@ type testFatalError struct{ error }
 
 func (e *testFatalError) IsTaskFatal() bool { return true }
 func (e *testFatalError) Unwrap() error     { return e.error }
+
+// A reaped attempt whose Fn returns while the next attempt is starting must
+// never finish that next attempt.
+func TestBootstrapTask_SupersededAttemptCannotFinishNextAttempt(t *testing.T) {
+	for i := 0; i < 20000; i++ {
+		bt := NewBootstrapTask("t", nil)
+		bt.attempts.Store(1)
+		bt.state.Store(int32(TaskTimedOut)) // attempt 1 was reaped
+
+		var started bool
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, started = bt.startAttempt(TaskTimedOut)
+		}()
+		go func() {
+			defer wg.Done()
+			bt.finishAttempt(1, TaskFailed, errors.New("late"))
+		}()
+		wg.Wait()
+
+		require.True(t, started)
+		require.Equal(t, TaskRunning, TaskState(bt.state.Load()), "iteration %d", i)
+	}
+}

@@ -61,6 +61,16 @@ func TestDedupWindow_ZeroSizeUsesDefault(t *testing.T) {
 		t.Fatalf("size with 0 arg should default to %d, got %d", DefaultDedupWindowSize, w.size)
 	}
 }
+
+// An idle window must not pin capacity-sized storage: every active filter
+// holds one.
+func TestDedupWindow_EmptyWindowDoesNotPreallocate(t *testing.T) {
+	w := NewDedupWindow(DefaultDedupWindowSize)
+	if cap(w.order) != 0 {
+		t.Fatalf("empty window must not preallocate order, cap=%d", cap(w.order))
+	}
+}
+
 func TestDedupKeyForFilter_Logs(t *testing.T) {
 	payload := json.RawMessage(`{"blockHash":"0xabc","transactionHash":"0xdef","logIndex":"0x1","removed":false}`)
 	got := DedupKeyForFilter(SubTypeLogs, payload)

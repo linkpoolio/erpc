@@ -57,7 +57,8 @@ func DedupKeyForFilter(subType string, result json.RawMessage) string {
 // (the log's removed flag; always false for kinds without one). Keys added
 // past the window's capacity evict the oldest entries. It is safe for
 // concurrent use; callers typically hold one per (network, subType,
-// paramsHash) fan-out group.
+// paramsHash) fan-out group. Storage grows with use rather than being
+// preallocated to capacity: most filters see far fewer keys than the cap.
 type DedupWindow struct {
 	size int
 
@@ -74,8 +75,7 @@ func NewDedupWindow(size int) *DedupWindow {
 	}
 	return &DedupWindow{
 		size:  size,
-		state: make(map[string]bool, size),
-		order: make([]string, 0, size),
+		state: make(map[string]bool),
 	}
 }
 

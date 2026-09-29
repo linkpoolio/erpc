@@ -3,7 +3,6 @@ package erpc
 import (
 	"context"
 	"errors"
-	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -669,14 +668,11 @@ func (e *networkExecutor) runHedge(
 						break
 					}
 				}
-				// Unless the request escalated to the fallbacks and none has
-				// answered yet: a sibling leg may still be waiting on one that
-				// has the data, so keep racing.
+				// Unless the request escalated to the fallbacks: a sibling leg
+				// may still be waiting on one that has the data, so keep racing
+				// (if every leg ends like this the hedge returns the last one).
 				if allMissing {
-					if req.EscalatedToFallbacks() && !slices.ContainsFunc(uxe.Upstreams(), isFallbackTier) {
-						return false
-					}
-					return true
+					return !req.EscalatedToFallbacks()
 				}
 			}
 			// Underlying-retryable wrapped errors (e.g. ErrUpstreamsExhausted

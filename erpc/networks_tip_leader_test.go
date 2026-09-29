@@ -277,3 +277,126 @@ func TestFailover_HedgeKeepsEscalatedSibling(t *testing.T) {
 	}
 	assert.Equal(t, escapeBefore+5, promUtil.ToFloat64(telemetry.MetricNetworkFallbackEscapeTotal.WithLabelValues("main", "evm:999", "eth_call")))
 }
+
+// ethCallMock answers eth_call on host with body after delay.
+func ethCallMock(host string, delay time.Duration, body string) {
+	gock.New("http://" + host).
+		Post("").
+		Persist().
+		Filter(func(r *http.Request) bool {
+			return r.URL.Host == host && strings.Contains(util.SafeReadBody(r), "eth_call")
+		}).
+		Reply(200).
+		Delay(delay).
+		JSON([]byte(body))
+}
+
+// latestHeadMock pins host's polled latest block, ahead of its standard mock.
+func latestHeadMock(host, latestHex string) {
+	gock.New("http://" + host).
+		Post("").
+		Persist().
+		Filter(func(r *http.Request) bool {
+			b := util.SafeReadBody(r)
+			return r.URL.Host == host && strings.Contains(b, "eth_getBlockByNumber") && strings.Contains(b, `"latest"`)
+		}).
+		Reply(200).
+		JSON([]byte(`{"result":{"number":"` + latestHex + `","timestamp":"0x6702a8f0"}}`))
+}
+
+func unboundedAll(cfgs []*common.UpstreamConfig) {
+	for _, cfg := range cfgs {
+		cfg.Evm.BlockAvailability = nil
+	}
+}
+
+const missingDataBody = `{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"header not found"}}`
+
+// A fallback that already answered missing data must not let a hedge leg
+// cancel another fallback that is still working on the request.
+func TestFailover_HedgeKeepsSlowFallbackAfterFastFallbackMiss(t *testing.T) {
+	defer util.ResetGock()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	network, _, _ := setupFailoverFixture(t, ctx, failoverFixtureOpts{
+		primaryLatest:  "0x3e8", // 1000
+		fallbackLatest: "0x3e8", // 1000, no tip leader
+		enableFailover: true,
+		configure:      unboundedAll,
+		failsafe:       hedgeFaster(),
+		mocks: func() {
+			ethCallMock("rpc1.localhost", 0, missingDataBody)
+			ethCallMock("rpc2.localhost", 0, missingDataBody)
+			ethCallMock("rpc3.localhost", 0, missingDataBody)
+			ethCallMock("rpc4.localhost", 80*time.Millisecond, `{"jsonrpc":"2.0","id":1,"result":"0x4444"}`)
+		},
+	})
+
+	for i := 0; i < 5; i++ {
+		result, err := forwardEthCall(t, ctx, network, i, "0x3ea")
+		require.NoError(t, err, "iter %d", i)
+		assert.Equal(t, "0x4444", result, "iter %d", i)
+	}
+}
+
+// When the tip leader fails, the sweep still escapes to the fallbacks it has
+// not tried, even one whose polled head trails the block.
+func TestFailover_TipLeaderKeepsEscapeToOtherFallbacks(t *testing.T) {
+	defer util.ResetGock()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	network, _, _ := setupFailoverFixture(t, ctx, failoverFixtureOpts{
+		primaryLatest:  "0x3e8", // 1000
+		fallbackLatest: "0x3ea", // fallback-1 at 1002 (leader)
+		enableFailover: true,
+		configure:      unboundedAll,
+		mocks: func() {
+			latestHeadMock("rpc4.localhost", "0x3e8") // fallback-2 at 1000
+			ethCallMock("rpc1.localhost", 0, missingDataBody)
+			ethCallMock("rpc2.localhost", 0, missingDataBody)
+			ethCallMock("rpc3.localhost", 0, `{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"internal error"}}`)
+		},
+	})
+
+	leader := telemetry.MetricNetworkTipLeaderRouteTotal.WithLabelValues("main", "evm:999", "eth_call")
+	escape := telemetry.MetricNetworkFallbackEscapeTotal.WithLabelValues("main", "evm:999", "eth_call")
+	leaderBefore, escapeBefore := promUtil.ToFloat64(leader), promUtil.ToFloat64(escape)
+
+	result, err := forwardEthCall(t, ctx, network, 1, "0x3ea")
+	require.NoError(t, err)
+	assert.Equal(t, "0x4444", result, "the untried fallback must still serve the request")
+	assert.Equal(t, leaderBefore+1, promUtil.ToFloat64(leader))
+	assert.Equal(t, escapeBefore+1, promUtil.ToFloat64(escape))
+}
+
+// A request pinned to an upstream by the use-upstream directive never takes
+// the tip-leader route to a fallback outside it.
+func TestFailover_TipLeaderRespectsUseUpstream(t *testing.T) {
+	defer util.ResetGock()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	network, _, _ := setupFailoverFixture(t, ctx, failoverFixtureOpts{
+		primaryLatest:  "0x3e8", // 1000
+		fallbackLatest: "0x3ea", // 1002
+		enableFailover: true,
+		configure:      unboundedPrimaries,
+	})
+
+	leader := telemetry.MetricNetworkTipLeaderRouteTotal.WithLabelValues("main", "evm:999", "eth_call")
+	before := promUtil.ToFloat64(leader)
+
+	req := ethCallRequest(1, "0x3ea")
+	req.SetDirectives(&common.RequestDirectives{UseUpstream: "primary-1"})
+	req.SetNetwork(network)
+	resp, err := network.Forward(ctx, req)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	defer resp.Release()
+	jrr, err := resp.JsonRpcResponse()
+	require.NoError(t, err)
+	assert.Equal(t, "0x1111", strings.Trim(jrr.GetResultString(), `"`))
+	assert.Equal(t, before, promUtil.ToFloat64(leader))
+}

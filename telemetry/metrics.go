@@ -759,6 +759,15 @@ var (
 		Help:      "Total number of times the per-request fallback escape hatch fired because the primary upstream set was exhausted with retryable errors.",
 	}, []string{"project", "network", "category"})
 
+	// MetricNetworkTipLeaderRouteTotal counts block-pinned requests sent to a
+	// fallback-tier upstream first because it already had the block while
+	// every routed upstream's head was below it.
+	MetricNetworkTipLeaderRouteTotal = DefineCounter(prometheus.CounterOpts{
+		Namespace: "erpc",
+		Name:      "network_tip_leader_route_total",
+		Help:      "Total number of block-pinned requests routed to a fallback-tier upstream first because it had the block and no routed upstream did.",
+	}, []string{"project", "network", "category"})
+
 	// MetricCacheExecutorAttempt counts every attempt a cache-connector
 	// failsafe executor governs, keyed by the executor's identity (the
 	// matchMethod / matchFinality it was configured with) and the outcome

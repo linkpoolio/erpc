@@ -208,6 +208,8 @@ type failoverFixtureOpts struct {
 	// mocks registers test-specific mocks ahead of the standard ones, before
 	// any poller starts.
 	mocks func()
+	// configure adjusts the upstream configs before the network is built.
+	configure func(cfgs []*common.UpstreamConfig)
 }
 
 func setupFailoverFixture(
@@ -232,7 +234,11 @@ func setupFailoverFixture(
 	mockEthCallReturning("rpc3.localhost", "0x3333")
 	mockEthCallReturning("rpc4.localhost", "0x4444")
 
-	network, upr, mt := buildFailoverNetwork(t, ctx, failoverUpstreamConfigs(), opts)
+	cfgs := failoverUpstreamConfigs()
+	if opts.configure != nil {
+		opts.configure(cfgs)
+	}
+	network, upr, mt := buildFailoverNetwork(t, ctx, cfgs, opts)
 
 	upsList := upr.GetNetworkUpstreams(ctx, util.EvmNetworkId(999))
 	require.Len(t, upsList, 4)
@@ -265,11 +271,26 @@ func TestFailover_EscapeHatch(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		// Primaries at 1000 skip block 1002; the fallbacks at 1002 serve it.
+		// Primaries at 1002 fail eth_call with a retryable error; the
+		// fallbacks at 1002 serve it. (Primaries below the block would take
+		// tip-leader routing instead, see TestFailover_TipLeaderRouting.)
 		network, _, _ := setupFailoverFixture(t, ctx, failoverFixtureOpts{
-			primaryLatest:  "0x3e8", // 1000
+			primaryLatest:  "0x3ea", // 1002
 			fallbackLatest: "0x3ea", // 1002
 			enableFailover: true,
+			mocks: func() {
+				for _, host := range []string{"rpc1.localhost", "rpc2.localhost"} {
+					host := host
+					gock.New("http://" + host).
+						Post("").
+						Persist().
+						Filter(func(r *http.Request) bool {
+							return r.URL.Host == host && strings.Contains(util.SafeReadBody(r), "eth_call")
+						}).
+						Reply(200).
+						JSON([]byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"internal error"}}`))
+				}
+			},
 		})
 
 		counter := telemetry.MetricNetworkFallbackEscapeTotal.WithLabelValues("main", "evm:999", "eth_call")

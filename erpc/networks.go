@@ -2294,6 +2294,34 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 			return requestBlockNumber(ctx, effectiveReq) > 0 && !evm.EmptyResultBeyondConfidence(ctx, effectiveReq)
 		}
 
+		// Tip-leader routing: a request pinned to a block above every routed
+		// upstream's head goes first to the fallbacks that already have it
+		// (a fallback's WS heads keep its poller current), then to the routed
+		// list. It spends the per-request escalation, so the escape below
+		// does not fire again.
+		if !oneUpstreamOnly && n.cfg.Failover.Enabled() && !failsafeExecutor.HasConsensus() {
+			if leaders := n.tipLeaderFallbacks(execSpanCtx, effectiveReq, method, upsList); len(leaders) > 0 &&
+				effectiveReq.MarkEscalatedToFallbacks() {
+				routed := effectiveReq.NextUpstream
+				maxLoopIterations += len(leaders)
+				nextUpstream = func() (common.Upstream, error) {
+					for len(leaders) > 0 {
+						fb := leaders[0]
+						leaders = leaders[1:]
+						if _, loaded := effectiveReq.ConsumedUpstreams.LoadOrStore(fb, true); !loaded {
+							return fb, nil
+						}
+					}
+					return routed()
+				}
+
+				telemetry.MetricNetworkTipLeaderRouteTotal.WithLabelValues(
+					n.projectId, n.Label(), method,
+				).Inc()
+				lg.Debug().Int("leaders", len(leaders)).Msg("routing to fallback upstreams ahead of the routed tip")
+			}
+		}
+
 	escalationLoop:
 		for {
 			for loopIteration := 0; loopIteration < maxLoopIterations; loopIteration++ {
@@ -3627,9 +3655,12 @@ func (n *Network) acquireRateLimitPermit(ctx context.Context, req *common.Normal
 // tierUpstreamsByGroup moves fallback-tier upstreams behind the rest,
 // preserving order within each tier.
 func tierUpstreamsByGroup(ups []common.Upstream) []common.Upstream {
-	return stablePartition(ups, func(u common.Upstream) bool {
-		return u.Config() != nil && u.Config().HasTag(common.TagTierFallback)
-	})
+	return stablePartition(ups, isFallbackTier)
+}
+
+// isFallbackTier reports whether u is tagged tier:fallback.
+func isFallbackTier(u common.Upstream) bool {
+	return u.Config() != nil && u.Config().HasTag(common.TagTierFallback)
 }
 
 // partitionUpstreamsByLatestBlock moves upstreams whose polled head is known
@@ -3688,6 +3719,45 @@ func preferTipLeaderForNearTipGetBlock(ups []common.Upstream, method string, bn 
 	out = append(out, ups[:leader]...)
 	out = append(out, ups[leader+1:]...)
 	return out
+}
+
+// tipLeaderFallbacks returns the fallback-tier upstreams, outside the routed
+// list, whose head has reached the block req is pinned to, when every routed
+// default-tier upstream's head is known and below it. Nil otherwise,
+// including when a routed head is unknown.
+func (n *Network) tipLeaderFallbacks(ctx context.Context, req *common.NormalizedRequest, method string, routed []common.Upstream) []common.Upstream {
+	if n.Architecture() != common.ArchitectureEvm {
+		return nil
+	}
+	bn := requestBlockNumber(ctx, req)
+	if bn <= 0 {
+		return nil
+	}
+	routedIds := make(map[string]struct{}, len(routed))
+	defaults := 0
+	for _, u := range routed {
+		routedIds[u.Id()] = struct{}{}
+		if isFallbackTier(u) {
+			continue
+		}
+		defaults++
+		if lb := upstreamLatestBlock(u); lb <= 0 || lb >= bn {
+			return nil
+		}
+	}
+	if defaults == 0 {
+		return nil
+	}
+	var leaders []common.Upstream
+	for _, fb := range n.upstreamsRegistry.GetFallbackEscapeUpstreams(ctx, n.networkId, method) {
+		if _, ok := routedIds[fb.Id()]; ok {
+			continue
+		}
+		if upstreamLatestBlock(fb) >= bn {
+			leaders = append(leaders, fb)
+		}
+	}
+	return leaders
 }
 
 // upstreamLatestBlock is u's polled head, or 0 when unknown.

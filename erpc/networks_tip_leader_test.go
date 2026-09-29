@@ -400,3 +400,45 @@ func TestFailover_TipLeaderRespectsUseUpstream(t *testing.T) {
 	assert.Equal(t, "0x1111", strings.Trim(jrr.GetResultString(), `"`))
 	assert.Equal(t, before, promUtil.ToFloat64(leader))
 }
+
+// With served-tip on, a numbered eth_getBlockByNumber above every eligible
+// head is short-circuited to null, unless a reachable fallback already has
+// the block.
+func TestFailover_FutureBlockShortCircuitSparesFallbackThatHasIt(t *testing.T) {
+	defer util.ResetGock()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	network, _, _ := setupFailoverFixture(t, ctx, failoverFixtureOpts{
+		primaryLatest:  "0x3e8", // 1000
+		fallbackLatest: "0x3ea", // 1002
+		enableFailover: true,
+		network: func(cfg *common.NetworkConfig) {
+			cfg.Evm.ServedTip = &common.EvmServedTipConfig{EnabledFor: []string{"latest"}}
+		},
+		mocks: func() {
+			for _, host := range []string{"rpc3.localhost", "rpc4.localhost"} {
+				host := host
+				gock.New("http://" + host).
+					Post("").
+					Persist().
+					Filter(func(r *http.Request) bool {
+						b := util.SafeReadBody(r)
+						return r.URL.Host == host && strings.Contains(b, "eth_getBlockByNumber") && strings.Contains(b, `"0x3ea"`)
+					}).
+					Reply(200).
+					JSON([]byte(`{"jsonrpc":"2.0","id":1,"result":{"number":"0x3ea","hash":"0xfb","timestamp":"0x6702a8f2"}}`))
+			}
+		},
+	})
+
+	req := common.NewNormalizedRequest([]byte(`{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["0x3ea",false]}`))
+	req.SetNetwork(network)
+	resp, err := network.Forward(ctx, req)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	defer resp.Release()
+	jrr, err := resp.JsonRpcResponse()
+	require.NoError(t, err)
+	assert.Contains(t, jrr.GetResultString(), `"0x3ea"`, "the fallback's block must be returned, not a synthetic null")
+}

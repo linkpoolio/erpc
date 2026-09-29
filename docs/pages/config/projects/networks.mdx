@@ -147,7 +147,7 @@ The escape:
 - fires at most once per request, and never for consensus requests;
 - is counted in `erpc_network_fallback_escape_total{project,network,category}` — expect zero in steady state.
 
-With `onDefaultsExhausted` on, a request pinned to a block above every routed upstream's known head is sent first to the `tier:fallback` upstreams whose head has already reached that block (for example because their `newHeads` subscription announced it first), then to the routed upstreams. This uses the same once-per-request escalation, so the escape above does not fire again for that request. It does nothing when any routed upstream's head is unknown or already at the block, and never applies to consensus requests. It is counted in `erpc_network_tip_leader_route_total{project,network,category}`.
+With `onDefaultsExhausted` on, a request pinned to a block above every routed upstream's known head is sent first to the `tier:fallback` upstreams whose head has already reached that block (for example because their `newHeads` subscription announced it first), then to the routed upstreams. This uses the same once-per-request escalation: other hedge legs and retries of that request do not escape, while the sweep that routed to the leaders still escapes once, to the fallbacks it has not tried, if the leaders and the routed upstreams all fail (counted in `erpc_network_fallback_escape_total` as usual). It does nothing when any routed upstream's head is unknown or already at the block, and never applies to consensus requests. It is counted in `erpc_network_tip_leader_route_total{project,network,category}`.
 
 The validation report warns when `onDefaultsExhausted` is enabled but no upstream is tagged `tier:fallback`.
 

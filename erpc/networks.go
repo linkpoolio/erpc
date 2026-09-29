@@ -915,6 +915,11 @@ func (n *Network) tryShortCircuitFutureBlock(ctx context.Context, req *common.No
 		// Unknown head (fail open) or block within reach of some upstream.
 		return nil, false
 	}
+	// A fallback the sweep can still reach may already have it while the
+	// policy keeps it out of the eligible set.
+	if n.cfg.Failover.Enabled() && len(n.fallbacksAtBlock(ctx, req, method, bn, nil)) > 0 {
+		return nil, false
+	}
 	jrr, err := common.NewJsonRpcResponse(req.ID(), nil, nil)
 	if err != nil {
 		return nil, false
@@ -3744,13 +3749,19 @@ func (n *Network) tipLeaderFallbacks(ctx context.Context, req *common.Normalized
 		}
 		routedIds[u.Id()] = struct{}{}
 	}
+	return n.fallbacksAtBlock(ctx, req, method, bn, routedIds)
+}
+
+// fallbacksAtBlock returns the fallback-escape upstreams, not in skip and
+// allowed by the request's upstream selector, whose head has reached bn.
+func (n *Network) fallbacksAtBlock(ctx context.Context, req *common.NormalizedRequest, method string, bn int64, skip map[string]struct{}) []common.Upstream {
 	selector := ""
 	if d := req.Directives(); d != nil {
 		selector = d.UseUpstream
 	}
-	var leaders []common.Upstream
+	var out []common.Upstream
 	for _, fb := range n.upstreamsRegistry.GetFallbackEscapeUpstreams(ctx, n.networkId, method) {
-		if _, ok := routedIds[fb.Id()]; ok || upstreamLatestBlock(fb) < bn {
+		if _, ok := skip[fb.Id()]; ok || upstreamLatestBlock(fb) < bn {
 			continue
 		}
 		if selector != "" {
@@ -3758,9 +3769,9 @@ func (n *Network) tipLeaderFallbacks(ctx context.Context, req *common.Normalized
 				continue
 			}
 		}
-		leaders = append(leaders, fb)
+		out = append(out, fb)
 	}
-	return leaders
+	return out
 }
 
 // upstreamLatestBlock is u's polled head, or 0 when unknown.

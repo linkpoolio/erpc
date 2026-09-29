@@ -169,6 +169,9 @@ func buildFailoverNetwork(
 		networkConfig.Failover = &common.FailoverConfig{OnDefaultsExhausted: util.BoolPtr(true)}
 	}
 	networkConfig.Failsafe = opts.failsafe
+	if opts.network != nil {
+		opts.network(networkConfig)
+	}
 
 	var policyEngine *policy.Engine
 	if !opts.noPolicy {
@@ -210,6 +213,8 @@ type failoverFixtureOpts struct {
 	mocks func()
 	// configure adjusts the upstream configs before the network is built.
 	configure func(cfgs []*common.UpstreamConfig)
+	// network adjusts the network config before the network is built.
+	network func(cfg *common.NetworkConfig)
 }
 
 func setupFailoverFixture(

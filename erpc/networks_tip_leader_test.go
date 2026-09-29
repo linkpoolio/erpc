@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/erpc/erpc/common"
 	"github.com/erpc/erpc/telemetry"
@@ -41,6 +42,44 @@ func countEthCalls(host string, hits *atomic.Int64) {
 			return false
 		}).
 		Reply(200)
+}
+
+// missingOnPrimariesSlowOnFallbacks makes the primaries answer eth_call with
+// missing data and the fallbacks serve it after delay.
+func missingOnPrimariesSlowOnFallbacks(delay time.Duration) func() {
+	return func() {
+		for _, host := range []string{"rpc1.localhost", "rpc2.localhost"} {
+			host := host
+			gock.New("http://" + host).
+				Post("").
+				Persist().
+				Filter(func(r *http.Request) bool {
+					return r.URL.Host == host && strings.Contains(util.SafeReadBody(r), "eth_call")
+				}).
+				Reply(200).
+				JSON([]byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"header not found"}}`))
+		}
+		for _, host := range []string{"rpc3.localhost", "rpc4.localhost"} {
+			host := host
+			gock.New("http://" + host).
+				Post("").
+				Persist().
+				Filter(func(r *http.Request) bool {
+					return r.URL.Host == host && strings.Contains(util.SafeReadBody(r), "eth_call")
+				}).
+				Reply(200).
+				Delay(delay).
+				JSON([]byte(`{"jsonrpc":"2.0","id":1,"result":"0x3333"}`))
+		}
+	}
+}
+
+// hedgeFaster hedges well before a fallback answers.
+func hedgeFaster() []*common.FailsafeConfig {
+	return []*common.FailsafeConfig{{
+		MatchMethod: "*",
+		Hedge:       &common.HedgePolicyConfig{Delay: common.NewStaticDuration(20 * time.Millisecond), MaxCount: 1},
+	}}
 }
 
 func forwardEthCall(t *testing.T, ctx context.Context, network *Network, id int, blockHex string) (string, error) {
@@ -183,4 +222,58 @@ func TestFailover_TipLeaderRouting(t *testing.T) {
 		assert.Equal(t, escapeBefore, escapeCounter(), "the escalation is already spent")
 	})
 
+	t.Run("HedgeDoesNotCancelSlowLeader", func(t *testing.T) {
+		defer util.ResetGock()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		// The hedge leg sweeps the primaries (missing data) while the leader
+		// leg still waits on the fallback; the leader must win.
+		network, _, _ := setupFailoverFixture(t, ctx, failoverFixtureOpts{
+			primaryLatest:  "0x3e8", // 1000
+			fallbackLatest: "0x3ea", // 1002
+			enableFailover: true,
+			configure:      unboundedPrimaries,
+			failsafe:       hedgeFaster(),
+			mocks:          missingOnPrimariesSlowOnFallbacks(80 * time.Millisecond),
+		})
+
+		for i := 0; i < 5; i++ {
+			result, err := forwardEthCall(t, ctx, network, i, "0x3ea")
+			require.NoError(t, err, "iter %d", i)
+			assert.Equal(t, "0x3333", result, "iter %d", i)
+		}
+	})
+}
+
+// A hedge leg that finds every routed upstream missing the data must not
+// cancel a sibling leg that escalated to the fallbacks and is still waiting.
+func TestFailover_HedgeKeepsEscalatedSibling(t *testing.T) {
+	defer util.ResetGock()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Nobody's head reaches 1002, so there is no tip leader: the primaries
+	// miss, the escape sends one leg to the (slow) fallbacks, and the hedge
+	// leg misses on the primaries again.
+	network, _, _ := setupFailoverFixture(t, ctx, failoverFixtureOpts{
+		primaryLatest:  "0x3e8", // 1000
+		fallbackLatest: "0x3e8", // 1000
+		enableFailover: true,
+		configure: func(cfgs []*common.UpstreamConfig) {
+			for _, cfg := range cfgs {
+				cfg.Evm.BlockAvailability = nil
+			}
+		},
+		failsafe: hedgeFaster(),
+		mocks:    missingOnPrimariesSlowOnFallbacks(80 * time.Millisecond),
+	})
+
+	escapeBefore := promUtil.ToFloat64(telemetry.MetricNetworkFallbackEscapeTotal.WithLabelValues("main", "evm:999", "eth_call"))
+	for i := 0; i < 5; i++ {
+		result, err := forwardEthCall(t, ctx, network, i, "0x3ea")
+		require.NoError(t, err, "iter %d", i)
+		assert.Equal(t, "0x3333", result, "iter %d", i)
+	}
+	assert.Equal(t, escapeBefore+5, promUtil.ToFloat64(telemetry.MetricNetworkFallbackEscapeTotal.WithLabelValues("main", "evm:999", "eth_call")))
 }

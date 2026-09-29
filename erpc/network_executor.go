@@ -3,6 +3,7 @@ package erpc
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -668,7 +669,13 @@ func (e *networkExecutor) runHedge(
 						break
 					}
 				}
+				// Unless the request escalated to the fallbacks and none has
+				// answered yet: a sibling leg may still be waiting on one that
+				// has the data, so keep racing.
 				if allMissing {
+					if req.EscalatedToFallbacks() && !slices.ContainsFunc(uxe.Upstreams(), isFallbackTier) {
+						return false
+					}
 					return true
 				}
 			}

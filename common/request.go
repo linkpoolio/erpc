@@ -1281,6 +1281,12 @@ func (r *NormalizedRequest) MarkEscalatedToFallbacks() bool {
 	return r.escalatedToFallbacks.CompareAndSwap(false, true)
 }
 
+// EscalatedToFallbacks reports whether the request has spent its fallback
+// escalation.
+func (r *NormalizedRequest) EscalatedToFallbacks() bool {
+	return r != nil && r.escalatedToFallbacks.Load()
+}
+
 // UserId returns the user ID from the user object, or "n/a" if not available
 func (r *NormalizedRequest) UserId() string {
 	if r == nil {

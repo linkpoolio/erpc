@@ -915,6 +915,13 @@ func (n *Network) tryShortCircuitFutureBlock(ctx context.Context, req *common.No
 		// Unknown head (fail open) or block within reach of some upstream.
 		return nil, false
 	}
+	// A fallback the sweep can still reach may already have it while the
+	// policy keeps it out of the eligible set. Consensus never reaches it.
+	if n.cfg.Failover.Enabled() && len(n.fallbacksAtBlock(ctx, req, method, bn, nil)) > 0 {
+		if fe := n.getFailsafeExecutor(ctx, req); fe == nil || !fe.HasConsensus() {
+			return nil, false
+		}
+	}
 	jrr, err := common.NewJsonRpcResponse(req.ID(), nil, nil)
 	if err != nil {
 		return nil, false
@@ -2294,6 +2301,37 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 			return requestBlockNumber(ctx, effectiveReq) > 0 && !evm.EmptyResultBeyondConfidence(ctx, effectiveReq)
 		}
 
+		// Tip-leader routing: a request pinned to a block above every routed
+		// upstream's head goes first to the fallbacks that already have it
+		// (a fallback's WS heads keep its poller current), then to the routed
+		// list. It takes the per-request escalation, so no other leg or
+		// attempt escapes; this sweep keeps its escape to the fallbacks it
+		// has not tried.
+		leaderRouted := false
+		if !oneUpstreamOnly && n.cfg.Failover.Enabled() && !failsafeExecutor.HasConsensus() {
+			if leaders := n.tipLeaderFallbacks(execSpanCtx, effectiveReq, method, upsList); len(leaders) > 0 &&
+				effectiveReq.MarkEscalatedToFallbacks() {
+				leaderRouted = true
+				routed := effectiveReq.NextUpstream
+				maxLoopIterations += len(leaders)
+				nextUpstream = func() (common.Upstream, error) {
+					for len(leaders) > 0 {
+						fb := leaders[0]
+						leaders = leaders[1:]
+						if _, loaded := effectiveReq.ConsumedUpstreams.LoadOrStore(fb, true); !loaded {
+							return fb, nil
+						}
+					}
+					return routed()
+				}
+
+				telemetry.MetricNetworkTipLeaderRouteTotal.WithLabelValues(
+					n.projectId, n.Label(), method,
+				).Inc()
+				lg.Debug().Int("leaders", len(leaders)).Msg("routing to fallback upstreams ahead of the routed tip")
+			}
+		}
+
 	escalationLoop:
 		for {
 			for loopIteration := 0; loopIteration < maxLoopIterations; loopIteration++ {
@@ -2492,7 +2530,8 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 						fallbacks = append(fallbacks, fb)
 					}
 				}
-				if len(fallbacks) > 0 && effectiveReq.MarkEscalatedToFallbacks() {
+				if len(fallbacks) > 0 && (leaderRouted || effectiveReq.MarkEscalatedToFallbacks()) {
+					leaderRouted = false
 					if bestResp != nil {
 						bestResp.Release()
 						bestResp = nil
@@ -3627,9 +3666,12 @@ func (n *Network) acquireRateLimitPermit(ctx context.Context, req *common.Normal
 // tierUpstreamsByGroup moves fallback-tier upstreams behind the rest,
 // preserving order within each tier.
 func tierUpstreamsByGroup(ups []common.Upstream) []common.Upstream {
-	return stablePartition(ups, func(u common.Upstream) bool {
-		return u.Config() != nil && u.Config().HasTag(common.TagTierFallback)
-	})
+	return stablePartition(ups, isFallbackTier)
+}
+
+// isFallbackTier reports whether u is tagged tier:fallback.
+func isFallbackTier(u common.Upstream) bool {
+	return u.Config() != nil && u.Config().HasTag(common.TagTierFallback)
 }
 
 // partitionUpstreamsByLatestBlock moves upstreams whose polled head is known
@@ -3688,6 +3730,66 @@ func preferTipLeaderForNearTipGetBlock(ups []common.Upstream, method string, bn 
 	out = append(out, ups[:leader]...)
 	out = append(out, ups[leader+1:]...)
 	return out
+}
+
+// tipLeaderFallbacks returns the fallback-tier upstreams, outside the routed
+// list and allowed by the request's upstream selector, whose head has reached
+// the block req is pinned to, when every routed upstream's head is known and
+// below it. Nil otherwise.
+func (n *Network) tipLeaderFallbacks(ctx context.Context, req *common.NormalizedRequest, method string, routed []common.Upstream) []common.Upstream {
+	if n.Architecture() != common.ArchitectureEvm {
+		return nil
+	}
+	bn := requestBlockNumber(ctx, req)
+	if bn <= 0 {
+		return nil
+	}
+	routedIds := make(map[string]struct{}, len(routed))
+	for _, u := range routed {
+		if lb := upstreamLatestBlock(u); lb <= 0 || lb >= bn {
+			return nil
+		}
+		routedIds[u.Id()] = struct{}{}
+	}
+	return n.fallbacksAtBlock(ctx, req, method, bn, routedIds)
+}
+
+// fallbacksAtBlock returns the fallback-escape upstreams, not in skip and
+// allowed by the request's upstream selector, whose head has reached bn and
+// whose enforced availability bounds admit it.
+func (n *Network) fallbacksAtBlock(ctx context.Context, req *common.NormalizedRequest, method string, bn int64, skip map[string]struct{}) []common.Upstream {
+	selector := ""
+	if d := req.Directives(); d != nil {
+		selector = d.UseUpstream
+	}
+	var out []common.Upstream
+	for _, fb := range n.upstreamsRegistry.GetFallbackEscapeUpstreams(ctx, n.networkId, method) {
+		if _, ok := skip[fb.Id()]; ok || upstreamLatestBlock(fb) < bn || !n.availabilityAdmits(fb, method, bn) {
+			continue
+		}
+		if selector != "" {
+			if match, err := common.UpstreamMatchesSelector(selector, fb); err != nil || !match {
+				continue
+			}
+		}
+		out = append(out, fb)
+	}
+	return out
+}
+
+// availabilityAdmits reports whether u's block-availability bounds, where
+// enforced for method, admit bn. The same bounds checkUpstreamBlockAvailability
+// gates on, without its metrics.
+func (n *Network) availabilityAdmits(u common.Upstream, method string, bn int64) bool {
+	if methodHasDedicatedRangeAvailabilityHook(method) || n.blockAvailabilityExplicitlyDisabled(method) {
+		return true
+	}
+	eu, ok := u.(common.EvmUpstream)
+	if !ok {
+		return true
+	}
+	lo, hi := eu.EvmBlockAvailabilityBounds()
+	return (lo == math.MinInt64 || bn >= lo) && (hi == math.MaxInt64 || bn <= hi)
 }
 
 // upstreamLatestBlock is u's polled head, or 0 when unknown.

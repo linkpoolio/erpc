@@ -668,8 +668,11 @@ func (e *networkExecutor) runHedge(
 						break
 					}
 				}
+				// Unless the request escalated to the fallbacks: a sibling leg
+				// may still be waiting on one that has the data, so keep racing
+				// (if every leg ends like this the hedge returns the last one).
 				if allMissing {
-					return true
+					return !req.EscalatedToFallbacks()
 				}
 			}
 			// Underlying-retryable wrapped errors (e.g. ErrUpstreamsExhausted

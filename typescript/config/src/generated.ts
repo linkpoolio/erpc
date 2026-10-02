@@ -1884,6 +1884,7 @@ export const AuthTypeDatabase: AuthType = "database";
 export const AuthTypeJwt: AuthType = "jwt";
 export const AuthTypeSiwe: AuthType = "siwe";
 export const AuthTypeNetwork: AuthType = "network";
+export const AuthTypeForwardedClientId: AuthType = "forwardedClientId";
 export interface AuthConfig {
   strategies: TsAuthStrategyConfig[];
 }
@@ -1915,6 +1916,17 @@ export interface AuthStrategyConfig {
   database?: DatabaseStrategyConfig;
   jwt?: JwtStrategyConfig;
   siwe?: SiweStrategyConfig;
+  /**
+   * Trust a gateway-injected client id header (e.g. Envoy X-Client-Id).
+   */
+  forwardedClientId?: ForwardedClientIdStrategyConfig;
+}
+export interface ForwardedClientIdStrategyConfig {
+  /**
+   * Header carrying the client id. Default: "X-Client-Id".
+   */
+  header?: string;
+  rateLimitBudget?: string;
 }
 export interface SecretStrategyConfig {
   id: string;

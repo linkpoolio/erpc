@@ -1309,6 +1309,9 @@ type JsonRpcUpstreamConfig struct {
 	EnableGzip    *bool             `yaml:"enableGzip,omitempty" json:"enableGzip"`
 	Headers       map[string]string `yaml:"headers,omitempty" json:"headers"`
 	ProxyPool     string            `yaml:"proxyPool,omitempty" json:"proxyPool"`
+	// NetworkId binds this upstream to architecture jsonrpc (slug only, e.g. solana-mainnet).
+	// Required when type is jsonrpc; skipped for EVM upstreams that already use jsonRpc for batch/headers.
+	NetworkId string `yaml:"networkId,omitempty" json:"networkId,omitempty"`
 }
 
 func (c *JsonRpcUpstreamConfig) Copy() *JsonRpcUpstreamConfig {
@@ -2301,6 +2304,7 @@ type NetworkConfig struct {
 	Failsafe          []*FailsafeConfig        `yaml:"failsafe,omitempty" json:"failsafe"`
 	Evm               *EvmNetworkConfig        `yaml:"evm,omitempty" json:"evm"`
 	Svm               *SvmNetworkConfig        `yaml:"svm,omitempty" json:"svm"`
+	JsonRpc           *JsonRpcNetworkConfig    `yaml:"jsonRpc,omitempty" json:"jsonRpc"`
 	SelectionPolicy   *SelectionPolicyConfig   `yaml:"selectionPolicy,omitempty" json:"selectionPolicy"`
 	DirectiveDefaults *DirectiveDefaultsConfig `yaml:"directiveDefaults,omitempty" json:"directiveDefaults"`
 	Alias             string                   `yaml:"alias,omitempty" json:"alias"`
@@ -2376,6 +2380,7 @@ func (n *NetworkConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		Failsafe          *FailsafeConfig          `yaml:"failsafe,omitempty"`
 		Evm               *EvmNetworkConfig        `yaml:"evm,omitempty"`
 		Svm               *SvmNetworkConfig        `yaml:"svm,omitempty"`
+		JsonRpc           *JsonRpcNetworkConfig    `yaml:"jsonRpc,omitempty"`
 		SelectionPolicy   *SelectionPolicyConfig   `yaml:"selectionPolicy,omitempty"`
 		DirectiveDefaults *DirectiveDefaultsConfig `yaml:"directiveDefaults,omitempty"`
 		Alias             string                   `yaml:"alias,omitempty"`
@@ -2395,6 +2400,7 @@ func (n *NetworkConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	n.RateLimitBudget = old.RateLimitBudget
 	n.Evm = old.Evm
 	n.Svm = old.Svm
+	n.JsonRpc = old.JsonRpc
 	n.SelectionPolicy = old.SelectionPolicy
 	n.DirectiveDefaults = old.DirectiveDefaults
 	n.Alias = old.Alias
@@ -2885,11 +2891,12 @@ func (s *SelectionPolicyConfig) UnmarshalYAML(unmarshal func(interface{}) error)
 type AuthType string
 
 const (
-	AuthTypeSecret   AuthType = "secret"
-	AuthTypeDatabase AuthType = "database"
-	AuthTypeJwt      AuthType = "jwt"
-	AuthTypeSiwe     AuthType = "siwe"
-	AuthTypeNetwork  AuthType = "network"
+	AuthTypeSecret            AuthType = "secret"
+	AuthTypeDatabase          AuthType = "database"
+	AuthTypeJwt               AuthType = "jwt"
+	AuthTypeSiwe              AuthType = "siwe"
+	AuthTypeNetwork           AuthType = "network"
+	AuthTypeForwardedClientId AuthType = "forwardedClientId"
 )
 
 type AuthConfig struct {
@@ -2920,12 +2927,27 @@ type AuthStrategyConfig struct {
 	// NormalizedRequest.SetUserFromTrustedHeader).
 	AllowClientDirectives *string `yaml:"allowClientDirectives,omitempty" json:"allowClientDirectives,omitempty"`
 
-	Type     AuthType                `yaml:"type" json:"type" tstype:"TsAuthType"`
-	Network  *NetworkStrategyConfig  `yaml:"network,omitempty" json:"network,omitempty"`
-	Secret   *SecretStrategyConfig   `yaml:"secret,omitempty" json:"secret,omitempty"`
-	Database *DatabaseStrategyConfig `yaml:"database,omitempty" json:"database,omitempty"`
-	Jwt      *JwtStrategyConfig      `yaml:"jwt,omitempty" json:"jwt,omitempty"`
-	Siwe     *SiweStrategyConfig     `yaml:"siwe,omitempty" json:"siwe,omitempty"`
+	Type              AuthType                         `yaml:"type" json:"type" tstype:"TsAuthType"`
+	Network           *NetworkStrategyConfig           `yaml:"network,omitempty" json:"network,omitempty"`
+	Secret            *SecretStrategyConfig            `yaml:"secret,omitempty" json:"secret,omitempty"`
+	Database          *DatabaseStrategyConfig          `yaml:"database,omitempty" json:"database,omitempty"`
+	Jwt               *JwtStrategyConfig               `yaml:"jwt,omitempty" json:"jwt,omitempty"`
+	Siwe              *SiweStrategyConfig              `yaml:"siwe,omitempty" json:"siwe,omitempty"`
+	ForwardedClientId *ForwardedClientIdStrategyConfig `yaml:"forwardedClientId,omitempty" json:"forwardedClientId,omitempty"`
+}
+
+// ForwardedClientIdStrategyConfig trusts a non-secret client identity header
+// injected by an upstream gateway after API-key auth (e.g. Envoy
+// apiKeyAuth.forwardClientIDHeader → X-Client-Id). Must only be enabled
+// behind a gateway that overwrites/strips client-supplied values of that header.
+type ForwardedClientIdStrategyConfig struct {
+	// Header documents the expected gateway identity header (default conceptually
+	// "X-Client-Id"). Payload extraction in auth.NewPayloadFromHttp currently
+	// always reads X-Client-Id via case-insensitive Header.Get; this field is
+	// not yet used to select the header name at runtime.
+	Header string `yaml:"header,omitempty" json:"header,omitempty"`
+	// RateLimitBudget, if set, is applied to the authenticated user.
+	RateLimitBudget string `yaml:"rateLimitBudget,omitempty" json:"rateLimitBudget,omitempty"`
 }
 
 type SecretStrategyConfig struct {
@@ -3222,6 +3244,11 @@ func (c *NetworkConfig) NetworkId() string {
 			return ""
 		}
 		return util.SvmNetworkId(c.Svm.Chain, c.Svm.Cluster)
+	case ArchitectureJsonRpc:
+		if c.JsonRpc == nil || c.JsonRpc.Id == "" {
+			return ""
+		}
+		return util.JsonRpcNetworkId(c.JsonRpc.Id)
 	default:
 		return ""
 	}

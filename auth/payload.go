@@ -3,11 +3,18 @@ package auth
 import "github.com/erpc/erpc/common"
 
 type AuthPayload struct {
-	Method string
-	Type   common.AuthType
-	Secret *SecretPayload
-	Jwt    *JwtPayload
-	Siwe   *SiwePayload
+	Method            string
+	Type              common.AuthType
+	Secret            *SecretPayload
+	Jwt               *JwtPayload
+	Siwe              *SiwePayload
+	ForwardedClientId *ForwardedClientIdPayload
+}
+
+// ForwardedClientIdPayload carries a gateway-injected client id (not a secret).
+type ForwardedClientIdPayload struct {
+	Value           string
+	RateLimitBudget string
 }
 
 // This payload is used by both "secret" and "database" strategies

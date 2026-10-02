@@ -373,7 +373,10 @@ func (r *JsonRpcResponse) ParseFromStream(ctx []context.Context, reader io.Reade
 		}
 	}
 
-	if len(temp.Error) > 0 {
+	// Bitcoin-family nodes often emit `"error": null` on success. Treat that
+	// (and missing error) as no error — ParseError("null") used to invent a
+	// server-side exception and fail the whole upstream attempt.
+	if len(temp.Error) > 0 && string(temp.Error) != "null" {
 		if err := r.ParseError(string(temp.Error)); err != nil {
 			return err
 		}
@@ -401,11 +404,17 @@ func (r *JsonRpcResponse) ParseError(raw string) error {
 
 	r.errBytes = nil
 
+	// JSON-RPC allows "error": null (Bitcoin Core / dogecoind / litecoind).
+	// That means success — do not fabricate a server-side exception.
+	if raw == "null" {
+		return nil
+	}
+
 	// First attempt to unmarshal the error as a typical JSON-RPC error
 	var rpcErr ErrJsonRpcExceptionExternal
 	if err := SonicCfg.UnmarshalFromString(raw, &rpcErr); err != nil {
 		// Special case: check for non-standard error structures in the raw data
-		if raw == "" || raw == "null" {
+		if raw == "" {
 			r.Error = NewErrJsonRpcExceptionExternal(
 				int(JsonRpcErrorServerSideException),
 				"unexpected empty response from upstream endpoint",
@@ -1204,10 +1213,13 @@ func isEmptyishValue(v interface{}) bool {
 type JsonRpcRequest struct {
 	sync.RWMutex
 
-	JSONRPC string        `json:"jsonrpc,omitempty"`
-	ID      interface{}   `json:"id,omitempty"`
-	Method  string        `json:"method"`
-	Params  []interface{} `json:"params"`
+	JSONRPC string      `json:"jsonrpc,omitempty"`
+	ID      interface{} `json:"id,omitempty"`
+	Method  string      `json:"method"`
+	// omitempty: Stellar (and some other non-EVM) reject "params":[] — they
+	// expect the field absent (or an object). Empty/nil params are omitted on
+	// the wire; EVM nodes accept both forms.
+	Params []interface{} `json:"params,omitempty"`
 
 	// idRaw stores the verbatim bytes of the id as received from the client.
 	// This is used to round-trip the id back without precision loss for ids

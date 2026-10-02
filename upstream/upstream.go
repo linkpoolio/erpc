@@ -1413,6 +1413,14 @@ func (u *Upstream) detectFeatures(ctx context.Context) error {
 		// Genesis-hash validation runs in Bootstrap (svmVerifyGenesisHash) once
 		// the client and networkId are in place, so it can go through the
 		// upstream's normal Forward path.
+	} else if cfg.Type == common.UpstreamTypeJsonRpc {
+		if cfg.JsonRpc == nil || cfg.JsonRpc.NetworkId == "" {
+			return common.NewTaskFatal(fmt.Errorf("upstream.*.jsonRpc.networkId is required for type jsonrpc"))
+		}
+		if !util.IsValidIdentifier(cfg.JsonRpc.NetworkId) {
+			return common.NewTaskFatal(fmt.Errorf("upstream.*.jsonRpc.networkId '%s' is invalid", cfg.JsonRpc.NetworkId))
+		}
+		u.networkId.Store(util.JsonRpcNetworkId(cfg.JsonRpc.NetworkId))
 	} else {
 		return fmt.Errorf("upstream type not supported: %s", cfg.Type)
 	}

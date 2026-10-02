@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"runtime/debug"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -54,6 +55,13 @@ type WsConnection struct {
 
 	closed     atomic.Bool // no more writes once set
 	peerClosed atomic.Bool // the peer's close frame was already answered
+	// peerEndCode is the close code the read loop ended on when the peer
+	// ended the connection (1006 when it vanished without a close frame);
+	// 0 when the server initiated the close.
+	peerEndCode atomic.Int32
+
+	// networkLabel is the metrics label of networkId (alias if configured).
+	networkLabel string
 
 	// subsClosed is guarded by SubscriptionManager.connMu.
 	subsClosed bool
@@ -104,6 +112,12 @@ func (s *HttpServer) handleWebSocket(
 		stopped:   make(chan struct{}),
 		done:      make(chan struct{}),
 	}
+
+	wsc.networkLabel = wsc.networkId
+	if nw, err := project.GetNetwork(r.Context(), wsc.networkId); err == nil {
+		wsc.networkLabel = nw.Label()
+	}
+	telemetry.GaugeHandle(telemetry.MetricWsConnectionsActive, project.Config.Id, wsc.networkLabel).Inc()
 
 	lg.Info().Str("connId", wsc.id).Str("remoteAddr", r.RemoteAddr).Msg("websocket connection established")
 
@@ -209,6 +223,9 @@ func (wsc *WsConnection) readLoop(pongWait time.Duration) {
 				Str("errType", fmt.Sprintf("%T", err))
 			if ce, ok := err.(*websocket.CloseError); ok {
 				ev = ev.Int("closeCode", ce.Code).Str("closeReason", ce.Text)
+				wsc.peerEndCode.Store(int32(ce.Code))
+			} else {
+				wsc.peerEndCode.Store(websocket.CloseAbnormalClosure)
 			}
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 				ev.Msg("websocket read ended: unexpected close")
@@ -270,7 +287,16 @@ func (wsc *WsConnection) handleMessage(raw []byte) {
 // Subscription methods are rejected in batches.
 func (wsc *WsConnection) handleRequest(ctx context.Context, raw []byte, startedAt *time.Time, inBatch bool) interface{} {
 	nq := common.NewNormalizedRequest(raw)
+	nq.SetTransport("ws")
 	nq.ForwardHeaders = make(http.Header)
+
+	// Every request is counted exactly once, including those rejected before
+	// they reach the network. category stays "n/a" until the client is
+	// authenticated so it cannot mint series with arbitrary method names.
+	outcome, category := "invalid", "n/a"
+	defer func() {
+		wsc.countRequest(category, nq.UserId(), nq.AgentName(), outcome)
+	}()
 	requestCtx := common.StartRequestSpan(ctx, nq)
 	nq.SetClientIP(wsc.server.resolveRealClientIP(wsc.httpReq))
 
@@ -300,25 +326,33 @@ func (wsc *WsConnection) handleRequest(ctx context.Context, raw []byte, startedA
 		return fail(err, &common.TRUE)
 	}
 	if !allowed {
+		outcome = "method_not_allowed"
 		return unsupported(fmt.Sprintf("method not supported: %s", method))
 	}
 	if inBatch && IsSubscriptionMethod(method) {
+		outcome = "method_not_allowed"
 		return unsupported("subscription methods (eth_subscribe, eth_unsubscribe) are not supported in batch requests")
 	}
 
-	ap, err := auth.NewPayloadFromHttp(method, wsc.httpReq.RemoteAddr, headers, queryArgs)
+	outcome = "unauthorized"
+	ap, err := auth.NewPayloadFromHttp(method, wsc.httpReq.RemoteAddr, headers, queryArgs, wsc.httpReq.URL.Path)
 	if err != nil {
 		return fail(err, &common.TRUE)
 	}
 	user, err := project.AuthenticateConsumer(requestCtx, nq, method, ap)
 	if err != nil {
+		if common.HasErrorCode(err, common.ErrCodeAuthRateLimitRuleExceeded) {
+			outcome = "rate_limited"
+		}
 		return fail(err, wsc.server.serverCfg.IncludeErrorDetails)
 	}
 	nq.SetUser(user)
 	if project.Config.TrustUserIdHeader && nq.User() == nil {
 		nq.SetUserFromTrustedHeader(headers.Get(common.HeaderUserId))
 	}
+	category = method
 
+	outcome = "network_unavailable"
 	nw, err := project.GetNetwork(requestCtx, wsc.networkId)
 	if err != nil {
 		return fail(err, wsc.server.serverCfg.IncludeErrorDetails)
@@ -335,6 +369,7 @@ func (wsc *WsConnection) handleRequest(ctx context.Context, raw []byte, startedA
 	default:
 		resp, err = project.Forward(requestCtx, wsc.networkId, nq)
 	}
+	outcome = clientRequestOutcome(err)
 	if err != nil {
 		if resp != nil {
 			go resp.Release()
@@ -349,11 +384,13 @@ func (wsc *WsConnection) handleRequest(ctx context.Context, raw []byte, startedA
 func (wsc *WsConnection) handleBatch(ctx context.Context, raw []byte, startedAt *time.Time) {
 	var requests []json.RawMessage
 	if err := common.SonicCfg.Unmarshal(raw, &requests); err != nil {
+		wsc.countRequest("n/a", "", "", "invalid_batch")
 		wsc.writeError(int(common.JsonRpcErrorParseException), "parse error")
 		return
 	}
 	// JSON-RPC 2.0 section 6: an empty batch gets a single Invalid Request error.
 	if len(requests) == 0 {
+		wsc.countRequest("n/a", "", "", "invalid_batch")
 		wsc.writeError(int(common.JsonRpcErrorClientSideException), "invalid request: empty batch")
 		return
 	}
@@ -532,6 +569,15 @@ func (wsc *WsConnection) teardown() {
 	wsc.server.activeWsConns.Delete(wsc.id)
 	close(wsc.done)
 
+	initiator, code := "server", wsc.closeCode
+	if pc := wsc.peerEndCode.Load(); pc != 0 {
+		initiator, code = "client", int(pc)
+	}
+	telemetry.CounterHandle(telemetry.MetricWsConnectionsClosedTotal,
+		wsc.project.Config.Id, wsc.networkLabel, strconv.Itoa(code), initiator,
+	).Inc()
+	telemetry.GaugeHandle(telemetry.MetricWsConnectionsActive, wsc.project.Config.Id, wsc.networkLabel).Dec()
+
 	wsc.logger.Info().Str("connId", wsc.id).Int("closeCode", wsc.closeCode).Msg("websocket connection closed")
 }
 
@@ -564,12 +610,8 @@ func (wsc *WsConnection) WriteSubscriptionNotification(clientSubId string, resul
 // the client reconnects knowing it missed data instead of silently
 // diverging.
 func (wsc *WsConnection) NotificationDropped(sub wsclient.Subscription, lossy bool) {
-	network := sub.NetworkID
-	if nw, err := wsc.project.GetNetwork(wsc.ctx, sub.NetworkID); err == nil {
-		network = nw.Label()
-	}
 	telemetry.CounterHandle(telemetry.MetricWebsocketSubscriptionNotificationsDroppedTotal,
-		wsc.project.Config.Id, network, sub.Kind.String(),
+		wsc.project.Config.Id, sub.Labels.Network, sub.Kind.String(), sub.Labels.User, sub.Labels.AgentName,
 	).Inc()
 
 	now := time.Now().UnixNano()
@@ -582,4 +624,17 @@ func (wsc *WsConnection) NotificationDropped(sub wsclient.Subscription, lossy bo
 	if !lossy {
 		wsc.stop(websocket.CloseTryAgainLater, "subscription buffer overflow: notifications were dropped", 0)
 	}
+}
+
+// countRequest increments ws_requests_total for one client request.
+func (wsc *WsConnection) countRequest(category, user, agent, outcome string) {
+	if user == "" {
+		user = "n/a"
+	}
+	if agent == "" {
+		agent = "unknown"
+	}
+	telemetry.CounterHandle(telemetry.MetricWsRequestsTotal,
+		wsc.project.Config.Id, wsc.networkLabel, category, user, agent, outcome,
+	).Inc()
 }

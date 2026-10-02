@@ -106,7 +106,7 @@ func (sm *SubscriptionManager) Subscribe(
 	reqFinality := nq.Finality(ctx)
 	telemetry.CounterHandle(telemetry.MetricNetworkRequestsReceived,
 		project.Config.Id, nw.Label(), method,
-		reqFinality.String(), nq.UserId(), nq.AgentName(),
+		reqFinality.String(), nq.UserId(), nq.AgentName(), nq.Transport(),
 	).Inc()
 
 	jrReq, err := nq.JsonRpcRequest()
@@ -129,7 +129,12 @@ func (sm *SubscriptionManager) Subscribe(
 		return nil, err
 	}
 
-	if err := conn.adapter.AddSubscription(clientSubID, networkId, kind, filterHash, maxSubs); err != nil {
+	if err := conn.adapter.AddSubscription(clientSubID, networkId, kind, filterHash, maxSubs, wsclient.SubscriptionLabels{
+		Project:   project.Config.Id,
+		Network:   nw.Label(),
+		User:      nq.UserId(),
+		AgentName: nq.AgentName(),
+	}); err != nil {
 		sm.releaseFilter(ctx, networkId, kind, filterHash)
 		if errors.Is(err, wsclient.ErrLimitExceeded) {
 			err = common.NewErrSubscriptionLimitExceeded(maxSubs)
@@ -172,7 +177,7 @@ func (sm *SubscriptionManager) Unsubscribe(
 	reqFinality := nq.Finality(ctx)
 	telemetry.CounterHandle(telemetry.MetricNetworkRequestsReceived,
 		project.Config.Id, nw.Label(), method,
-		reqFinality.String(), nq.UserId(), nq.AgentName(),
+		reqFinality.String(), nq.UserId(), nq.AgentName(), nq.Transport(),
 	).Inc()
 
 	jrReq, err := nq.JsonRpcRequest()
@@ -387,6 +392,9 @@ func (sm *SubscriptionManager) recordSuccessMetrics(
 		project.Config.Id, nw.Label(), "proxy", "proxy",
 		method, finality.String(), nq.UserId(),
 	).Observe(time.Since(start).Seconds())
+	telemetry.ObserverHandle(telemetry.MetricClientRequestDuration,
+		project.Config.Id, nw.Label(), nq.UserId(), nq.Transport(), "ok",
+	).Observe(time.Since(start).Seconds())
 }
 
 func (sm *SubscriptionManager) recordFailureMetrics(
@@ -410,6 +418,9 @@ func (sm *SubscriptionManager) recordFailureMetrics(
 	telemetry.ObserverHandle(telemetry.MetricNetworkRequestDuration,
 		project.Config.Id, nw.Label(), "<error>", "<error>",
 		method, finality.String(), nq.UserId(),
+	).Observe(time.Since(start).Seconds())
+	telemetry.ObserverHandle(telemetry.MetricClientRequestDuration,
+		project.Config.Id, nw.Label(), nq.UserId(), nq.Transport(), "error",
 	).Observe(time.Since(start).Seconds())
 }
 

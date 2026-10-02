@@ -129,6 +129,30 @@ func (p *PreparedProject) AuthenticateConsumer(ctx context.Context, req *common.
 
 func (p *PreparedProject) Forward(ctx context.Context, networkId string, nq *common.NormalizedRequest) (*common.NormalizedResponse, error) {
 	start := time.Now()
+	resp, err := p.forward(ctx, networkId, nq)
+	if nw := nq.Network(); nw != nil {
+		telemetry.ObserverHandle(telemetry.MetricClientRequestDuration,
+			p.Config.Id, nw.Label(), nq.UserId(), nq.Transport(), clientRequestOutcome(err),
+		).Observe(time.Since(start).Seconds())
+	}
+	return resp, err
+}
+
+// clientRequestOutcome is the outcome label of client_request_duration_seconds
+// and ws_requests_total for a request that reached the project.
+func clientRequestOutcome(err error) string {
+	switch {
+	case err == nil:
+		return "ok"
+	case common.HasErrorCode(err, common.ErrCodeProjectRateLimitRuleExceeded, common.ErrCodeAuthRateLimitRuleExceeded):
+		return "rate_limited"
+	default:
+		return "error"
+	}
+}
+
+func (p *PreparedProject) forward(ctx context.Context, networkId string, nq *common.NormalizedRequest) (*common.NormalizedResponse, error) {
+	start := time.Now()
 	ctx, span := common.StartDetailSpan(ctx, "Project.Forward")
 	defer span.End()
 
@@ -150,7 +174,7 @@ func (p *PreparedProject) Forward(ctx context.Context, networkId string, nq *com
 	reqFinality := nq.Finality(ctx)
 
 	telemetry.CounterHandle(telemetry.MetricNetworkRequestsReceived,
-		p.Config.Id, network.Label(), method, reqFinality.String(), nq.UserId(), nq.AgentName(),
+		p.Config.Id, network.Label(), method, reqFinality.String(), nq.UserId(), nq.AgentName(), nq.Transport(),
 	).Inc()
 	lg := p.Logger.With().
 		Str("component", "proxy").

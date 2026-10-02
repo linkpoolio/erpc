@@ -95,7 +95,9 @@ func (manager *ClientRegistry) CreateClient(appCtx context.Context, ups common.U
 		creation.once.Do(func() {
 			lg := manager.logger.With().Str("upstreamId", cfg.Id).Logger()
 			switch cfg.Type {
-			case common.UpstreamTypeEvm:
+			case common.UpstreamTypeEvm, common.UpstreamTypeJsonRpc:
+				// jsonrpc architecture reuses the generic HTTP/WS JSON-RPC clients
+				// (passthrough; no EVM chainId/state poller). gRPC BDS remains EVM-only.
 				if parsedUrl.Scheme == "http" || parsedUrl.Scheme == "https" {
 					newClient, err = NewGenericHttpJsonRpcClient(
 						appCtx,
@@ -123,6 +125,8 @@ func (manager *ClientRegistry) CreateClient(appCtx context.Context, ups common.U
 					if err != nil {
 						clientErr = fmt.Errorf("failed to create WebSocket client for upstream %v: %w", cfg.Id, err)
 					}
+				} else if (parsedUrl.Scheme == "grpc" || parsedUrl.Scheme == "grpc+bds") && cfg.Type == common.UpstreamTypeJsonRpc {
+					clientErr = fmt.Errorf("unsupported endpoint scheme: %v for upstream type jsonrpc: %v", parsedUrl.Scheme, cfg.Id)
 				} else if parsedUrl.Scheme == "grpc" || parsedUrl.Scheme == "grpc+bds" {
 					grpcPoolSize := 0
 					if cfg.Grpc != nil {

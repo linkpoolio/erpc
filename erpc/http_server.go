@@ -581,9 +581,9 @@ func (s *HttpServer) createRequestHandler() http.Handler {
 				var ap *auth.AuthPayload
 
 				if project != nil {
-					ap, err = auth.NewPayloadFromHttp(method, r.RemoteAddr, headers, queryArgs)
+					ap, err = auth.NewPayloadFromHttp(method, r.RemoteAddr, headers, queryArgs, r.URL.Path)
 				} else if isAdmin {
-					ap, err = auth.NewPayloadFromHttp(method, r.RemoteAddr, headers, queryArgs)
+					ap, err = auth.NewPayloadFromHttp(method, r.RemoteAddr, headers, queryArgs, r.URL.Path)
 				}
 				if err != nil {
 					responses[index] = processErrorBody(&rlg, &startedAt, nq, err, &common.TRUE)

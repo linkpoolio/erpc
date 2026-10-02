@@ -306,7 +306,7 @@ func (wsc *WsConnection) handleRequest(ctx context.Context, raw []byte, startedA
 		return unsupported("subscription methods (eth_subscribe, eth_unsubscribe) are not supported in batch requests")
 	}
 
-	ap, err := auth.NewPayloadFromHttp(method, wsc.httpReq.RemoteAddr, headers, queryArgs)
+	ap, err := auth.NewPayloadFromHttp(method, wsc.httpReq.RemoteAddr, headers, queryArgs, wsc.httpReq.URL.Path)
 	if err != nil {
 		return fail(err, &common.TRUE)
 	}

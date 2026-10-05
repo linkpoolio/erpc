@@ -2041,21 +2041,12 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 		return nil, err
 	}
 
-	// For a specific block above every routed head, the fallbacks whose head
-	// already has it (e.g. their newHeads led) join the routed list.
-	var bn int64
-	var tipLeaders []common.Upstream
+	// For a specific block, try upstreams whose poller already has it first.
+	// Ordering hints only: every upstream stays eligible.
 	if n.Architecture() == common.ArchitectureEvm {
-		bn = requestBlockNumber(ctx, req)
-	}
-	if bn > 0 && n.cfg.Failover.Enabled() {
-		if fe := n.getFailsafeExecutor(ctx, req); fe != nil && !fe.HasConsensus() {
-			if tipLeaders = n.tipLeaderFallbacks(ctx, req, method, bn, upsList); len(tipLeaders) > 0 {
-				upsList = append(slices.Clone(upsList), tipLeaders...)
-				telemetry.MetricNetworkTipLeaderRouteTotal.WithLabelValues(
-					n.projectId, n.Label(), method,
-				).Inc()
-			}
+		if bn := requestBlockNumber(ctx, req); bn > 0 {
+			upsList = partitionUpstreamsByLatestBlock(upsList, bn)
+			upsList = preferTipLeaderForNearTipGetBlock(upsList, method, bn)
 		}
 	}
 
@@ -2063,13 +2054,6 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 	// keeping score order within each tier.
 	if n.cfg.Failover.Enabled() {
 		upsList = tierUpstreamsByGroup(upsList)
-	}
-
-	// For a specific block, try upstreams whose poller already has it first,
-	// whatever their tier. Ordering hints only: every upstream stays eligible.
-	if bn > 0 {
-		upsList = partitionUpstreamsByLatestBlock(upsList, bn)
-		upsList = preferTipLeaderForNearTipGetBlock(upsList, method, bn)
 	}
 
 	// Architecture-specific pruning of the upstream list. Currently only SVM
@@ -2169,16 +2153,13 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 	// Future-block short-circuit: a concrete block number beyond every eligible
 	// upstream's head cannot be served yet — return the truthful null instead of
 	// dispatching + hedging across upstreams that will all return empty. Runs
-	// before rate limiting so a non-dispatched request consumes no permit. A
-	// routed tip leader has the block, so it is not in the future.
-	if len(tipLeaders) == 0 {
-		if resp, ok := n.tryShortCircuitFutureBlock(ctx, req, method); ok {
-			forwardSpan.SetAttributes(attribute.Bool("future_block.short_circuit", true))
-			if mlx != nil {
-				mlx.Close(ctx, resp, nil)
-			}
-			return resp, nil
+	// before rate limiting so a non-dispatched request consumes no permit.
+	if resp, ok := n.tryShortCircuitFutureBlock(ctx, req, method); ok {
+		forwardSpan.SetAttributes(attribute.Bool("future_block.short_circuit", true))
+		if mlx != nil {
+			mlx.Close(ctx, resp, nil)
 		}
+		return resp, nil
 	}
 
 	// 3) Check if we should handle this method on this network
@@ -3707,52 +3688,6 @@ func preferTipLeaderForNearTipGetBlock(ups []common.Upstream, method string, bn 
 	out = append(out, ups[:leader]...)
 	out = append(out, ups[leader+1:]...)
 	return out
-}
-
-// tipLeaderFallbacks returns the fallback-escape upstreams outside routed,
-// allowed by the request's upstream selector, whose polled head has reached bn
-// and whose enforced availability bounds admit it, when every routed
-// upstream's head is known and below bn. Nil otherwise.
-func (n *Network) tipLeaderFallbacks(ctx context.Context, req *common.NormalizedRequest, method string, bn int64, routed []common.Upstream) []common.Upstream {
-	routedIds := make(map[string]struct{}, len(routed))
-	for _, u := range routed {
-		if lb := upstreamLatestBlock(u); lb <= 0 || lb >= bn {
-			return nil
-		}
-		routedIds[u.Id()] = struct{}{}
-	}
-	selector := ""
-	if d := req.Directives(); d != nil {
-		selector = d.UseUpstream
-	}
-	var out []common.Upstream
-	for _, fb := range n.upstreamsRegistry.GetFallbackEscapeUpstreams(ctx, n.networkId, method) {
-		if _, ok := routedIds[fb.Id()]; ok || upstreamLatestBlock(fb) < bn || !n.availabilityAdmits(fb, method, bn) {
-			continue
-		}
-		if selector != "" {
-			if match, err := common.UpstreamMatchesSelector(selector, fb); err != nil || !match {
-				continue
-			}
-		}
-		out = append(out, fb)
-	}
-	return out
-}
-
-// availabilityAdmits reports whether u's block-availability bounds, where
-// enforced for method, admit bn. The same bounds checkUpstreamBlockAvailability
-// gates on, without its metrics.
-func (n *Network) availabilityAdmits(u common.Upstream, method string, bn int64) bool {
-	if methodHasDedicatedRangeAvailabilityHook(method) || n.blockAvailabilityExplicitlyDisabled(method) {
-		return true
-	}
-	eu, ok := u.(common.EvmUpstream)
-	if !ok {
-		return true
-	}
-	lo, hi := eu.EvmBlockAvailabilityBounds()
-	return (lo == math.MinInt64 || bn >= lo) && (hi == math.MaxInt64 || bn <= hi)
 }
 
 // upstreamLatestBlock is u's polled head, or 0 when unknown.

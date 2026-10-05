@@ -147,8 +147,6 @@ The escape:
 - fires at most once per request, and never for consensus requests;
 - is counted in `erpc_network_fallback_escape_total{project,network,category}` — expect zero in steady state.
 
-With `onDefaultsExhausted` on, a request pinned to a block above every routed upstream's known head also routes to the `tier:fallback` upstreams whose head has already reached that block (for example because their `newHeads` subscription announced it first). For any block-pinned request, upstreams whose head has the block are tried before those whose head is below it, whatever their tier. This is ordering, not an escape: the escape above still fires once, to the fallbacks not yet tried, if every upstream fails. Fallbacks are added only when every routed upstream's head is known and below the block, and never for consensus requests; each addition is counted in `erpc_network_tip_leader_route_total{project,network,category}`.
-
 The validation report warns when `onDefaultsExhausted` is enabled but no upstream is tagged `tier:fallback`.
 
 ## Agent reference

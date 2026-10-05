@@ -276,26 +276,11 @@ func TestFailover_EscapeHatch(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		// Primaries at 1002 fail eth_call with a retryable error; the
-		// fallbacks at 1002 serve it. (Primaries below the block would take
-		// tip-leader routing instead, see TestFailover_TipLeaderRouting.)
+		// Primaries at 1000 skip block 1002; the fallbacks at 1002 serve it.
 		network, _, _ := setupFailoverFixture(t, ctx, failoverFixtureOpts{
-			primaryLatest:  "0x3ea", // 1002
+			primaryLatest:  "0x3e8", // 1000
 			fallbackLatest: "0x3ea", // 1002
 			enableFailover: true,
-			mocks: func() {
-				for _, host := range []string{"rpc1.localhost", "rpc2.localhost"} {
-					host := host
-					gock.New("http://" + host).
-						Post("").
-						Persist().
-						Filter(func(r *http.Request) bool {
-							return r.URL.Host == host && strings.Contains(util.SafeReadBody(r), "eth_call")
-						}).
-						Reply(200).
-						JSON([]byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"internal error"}}`))
-				}
-			},
 		})
 
 		counter := telemetry.MetricNetworkFallbackEscapeTotal.WithLabelValues("main", "evm:999", "eth_call")

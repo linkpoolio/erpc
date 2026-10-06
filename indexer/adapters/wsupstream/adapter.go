@@ -61,7 +61,11 @@ type Adapter struct {
 	// resubCancel cancels the resubscribe loop of connection resubEpoch.
 	resubCancel context.CancelFunc
 	resubEpoch  uint64
-	heads       upstreamSub
+	// resubDone is set once that loop has established everything;
+	// resubAgain asks a running loop for another pass before it finishes.
+	resubDone  bool
+	resubAgain bool
+	heads      upstreamSub
 	// filters (by filterKey) survive disconnects to be resubscribed.
 	filters map[string]*filterSub
 }
@@ -143,6 +147,7 @@ func (a *Adapter) Start(_ context.Context, nw indexer.NetworkHandle, sink indexe
 		if a.resubCancel != nil {
 			a.resubCancel()
 		}
+		a.resubDone = false
 		a.heads.id = ""
 		for _, sub := range a.filters {
 			sub.id = ""
@@ -160,7 +165,11 @@ func (a *Adapter) startResubscribe() {
 	epoch := a.wsClient.Epoch()
 	a.subsMu.Lock()
 	defer a.subsMu.Unlock()
-	if epoch == 0 || epoch == a.resubEpoch {
+	if epoch == 0 {
+		return
+	}
+	if epoch == a.resubEpoch && !a.resubDone {
+		a.resubAgain = true
 		return
 	}
 	if a.resubCancel != nil {
@@ -168,12 +177,13 @@ func (a *Adapter) startResubscribe() {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	a.resubCancel, a.resubEpoch = cancel, epoch
+	a.resubDone, a.resubAgain = false, false
 	go a.resubscribeWithRetry(ctx)
 }
 
-// EnsureFilter subscribes a filter; a no-op if it is already subscribed. A
-// filter this call added is dropped again on failure, so it isn't
-// resubscribed on every reconnect.
+// EnsureFilter subscribes a filter; a no-op if it is already subscribed. On
+// failure the filter is kept and retried in the background, like every
+// other subscription of this upstream, until RemoveFilter.
 func (a *Adapter) EnsureFilter(ctx context.Context, subType, paramsHash string, params []interface{}) error {
 	key := filterKey(subType, paramsHash)
 
@@ -186,17 +196,21 @@ func (a *Adapter) EnsureFilter(ctx context.Context, subType, paramsHash string, 
 	a.subsMu.Unlock()
 
 	sub.mu.Lock()
-	defer sub.mu.Unlock()
 	err := a.subscribeFilterLocked(ctx, sub)
-	if err != nil && !exists {
-		a.subsMu.Lock()
-		if a.filters[key] == sub {
-			delete(a.filters, key)
-		}
-		a.subsMu.Unlock()
-		a.drop(ctx, &sub.upstreamSub)
+	sub.mu.Unlock()
+	if err != nil {
+		a.startResubscribe()
 	}
 	return err
+}
+
+// FilterLive reports whether the filter's subscription is live on the
+// current connection.
+func (a *Adapter) FilterLive(subType, paramsHash string) bool {
+	a.subsMu.Lock()
+	defer a.subsMu.Unlock()
+	sub, ok := a.filters[filterKey(subType, paramsHash)]
+	return ok && sub.id != ""
 }
 
 // RemoveFilter unsubscribes a filter and stops resubscribing it.
@@ -257,6 +271,16 @@ func (a *Adapter) resubscribeWithRetry(ctx context.Context) {
 			}
 		}
 		if done {
+			a.subsMu.Lock()
+			again := a.resubAgain && ctx.Err() == nil
+			a.resubAgain = false
+			if !again && ctx.Err() == nil {
+				a.resubDone = true
+			}
+			a.subsMu.Unlock()
+			if again {
+				continue
+			}
 			a.logger.Info().Msg("all upstream subscriptions (re)established")
 			return
 		}

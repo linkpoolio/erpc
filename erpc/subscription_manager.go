@@ -13,7 +13,6 @@ import (
 	"github.com/erpc/erpc/indexer/adapters/wsclient"
 	"github.com/erpc/erpc/indexer/adapters/wsupstream"
 	"github.com/erpc/erpc/telemetry"
-	"github.com/erpc/erpc/upstream"
 	"github.com/rs/zerolog"
 )
 
@@ -287,36 +286,48 @@ func (sm *SubscriptionManager) bootstrapNetwork(ctx context.Context, nw *Network
 	return nil
 }
 
-// subIngressSelector picks the ingresses of a filter subscribe the way the
-// HTTP path picks upstreams: by score for eth_subscribe, skipping upstreams
-// whose circuit breaker is open. Fallback-tier upstreams form the fallback
-// tier only when the network's failover is enabled, as over HTTP.
+// subIngressSelector picks the ingresses that carry a filter subscription.
+// With failover on, the defaults are the upstreams outside the fallback tier
+// that the selection policy routes to, and the fallback-tier upstreams stand
+// in for them (see indexer.IngressSelector): the same rule newHeads follows
+// (see networkHandle.deliversHeadsFrom). Without failover every WebSocket
+// upstream is a default.
 type subIngressSelector struct {
 	nw *Network
 }
 
 func (s *subIngressSelector) Select(_, _ string, _ []interface{}) (defaults, fallbacks []string) {
-	ups, err := s.nw.upstreamsRegistry.GetSortedUpstreams(context.Background(), s.nw.networkId, MethodEthSubscribe)
-	if err != nil {
-		return nil, nil
-	}
-
+	ctx := context.Background()
 	failoverOn := s.nw.cfg != nil && s.nw.cfg.Failover.Enabled()
-	for _, u := range ups {
-		up, ok := u.(*upstream.Upstream)
-		if !ok {
-			continue
+	eligible := make(map[string]struct{})
+	if failoverOn {
+		for _, u := range s.nw.tipCandidateUpstreams(ctx, "*") {
+			eligible[u.Id()] = struct{}{}
 		}
-		cfg := up.Config()
-		if cfg == nil || !upstream.IsWsEndpoint(cfg.Endpoint) || up.IsDown(MethodEthSubscribe) {
-			continue
-		}
+	}
+	var ws []common.Upstream
+	for _, up := range s.nw.upstreamsRegistry.GetWsUpstreams(ctx, s.nw.networkId) {
+		ws = append(ws, up)
+	}
+	return tierWsIngresses(ws, eligible, failoverOn)
+}
+
+// tierWsIngresses names the ingresses of the WebSocket upstreams ws: with
+// failover on, the eligible ones outside the fallback tier are the defaults
+// and the fallback tier the fallbacks; otherwise all are defaults.
+func tierWsIngresses(ws []common.Upstream, eligible map[string]struct{}, failoverOn bool) (defaults, fallbacks []string) {
+	for _, up := range ws {
 		name := "ws:" + up.Id()
-		if failoverOn && cfg.HasTag(common.TagTierFallback) {
+		switch {
+		case !failoverOn:
+			defaults = append(defaults, name)
+		case isFallbackTier(up):
 			fallbacks = append(fallbacks, name)
-			continue
+		default:
+			if _, ok := eligible[up.Id()]; ok {
+				defaults = append(defaults, name)
+			}
 		}
-		defaults = append(defaults, name)
 	}
 	return defaults, fallbacks
 }

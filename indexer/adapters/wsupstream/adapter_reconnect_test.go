@@ -353,7 +353,8 @@ func TestAdapterRemoveFilterDuringSubscribe(t *testing.T) {
 }
 
 // TestAdapterEnsureFilterWhileDisconnected: EnsureFilter must report the
-// failure (so the indexer tries other ingresses) and not keep the filter.
+// failure (so the indexer tries other ingresses) and keep the filter, to
+// subscribe it once connected.
 func TestAdapterEnsureFilterWhileDisconnected(t *testing.T) {
 	server := newNotifyServer(t)
 	u := server.wsURL(t)
@@ -361,9 +362,42 @@ func TestAdapterEnsureFilterWhileDisconnected(t *testing.T) {
 	a, _ := newTestAdapter(t, u)
 
 	params := logsParams("0xabc")
-	err := a.EnsureFilter(context.Background(), indexer.SubTypeLogs, indexer.BuildParamsKey(params), params)
+	hash := indexer.BuildParamsKey(params)
+	err := a.EnsureFilter(context.Background(), indexer.SubTypeLogs, hash, params)
 	require.ErrorIs(t, err, errNotConnected)
+	assert.False(t, a.FilterLive(indexer.SubTypeLogs, hash))
 	a.subsMu.Lock()
-	assert.Empty(t, a.filters)
+	assert.Len(t, a.filters, 1)
 	a.subsMu.Unlock()
+}
+
+// TestAdapterRetriesFailedEnsureFilter: a filter whose subscribe failed on
+// a live connection is retried in the background until it is live, and
+// RemoveFilter ends that.
+func TestAdapterRetriesFailedEnsureFilter(t *testing.T) {
+	compressResubRetry(t)
+	server := newNotifyServer(t)
+	a, sink := newTestAdapter(t, server.wsURL(t))
+	<-server.newConn
+	require.NoError(t, a.Start(context.Background(), fakeNetworkHandle{}, sink))
+	require.Eventually(t, subscribedHeads(a), 3*time.Second, 10*time.Millisecond)
+
+	var failuresLeft atomic.Int64
+	failuresLeft.Store(2)
+	send := a.forward
+	a.forward = func(ctx context.Context, nq *common.NormalizedRequest, bypass bool) (*common.NormalizedResponse, error) {
+		if m, _ := nq.Method(); m == methodEthSubscribe && failuresLeft.Add(-1) >= 0 {
+			return nil, errors.New("circuit breaker is open on upstream-level")
+		}
+		return send(ctx, nq, bypass)
+	}
+
+	params := logsParams("0xabc")
+	hash := indexer.BuildParamsKey(params)
+	require.Error(t, a.EnsureFilter(context.Background(), indexer.SubTypeLogs, hash, params))
+	require.Eventually(t, func() bool { return a.FilterLive(indexer.SubTypeLogs, hash) },
+		3*time.Second, 10*time.Millisecond, "the failed filter must be retried until live")
+
+	require.NoError(t, a.RemoveFilter(context.Background(), indexer.SubTypeLogs, hash))
+	assert.False(t, a.FilterLive(indexer.SubTypeLogs, hash))
 }

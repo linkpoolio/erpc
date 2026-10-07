@@ -2401,12 +2401,16 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 				//    emptyResultAccept and consensus is not required,
 				//    because failsafe would accept the empty result anyway
 				//    so trying more upstreams just wastes time on slow ones.
+				//  - Emptyish success also qualifies for a block above every
+				//    upstream's head: no other upstream can have it yet, so
+				//    sweeping (and escaping to fallbacks) only burns quota.
 				//  - Otherwise emptyish results continue to the next upstream.
 				if err == nil && r != nil && !r.IsObjectNull() {
 					emptyish := r.IsResultEmptyish()
 					acceptEmpty := !emptyish ||
 						(!failsafeExecutor.HasConsensus() &&
-							slices.Contains(failsafeExecutor.EmptyResultAccept(), method))
+							(slices.Contains(failsafeExecutor.EmptyResultAccept(), method) ||
+								evm.EmptyResultBeyondConfidence(loopCtx, effectiveReq)))
 					if acceptEmpty {
 						st := effectiveReq.ExecState()
 						st.MarkUpstreamAttemptWon(r.UpstreamId())

@@ -681,7 +681,10 @@ func (e *networkExecutor) runHedge(
 		// here so the hedge keeps racing for a non-empty sibling; if all
 		// legs finish empty the failsafe hedge falls through to the
 		// last response, matching the pre-existing terminal behaviour.
-		if r.IsResultEmptyish(ctx) {
+		//
+		// A block above every upstream's head is empty everywhere, so its
+		// empty result wins like an accepted one.
+		if r.IsResultEmptyish(ctx) && !evm.EmptyResultBeyondConfidence(ctx, req) {
 			method, _ := req.Method()
 			accepted := false
 			for _, m := range e.emptyResultAccept {

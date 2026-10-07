@@ -12,8 +12,9 @@ import (
 type NetworkArchitecture string
 
 const (
-	ArchitectureEvm NetworkArchitecture = "evm"
-	ArchitectureSvm NetworkArchitecture = "svm"
+	ArchitectureEvm     NetworkArchitecture = "evm"
+	ArchitectureSvm     NetworkArchitecture = "svm"
+	ArchitectureJsonRpc NetworkArchitecture = "jsonrpc"
 )
 
 type Network interface {
@@ -87,7 +88,7 @@ func EvmLeaderUpstream(n Network, ctx context.Context) Upstream {
 
 func IsValidArchitecture(architecture string) bool {
 	switch NetworkArchitecture(architecture) {
-	case ArchitectureEvm, ArchitectureSvm:
+	case ArchitectureEvm, ArchitectureSvm, ArchitectureJsonRpc:
 		return true
 	}
 	return false
@@ -142,6 +143,10 @@ func IsValidNetwork(network string) bool {
 			return true
 		}
 		return isIdentifier(chain) && isIdentifier(cluster)
+	}
+	if strings.HasPrefix(network, "jsonrpc:") {
+		id := strings.TrimPrefix(network, "jsonrpc:")
+		return id != "" && !strings.Contains(id, ":")
 	}
 
 	return false

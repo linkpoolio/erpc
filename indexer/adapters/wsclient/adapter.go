@@ -8,6 +8,8 @@ import (
 	"sync"
 
 	"github.com/erpc/erpc/indexer"
+	"github.com/erpc/erpc/telemetry"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog"
 )
 
@@ -56,11 +58,35 @@ type routeKey struct {
 	filterHash string
 }
 
+// SubscriptionLabels are frozen at eth_subscribe time and label the
+// per-client metrics of a subscription (delivered, dropped, active).
+type SubscriptionLabels struct {
+	Project string
+	// Network is the metrics network label (alias if configured, else id).
+	Network   string
+	User      string
+	AgentName string
+}
+
+func (l SubscriptionLabels) withDefaults() SubscriptionLabels {
+	if l.Project == "" {
+		l.Project = "n/a"
+	}
+	if l.User == "" {
+		l.User = "n/a"
+	}
+	if l.AgentName == "" {
+		l.AgentName = "unknown"
+	}
+	return l
+}
+
 type clientSub struct {
 	id         string
 	kind       indexer.EventKind
 	networkID  string
 	filterHash string // "" for newHeads
+	labels     SubscriptionLabels
 
 	notify chan json.RawMessage
 	done   chan struct{} // closed by whoever removes the sub from Adapter.subs
@@ -111,12 +137,17 @@ func (a *Adapter) Deliver(ev indexer.IndexedEvent) {
 // AddSubscription registers a subscription and starts its writer. It fails
 // with ErrLimitExceeded when the connection already holds maxSubs, and with
 // ErrClosed once the adapter was drained.
-func (a *Adapter) AddSubscription(clientSubID, networkID string, kind indexer.EventKind, filterHash string, maxSubs int) error {
+func (a *Adapter) AddSubscription(clientSubID, networkID string, kind indexer.EventKind, filterHash string, maxSubs int, labels SubscriptionLabels) error {
+	labels = labels.withDefaults()
+	if labels.Network == "" {
+		labels.Network = networkID
+	}
 	sub := &clientSub{
 		id:         clientSubID,
 		kind:       kind,
 		networkID:  networkID,
 		filterHash: filterHash,
+		labels:     labels,
 		notify:     make(chan json.RawMessage, a.bufferSize),
 		done:       make(chan struct{}),
 	}
@@ -140,6 +171,7 @@ func (a *Adapter) AddSubscription(clientSubID, networkID string, kind indexer.Ev
 	set[clientSubID] = struct{}{}
 	a.mu.Unlock()
 
+	sub.activeGauge().Inc()
 	go a.runWriter(sub)
 	return nil
 }
@@ -164,6 +196,7 @@ func (a *Adapter) RemoveSubscription(clientSubID string) (kind indexer.EventKind
 	a.mu.Unlock()
 
 	close(sub.done)
+	sub.activeGauge().Dec()
 	return sub.kind, sub.networkID, sub.filterHash, true
 }
 
@@ -181,6 +214,7 @@ func (a *Adapter) Drain() []Subscription {
 	out := make([]Subscription, 0, len(subs))
 	for _, sub := range subs {
 		close(sub.done)
+		sub.activeGauge().Dec()
 		out = append(out, sub.snapshot())
 	}
 	return out
@@ -192,7 +226,13 @@ func (sub *clientSub) snapshot() Subscription {
 		Kind:        sub.kind,
 		NetworkID:   sub.networkID,
 		FilterHash:  sub.filterHash,
+		Labels:      sub.labels,
 	}
+}
+
+func (sub *clientSub) activeGauge() prometheus.Gauge {
+	return telemetry.GaugeHandle(telemetry.MetricWsSubscriptionsActive,
+		sub.labels.Project, sub.labels.Network, sub.kind.String(), sub.labels.User)
 }
 
 // Subscription describes one subscription.
@@ -201,6 +241,7 @@ type Subscription struct {
 	Kind        indexer.EventKind
 	NetworkID   string
 	FilterHash  string
+	Labels      SubscriptionLabels
 }
 
 // Count returns the number of active subscriptions.
@@ -219,7 +260,12 @@ func (a *Adapter) runWriter(sub *clientSub) {
 			if err := a.writer.WriteSubscriptionNotification(sub.id, payload); err != nil {
 				a.logger.Debug().Err(err).Str("clientSubId", sub.id).
 					Msg("failed to write subscription notification")
+				continue
 			}
+			telemetry.CounterHandle(telemetry.MetricWsSubscriptionEventsTotal,
+				sub.labels.Project, sub.labels.Network, sub.kind.String(),
+				sub.labels.User, sub.labels.AgentName,
+			).Inc()
 		}
 	}
 }

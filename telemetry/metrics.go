@@ -123,11 +123,51 @@ var (
 		Help:      "Whether the upstream WebSocket connection is currently established (1) or down/wedged (0).",
 	}, []string{"project", "vendor", "network", "upstream"})
 
-	MetricWebsocketSubscriptionNotificationsDroppedTotal = DefineCounter(prometheus.CounterOpts{
+	MetricWebsocketSubscriptionNotificationsDroppedTotal = DefineLabeledCounter(prometheus.CounterOpts{
 		Namespace: "erpc",
 		Name:      "websocket_subscription_notifications_dropped_total",
 		Help:      "Subscription notifications dropped because a client's per-subscription buffer was full. For logs the client connection is closed with 1013.",
-	}, []string{"project", "network", "kind"})
+	}, []string{"project", "network", "kind", "user", "agent_name"})
+
+	// MetricWsSubscriptionEventsTotal counts subscription notifications
+	// (newHeads / logs / pending txs) written to a client. These are server
+	// pushes, not client calls: client JSON-RPC calls over WebSocket are in
+	// network_request_received_total{transport="ws"} and ws_requests_total.
+	MetricWsSubscriptionEventsTotal = DefineLabeledCounter(prometheus.CounterOpts{
+		Namespace: "erpc",
+		Name:      "ws_subscription_events_total",
+		Help:      "Subscription notifications successfully written to a client WebSocket.",
+	}, []string{"project", "network", "kind", "user", "agent_name"})
+
+	// MetricWsRequestsTotal counts every JSON-RPC request a client sends over
+	// WebSocket (batch items individually), including those rejected before
+	// they reach the network (invalid, method not allowed, unauthorized, rate
+	// limited) and therefore absent from network_request_received_total.
+	// category is "n/a" until the request is authenticated, so unauthenticated
+	// clients cannot mint series with arbitrary method names.
+	MetricWsRequestsTotal = DefineLabeledCounter(prometheus.CounterOpts{
+		Namespace: "erpc",
+		Name:      "ws_requests_total",
+		Help:      "JSON-RPC requests received over client WebSocket connections, by outcome (ok, error, invalid, method_not_allowed, unauthorized, rate_limited, network_unavailable, invalid_batch).",
+	}, []string{"project", "network", "category", "user", "agent_name", "outcome"})
+
+	MetricWsConnectionsActive = DefineGauge(prometheus.GaugeOpts{
+		Namespace: "erpc",
+		Name:      "ws_connections_active",
+		Help:      "Client WebSocket connections currently open.",
+	}, []string{"project", "network"})
+
+	MetricWsConnectionsClosedTotal = DefineCounter(prometheus.CounterOpts{
+		Namespace: "erpc",
+		Name:      "ws_connections_closed_total",
+		Help:      "Client WebSocket connections closed, by close code and whether the peer initiated the close.",
+	}, []string{"project", "network", "close_code", "initiator"})
+
+	MetricWsSubscriptionsActive = DefineGauge(prometheus.GaugeOpts{
+		Namespace: "erpc",
+		Name:      "ws_subscriptions_active",
+		Help:      "Client subscriptions currently active.",
+	}, []string{"project", "network", "kind", "user"})
 
 	// MetricNetworkServedTipBlockNumber is the block number the network actually
 	// advertises/serves as the tip for a block tag (axis=latest|finalized): the
@@ -645,7 +685,7 @@ var (
 		Namespace: "erpc",
 		Name:      "network_request_received_total",
 		Help:      "Total number of requests received for a network.",
-	}, []string{"project", "network", "category", "finality", "user", "agent_name"})
+	}, []string{"project", "network", "category", "finality", "user", "agent_name", "transport"})
 
 	MetricNetworkMultiplexedRequests = DefineLabeledCounter(prometheus.CounterOpts{
 		Namespace: "erpc",
@@ -1069,6 +1109,16 @@ var (
 		Name:      "network_request_duration_seconds",
 		Help:      "Duration of requests for a network.",
 	}, []string{"project", "network", "vendor", "upstream", "category", "finality", "user"})
+
+	// MetricClientRequestDuration is end-to-end request duration per client
+	// (user) without the category/vendor/upstream dimensions, so per-user
+	// latency stays affordable where network_request_duration_seconds has its
+	// user label dropped.
+	MetricClientRequestDuration = DefineLabeledHistogram(prometheus.HistogramOpts{
+		Namespace: "erpc",
+		Name:      "client_request_duration_seconds",
+		Help:      "End-to-end duration of client requests by network, user and transport.",
+	}, []string{"project", "network", "user", "transport", "outcome"})
 
 	// Per-request integrity latency overhead — the time a request waited on
 	// integrity data-checks plus aux force-fetches (canonical header/receipts),

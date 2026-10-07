@@ -24,6 +24,10 @@ func SvmNetworkId(chain, cluster string) string {
 	return "svm:" + chain + ":" + cluster
 }
 
+func JsonRpcNetworkId(id string) string {
+	return fmt.Sprintf("jsonrpc:%s", id)
+}
+
 var validIdentifierRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 func IsValidIdentifier(s string) bool {
@@ -62,6 +66,10 @@ func IsValidNetworkId(s string) bool {
 			return false
 		}
 		return true
+	}
+	if strings.HasPrefix(s, "jsonrpc:") {
+		id := s[len("jsonrpc:"):]
+		return id != "" && IsValidIdentifier(id)
 	}
 	return false
 }

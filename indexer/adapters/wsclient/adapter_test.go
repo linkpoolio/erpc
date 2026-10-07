@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/erpc/erpc/indexer"
+	"github.com/erpc/erpc/telemetry"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -58,13 +60,13 @@ func deliver(a *Adapter, kind indexer.EventKind, filterHash string, n int) {
 
 func TestAdapter_AddAfterDrainIsRefused(t *testing.T) {
 	a := newTestAdapter(&fakeWriter{}, 8)
-	require.NoError(t, a.AddSubscription("s1", "evm:1", indexer.KindLog, "f", 10))
+	require.NoError(t, a.AddSubscription("s1", "evm:1", indexer.KindLog, "f", 10, SubscriptionLabels{}))
 
 	removed := a.Drain()
 	require.Len(t, removed, 1)
 	assert.Equal(t, "s1", removed[0].ClientSubID)
 
-	assert.ErrorIs(t, a.AddSubscription("s2", "evm:1", indexer.KindLog, "f", 10), ErrClosed)
+	assert.ErrorIs(t, a.AddSubscription("s2", "evm:1", indexer.KindLog, "f", 10, SubscriptionLabels{}), ErrClosed)
 	assert.Equal(t, 0, a.Count())
 }
 
@@ -72,8 +74,8 @@ func TestAdapter_AddAfterDrainIsRefused(t *testing.T) {
 // its filter reference is released exactly once.
 func TestAdapter_RemoveAndDrainAreExclusive(t *testing.T) {
 	a := newTestAdapter(&fakeWriter{}, 8)
-	require.NoError(t, a.AddSubscription("s1", "evm:1", indexer.KindLog, "f", 10))
-	require.NoError(t, a.AddSubscription("s2", "evm:1", indexer.KindLog, "f", 10))
+	require.NoError(t, a.AddSubscription("s1", "evm:1", indexer.KindLog, "f", 10, SubscriptionLabels{}))
+	require.NoError(t, a.AddSubscription("s2", "evm:1", indexer.KindLog, "f", 10, SubscriptionLabels{}))
 
 	_, _, _, existed := a.RemoveSubscription("s1")
 	require.True(t, existed)
@@ -93,7 +95,7 @@ func TestAdapter_SubscriptionLimitIsAtomic(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			if a.AddSubscription(fmt.Sprintf("s%d", i), "evm:1", indexer.KindNewHead, "", 10) == nil {
+			if a.AddSubscription(fmt.Sprintf("s%d", i), "evm:1", indexer.KindNewHead, "", 10, SubscriptionLabels{}) == nil {
 				ok.Add(1)
 			}
 		}(i)
@@ -108,7 +110,7 @@ func TestAdapter_SubscriptionLimitIsAtomic(t *testing.T) {
 func TestAdapter_BurstWithinBufferIsDelivered(t *testing.T) {
 	w := &fakeWriter{}
 	a := newTestAdapter(w, 256)
-	require.NoError(t, a.AddSubscription("s1", "evm:1", indexer.KindLog, "f", 10))
+	require.NoError(t, a.AddSubscription("s1", "evm:1", indexer.KindLog, "f", 10, SubscriptionLabels{}))
 	defer a.Drain()
 
 	deliver(a, indexer.KindLog, "f", 200)
@@ -125,7 +127,7 @@ func TestAdapter_BurstWithinBufferIsDelivered(t *testing.T) {
 func TestAdapter_NewHeadsOverflowDropsOldest(t *testing.T) {
 	w := &fakeWriter{block: make(chan struct{})}
 	a := newTestAdapter(w, 2)
-	require.NoError(t, a.AddSubscription("s1", "evm:1", indexer.KindNewHead, "", 10))
+	require.NoError(t, a.AddSubscription("s1", "evm:1", indexer.KindNewHead, "", 10, SubscriptionLabels{}))
 	defer a.Drain()
 
 	// The writer takes one event and blocks on it; two more fill the buffer.
@@ -148,7 +150,7 @@ func TestAdapter_NewHeadsOverflowDropsOldest(t *testing.T) {
 func TestAdapter_LogsOverflowIsReportedNotEvicted(t *testing.T) {
 	w := &fakeWriter{block: make(chan struct{})}
 	a := newTestAdapter(w, 2)
-	require.NoError(t, a.AddSubscription("s1", "evm:1", indexer.KindLog, "f", 10))
+	require.NoError(t, a.AddSubscription("s1", "evm:1", indexer.KindLog, "f", 10, SubscriptionLabels{}))
 	defer a.Drain()
 
 	deliver(a, indexer.KindLog, "f", 1)
@@ -163,4 +165,34 @@ func TestAdapter_LogsOverflowIsReportedNotEvicted(t *testing.T) {
 	written, dropped := w.snapshot()
 	assert.Equal(t, []string{"0", "0", "1"}, written, "queued logs must be kept in order")
 	assert.Equal(t, []bool{false, false, false}, dropped)
+}
+
+// Delivered notifications and the active-subscription gauge are labeled
+// with the labels frozen at subscribe time.
+func TestAdapter_PerClientMetrics(t *testing.T) {
+	labels := SubscriptionLabels{Project: "p-metrics", Network: "eth-mainnet", User: "cl-no-99", AgentName: "go"}
+	delivered := func() float64 {
+		return testutil.ToFloat64(telemetry.CounterHandle(telemetry.MetricWsSubscriptionEventsTotal,
+			"p-metrics", "eth-mainnet", indexer.KindNewHead.String(), "cl-no-99", "go"))
+	}
+	active := func() float64 {
+		return testutil.ToFloat64(telemetry.GaugeHandle(telemetry.MetricWsSubscriptionsActive,
+			"p-metrics", "eth-mainnet", indexer.KindNewHead.String(), "cl-no-99"))
+	}
+
+	deliveredBefore := delivered()
+	w := &fakeWriter{}
+	a := newTestAdapter(w, 8)
+	require.NoError(t, a.AddSubscription("s1", "evm:1", indexer.KindNewHead, "", 10, labels))
+	require.NoError(t, a.AddSubscription("s2", "evm:1", indexer.KindNewHead, "", 10, labels))
+	assert.Equal(t, float64(2), active())
+
+	deliver(a, indexer.KindNewHead, "", 3)
+	require.Eventually(t, func() bool { return delivered() == deliveredBefore+6 }, 2*time.Second, 10*time.Millisecond)
+
+	_, _, _, existed := a.RemoveSubscription("s1")
+	require.True(t, existed)
+	assert.Equal(t, float64(1), active())
+	a.Drain()
+	assert.Equal(t, float64(0), active())
 }

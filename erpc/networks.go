@@ -889,10 +889,12 @@ func (n *Network) evmHeadReference(ctx context.Context, useFinalized bool) serve
 // them only burns latency and load before they each return empty — returning the
 // null here skips that fan-out entirely.
 //
-// Safety: it compares against the highest effective latest head across every
-// upstream of the network, static caps included, and fails open when any of
-// them has no known head (see futureBlockCeiling), so it never nulls out a
-// block any upstream actually serves. It runs when the network sets
+// Safety: it compares against the highest last-observed effective latest head
+// across every upstream of the network, static caps included, and fails open
+// when any of them has no observed head (see futureBlockCeiling), so it never
+// nulls out a block at or below a head an upstream has reported. A block an
+// upstream produced after its last observed head can still get null until the
+// poller or a head subscription reports it. It runs when the network sets
 // evm.shortCircuitFutureBlocks or enables served-tip for the latest axis (see
 // EvmNetworkConfig.ShortCircuitFutureBlocksEnabled), and the synthesized
 // response is returned directly from Forward, so it is never written to cache

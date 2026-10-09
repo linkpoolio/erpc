@@ -101,7 +101,7 @@ Leave unset for chains where upstreams handle `fromBlock: "0x0"` in an `eth_subs
 
 ## Future-block polling
 
-Clients that follow a chain by number (for example rollup nodes reading L1) poll `eth_getBlockByNumber` for the block after the head and treat `null` as "not produced yet". No upstream has that block, so each one returns `null` in turn and every poll walks every routed upstream, fallbacks included. Enable `shortCircuitFutureBlocks` to return `null` for a numbered `eth_getBlockByNumber` above the latest head of every upstream of the network (static availability caps included), without dispatching it. A block any upstream has is still dispatched, and the request is dispatched as usual while any upstream's head is unknown. It is always on when `servedTip.enabledFor` includes `"latest"`.
+Clients that follow a chain by number (for example rollup nodes reading L1) poll `eth_getBlockByNumber` for the block after the head and treat `null` as "not produced yet". No upstream has that block, so each one returns `null` in turn and every poll walks every routed upstream, fallbacks included. Enable `shortCircuitFutureBlocks` to return `null` for a numbered `eth_getBlockByNumber` above the latest head of every upstream of the network (static availability caps included), without dispatching it. A block at or below the last head any upstream reported is still dispatched, and the request is dispatched as usual while any upstream's head is unknown. It is always on when `servedTip.enabledFor` includes `"latest"`.
 
 <Tabs items={["yaml", "typescript"]} defaultIndex={0} storageKey="GlobalConfigTypeTabIndex">
   <Tabs.Tab>

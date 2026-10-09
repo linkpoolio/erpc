@@ -631,11 +631,11 @@ func evmTipObservation(u common.EvmUpstream, useFinalized bool) (blk int64, boun
 	return blk, head > 0 && *exact < head
 }
 
-// dispatchableSyncingHead returns the highest head among the upstreams that
+// dispatchableSyncingHead returns the highest latest head among the upstreams that
 // report syncing but still receive requests (evm.skipWhenSyncing unset or
 // false). evmTipBallot leaves syncing upstreams out of the head reference, so
 // the future-block short-circuit checks these separately.
-func dispatchableSyncingHead(upstreams []common.Upstream, useFinalized bool) int64 {
+func dispatchableSyncingHead(upstreams []common.Upstream) int64 {
 	var head int64
 	for _, cu := range upstreams {
 		u, ok := cu.(common.EvmUpstream)
@@ -645,7 +645,7 @@ func dispatchableSyncingHead(upstreams []common.Upstream, useFinalized bool) int
 		if cfg := u.Config(); cfg != nil && cfg.Evm != nil && cfg.Evm.SkipWhenSyncing != nil && *cfg.Evm.SkipWhenSyncing {
 			continue
 		}
-		if blk, _ := evmTipObservation(u, useFinalized); blk > head {
+		if blk, _ := evmTipObservation(u, false); blk > head {
 			head = blk
 		}
 	}
@@ -905,7 +905,7 @@ func (n *Network) evmHeadReference(ctx context.Context, useFinalized bool) serve
 
 // tryShortCircuitFutureBlock returns a truthful null response (ok=true) when
 // `req` is a concrete-numbered eth_getBlockByNumber lookup whose target block is
-// beyond every eligible upstream's head (at the network's emptyResultConfidence level).
+// beyond every eligible upstream's latest head.
 // No upstream can serve such a block yet, so dispatching + hedging across all of
 // them only burns latency and load before they each return empty — returning the
 // null here skips that fan-out entirely.
@@ -931,13 +931,16 @@ func (n *Network) tryShortCircuitFutureBlock(ctx context.Context, req *common.No
 		// params carry no concrete future number — never short-circuit.
 		return nil, false
 	}
-	useFinalized := n.cfg.Evm.EmptyResultConfidence == common.AvailbilityConfidenceFinalized
-	maxHead := n.evmHeadReference(ctx, useFinalized).Available
+	// Latest heads, whatever emptyResultConfidence says: that setting decides how
+	// an empty upstream answer is treated, while this decides whether any
+	// upstream can have the block at all. An unfinalized block an upstream
+	// already has must still be dispatched.
+	maxHead := n.evmHeadReference(ctx, false).Available
 	if maxHead <= 0 || bn <= maxHead {
 		// Unknown head (fail open) or block within reach of some upstream.
 		return nil, false
 	}
-	if bn <= dispatchableSyncingHead(n.tipCandidateUpstreams(ctx, "*"), useFinalized) {
+	if bn <= dispatchableSyncingHead(n.tipCandidateUpstreams(ctx, "*")) {
 		// Available leaves syncing upstreams out, but one that still receives
 		// requests may already have the block.
 		return nil, false

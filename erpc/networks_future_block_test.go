@@ -317,3 +317,35 @@ func TestForward_FutureBlock_OptIn_SkippedSyncingUpstreamAhead_ShortCircuitsToNu
 	assert.Zero(t, dispatched.Load(),
 		"a block beyond every dispatchable upstream's head must not be dispatched")
 }
+
+// emptyResultConfidence: finalizedBlock decides how an empty upstream answer is
+// treated, not whether an upstream can have the block. A block between the
+// finalized and latest heads must still be dispatched.
+func TestForward_FutureBlock_OptIn_FinalizedConfidence_UnfinalizedBlock_Dispatches(t *testing.T) {
+	util.ResetGock()
+	defer util.ResetGock()
+	util.SetupMocksForEvmStatePoller()
+	var dispatched atomic.Int64
+	mockGetBlockByNumberAt("0x5f", futureBlockSentinel, &dispatched, "fb1", "fb2", "fb3")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	network, ups := setupServedTipNetworkWith(t, ctx, []servedTipFixture{
+		{id: "fb1", chainID: 123, latestBlock: 100},
+		{id: "fb2", chainID: 123, latestBlock: 99},
+		{id: "fb3", chainID: 123, latestBlock: 98},
+	}, nil)
+	network.cfg.Evm.ShortCircuitFutureBlocks = util.BoolPtr(true)
+	network.cfg.Evm.EmptyResultConfidence = common.AvailbilityConfidenceFinalized
+	for _, u := range ups {
+		u.EvmStatePoller().SuggestFinalizedBlock(90)
+	}
+
+	// block 95 (0x5f) is above every finalized head (90) but below the latest ones.
+	resp := forwardGetBlockByNumber(t, ctx, network, "0x5f")
+	jrr, err := resp.JsonRpcResponse(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, jrr.GetResultString(), "0x270f",
+		"an unfinalized block the upstreams already have must be dispatched")
+}

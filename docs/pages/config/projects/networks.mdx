@@ -99,6 +99,52 @@ export default createConfig({
 
 Leave unset for chains where upstreams handle `fromBlock: "0x0"` in an `eth_subscribe` filter correctly (most do — the flag is a targeted workaround, not a universal default). It can also be set once for every network under `networkDefaults.evm`.
 
+## Future-block polling
+
+Clients that follow a chain by number (for example rollup nodes reading L1) poll `eth_getBlockByNumber` for the block after the head and treat `null` as "not produced yet". No upstream has that block, so each one returns `null` in turn and every poll walks every routed upstream, fallbacks included. Enable `shortCircuitFutureBlocks` to return `null` for a numbered `eth_getBlockByNumber` above the highest head any eligible upstream has (static availability caps included), without dispatching it. A block any eligible upstream has is still dispatched. It is always on when `servedTip.enabledFor` includes `"latest"`.
+
+<Tabs items={["yaml", "typescript"]} defaultIndex={0} storageKey="GlobalConfigTypeTabIndex">
+  <Tabs.Tab>
+```yaml filename="erpc.yaml"
+projects:
+  - id: main
+    networks:
+      - architecture: evm
+        evm:
+          chainId: 1
+          # Returns null for eth_getBlockByNumber(N) when N is above every
+          # eligible upstream's head, instead of asking each upstream.
+          shortCircuitFutureBlocks: true  # default: false
+```
+</Tabs.Tab>
+  <Tabs.Tab>
+```ts filename="erpc.ts"
+import { createConfig } from "@erpc-cloud/config";
+
+export default createConfig({
+  projects: [
+    {
+      id: "main",
+      networks: [
+        {
+          architecture: "evm",
+          evm: {
+            chainId: 1,
+            // Returns null for eth_getBlockByNumber(N) when N is above every
+            // eligible upstream's head, instead of asking each upstream.
+            shortCircuitFutureBlocks: true,  // default: false
+          },
+        },
+      ],
+    },
+  ],
+});
+```
+</Tabs.Tab>
+</Tabs>
+
+The head is what eRPC last saw from the state poller and head subscriptions. A block an upstream produced after that gets `null` until eRPC sees it, so a client that learned of the block elsewhere (for example from the node's own `newHeads`) can briefly get `null` for a block that exists. Only enable it where heads arrive promptly, such as networks with WebSocket head subscriptions, and where clients retry a `null`.
+
 ## Failover
 
 By default a request only reaches the upstreams the [selection policy](/config/projects/selection-policies) currently routes to; upstreams tagged `tier:fallback` join once the policy promotes them, which happens on its evaluation interval. `failover.onDefaultsExhausted` adds a per-request escape for the moments before that: when every routed upstream failed with an error that another upstream might not repeat, the same request is retried once on the `tier:fallback` upstreams it has not tried yet — even while the policy still keeps them cordoned.

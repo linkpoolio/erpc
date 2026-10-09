@@ -891,13 +891,14 @@ func (n *Network) evmHeadReference(ctx context.Context, useFinalized bool) serve
 //
 // Safety: it compares against the highest effective head across eligible
 // upstreams, static caps included (servedTipReference.Available), so it never
-// nulls out a block any upstream actually serves. It is gated on served-tip being enabled for the latest
-// axis — the same opt-in that makes the head trustworthy — and the synthesized
+// nulls out a block any upstream actually serves. It runs when the network sets
+// evm.shortCircuitFutureBlocks or enables served-tip for the latest axis (see
+// EvmNetworkConfig.ShortCircuitFutureBlocksEnabled), and the synthesized
 // response is returned directly from Forward, so it is never written to cache
 // (the block will exist later). The post-forward empty guard remains as
 // defense-in-depth for the in-flight case where an upstream advances mid-request.
 func (n *Network) tryShortCircuitFutureBlock(ctx context.Context, req *common.NormalizedRequest, method string) (*common.NormalizedResponse, bool) {
-	if n.cfg == nil || n.cfg.Evm == nil || !n.servedTipEnabledFor("latest") {
+	if n.cfg == nil || !n.cfg.Evm.ShortCircuitFutureBlocksEnabled() {
 		return nil, false
 	}
 	if !strings.EqualFold(method, "eth_getBlockByNumber") {

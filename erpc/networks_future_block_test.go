@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/erpc/erpc/common"
@@ -167,4 +168,78 @@ func TestForward_FutureBlock_LatestTag_Dispatches(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, jrr.GetResultString(), "0x270f",
 		"latest tag has no concrete future number; must dispatch normally")
+}
+
+// evm.shortCircuitFutureBlocks enables the short-circuit without served-tip: a
+// block above every head returns null and reaches no upstream.
+func TestForward_FutureBlock_OptInWithoutServedTip_ShortCircuitsToNull(t *testing.T) {
+	util.ResetGock()
+	defer util.ResetGock()
+	util.SetupMocksForEvmStatePoller()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	network, _ := setupServedTipNetworkWith(t, ctx, []servedTipFixture{
+		{id: "fb1", chainID: 123, latestBlock: 100},
+		{id: "fb2", chainID: 123, latestBlock: 99},
+		{id: "fb3", chainID: 123, latestBlock: 98},
+	}, nil)
+	network.cfg.Evm.ShortCircuitFutureBlocks = util.BoolPtr(true)
+	var dispatched atomic.Int64
+	for _, id := range []string{"fb1", "fb2", "fb3"} {
+		gock.New("http://" + id + ".localhost").
+			Post("").
+			Persist().
+			Filter(func(r *http.Request) bool {
+				if !strings.Contains(util.SafeReadBody(r), "eth_getBlockByNumber") {
+					return false
+				}
+				dispatched.Add(1)
+				return true
+			}).
+			Reply(200).
+			JSON([]byte(`{"jsonrpc":"2.0","id":1,"result":null}`))
+	}
+
+	req := common.NewNormalizedRequest([]byte(
+		`{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["0x69",false]}`))
+	resp, err := network.Forward(ctx, req)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	assert.True(t, resp.IsResultEmptyish(ctx),
+		"block 105 > max head 100 must short-circuit to null")
+	assert.Zero(t, dispatched.Load(),
+		"a block beyond every upstream's head must not be dispatched to any upstream")
+}
+
+// Without served-tip "latest" is the corroborated (second-highest) head, but a
+// block only the most-ahead upstream has is still servable: with the opt-in it
+// must be dispatched, not nulled.
+func TestForward_FutureBlock_OptInWithoutServedTip_OnlyMostAheadHasBlock_Dispatches(t *testing.T) {
+	util.ResetGock()
+	defer util.ResetGock()
+	util.SetupMocksForEvmStatePoller()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	network, _ := setupServedTipNetworkWith(t, ctx, []servedTipFixture{
+		{id: "fb1", chainID: 123, latestBlock: 100},
+		{id: "fb2", chainID: 123, latestBlock: 99},
+		{id: "fb3", chainID: 123, latestBlock: 98},
+	}, nil)
+	network.cfg.Evm.ShortCircuitFutureBlocks = util.BoolPtr(true)
+	mockGetBlockByNumberNonNull("fb1", "fb2", "fb3")
+
+	// block 100 (0x64) is above the corroborated head (99) but fb1 has it.
+	req := common.NewNormalizedRequest([]byte(
+		`{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["0x64",false]}`))
+	resp, err := network.Forward(ctx, req)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	jrr, err := resp.JsonRpcResponse(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, jrr.GetResultString(), "0x270f",
+		"a block the most-ahead upstream has must be dispatched, not short-circuited")
 }

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/erpc/erpc/common"
 	"github.com/erpc/erpc/util"
@@ -372,4 +373,35 @@ func TestForward_FutureBlock_OptIn_CordonedFallbackAhead_Dispatches(t *testing.T
 	forwardGetBlockByNumber(t, ctx, network, "0x69")
 	assert.Positive(t, dispatched.Load(),
 		"a block a cordoned fallback may have must be dispatched, not short-circuited")
+}
+
+// The default selection policy mirrors sampled requests to the upstreams it
+// excludes (probeExcluded). A short-circuited request is never dispatched, so it
+// must not be mirrored either.
+func TestForward_FutureBlock_OptIn_ShortCircuitNotMirroredToExcluded(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer util.ResetGock()
+
+	var dispatched atomic.Int64
+	network, _, _ := setupFailoverFixture(t, ctx, failoverFixtureOpts{
+		primaryLatest:  "0x64", // 100
+		fallbackLatest: "0x64", // 100, cordoned by the default policy
+		enableFailover: true,
+		mocks: func() {
+			mockGetBlockByNumberAt("0x69", "null", &dispatched, "rpc1", "rpc2", "rpc3", "rpc4")
+		},
+		network: func(cfg *common.NetworkConfig) {
+			cfg.Evm.ShortCircuitFutureBlocks = util.BoolPtr(true)
+		},
+	})
+
+	for i := 0; i < 5; i++ {
+		resp := forwardGetBlockByNumber(t, ctx, network, "0x69")
+		assert.True(t, resp.IsResultEmptyish(ctx))
+	}
+	// Mirrors are asynchronous; give the prober time to dispatch any.
+	time.Sleep(500 * time.Millisecond)
+	assert.Zero(t, dispatched.Load(),
+		"a short-circuited request must reach no upstream, mirrored probes included")
 }

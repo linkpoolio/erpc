@@ -2160,10 +2160,23 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 	// Set upstreams on the request
 	req.SetUpstreams(upsList)
 
+	// Future-block short-circuit: a concrete block number beyond every
+	// upstream's head cannot be served yet — return the truthful null instead of
+	// dispatching + hedging across upstreams that will all return empty. Runs
+	// before rate limiting so a non-dispatched request consumes no permit, and
+	// before the probe-bus publish so it is never mirrored to excluded upstreams.
+	if resp, ok := n.tryShortCircuitFutureBlock(ctx, req, method); ok {
+		forwardSpan.SetAttributes(attribute.Bool("future_block.short_circuit", true))
+		if mlx != nil {
+			mlx.Close(ctx, resp, nil)
+		}
+		return resp, nil
+	}
+
 	// Feed the per-network probe-bus AFTER we know the request is
 	// actually going to dispatch to an upstream (i.e. not a
-	// cache-hit / static-response / follower-multiplexer
-	// short-circuit, all of which returned earlier). The publish is
+	// cache-hit / static-response / follower-multiplexer /
+	// future-block short-circuit, all of which returned earlier). The publish is
 	// non-blocking and drops on overflow — request latency is never
 	// affected. The Prober (if any) samples from this feed to mirror
 	// the request against currently-excluded upstreams so their
@@ -2188,18 +2201,6 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 			}
 			return resp, nil
 		}
-	}
-
-	// Future-block short-circuit: a concrete block number beyond every eligible
-	// upstream's head cannot be served yet — return the truthful null instead of
-	// dispatching + hedging across upstreams that will all return empty. Runs
-	// before rate limiting so a non-dispatched request consumes no permit.
-	if resp, ok := n.tryShortCircuitFutureBlock(ctx, req, method); ok {
-		forwardSpan.SetAttributes(attribute.Bool("future_block.short_circuit", true))
-		if mlx != nil {
-			mlx.Close(ctx, resp, nil)
-		}
-		return resp, nil
 	}
 
 	// 3) Check if we should handle this method on this network

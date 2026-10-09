@@ -2682,7 +2682,9 @@ type EvmNetworkConfig struct {
 	EmptyResultConfidence AvailbilityConfidence `yaml:"emptyResultConfidence,omitempty" json:"emptyResultConfidence,omitempty"`
 
 	// ShortCircuitFutureBlocks returns null for a numbered eth_getBlockByNumber
-	// above the highest head any eligible upstream has, without dispatching it.
+	// above the highest latest head across every upstream of the network
+	// (regardless of selection policy, tier or syncing state), without
+	// dispatching it; it never fires while any upstream's head is unknown.
 	// Clients that poll the next block by number otherwise walk every routed
 	// upstream on each poll. Always on when servedTip is enabled for "latest".
 	// The head is what the state poller and head subscriptions last reported, so
@@ -2771,7 +2773,7 @@ type EvmServedTipConfig struct {
 }
 
 // ShortCircuitFutureBlocksEnabled reports whether a numbered eth_getBlockByNumber
-// above every eligible upstream's head returns null without dispatching: when
+// above every upstream's head returns null without dispatching: when
 // ShortCircuitFutureBlocks is true, or servedTip is enabled for "latest".
 // Nil-receiver safe.
 func (c *EvmNetworkConfig) ShortCircuitFutureBlocksEnabled() bool {

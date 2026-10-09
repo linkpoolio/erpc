@@ -631,27 +631,6 @@ func evmTipObservation(u common.EvmUpstream, useFinalized bool) (blk int64, boun
 	return blk, head > 0 && *exact < head
 }
 
-// dispatchableSyncingHead returns the highest latest head among the upstreams that
-// report syncing but still receive requests (evm.skipWhenSyncing unset or
-// false). evmTipBallot leaves syncing upstreams out of the head reference, so
-// the future-block short-circuit checks these separately.
-func dispatchableSyncingHead(upstreams []common.Upstream) int64 {
-	var head int64
-	for _, cu := range upstreams {
-		u, ok := cu.(common.EvmUpstream)
-		if !ok || u.EvmStatePoller() == nil || u.EvmSyncingState() != common.EvmSyncingStateSyncing {
-			continue
-		}
-		if cfg := u.Config(); cfg != nil && cfg.Evm != nil && cfg.Evm.SkipWhenSyncing != nil && *cfg.Evm.SkipWhenSyncing {
-			continue
-		}
-		if blk, _ := evmTipObservation(u, false); blk > head {
-			head = blk
-		}
-	}
-	return head
-}
-
 // configuredUpperExactBlock returns the upstream's configured
 // blockAvailability.upper.exactBlock, or nil when it declares no such constant.
 func configuredUpperExactBlock(u common.Upstream) *int64 {
@@ -905,14 +884,15 @@ func (n *Network) evmHeadReference(ctx context.Context, useFinalized bool) serve
 
 // tryShortCircuitFutureBlock returns a truthful null response (ok=true) when
 // `req` is a concrete-numbered eth_getBlockByNumber lookup whose target block is
-// beyond every eligible upstream's latest head.
+// beyond every upstream's latest head.
 // No upstream can serve such a block yet, so dispatching + hedging across all of
 // them only burns latency and load before they each return empty — returning the
 // null here skips that fan-out entirely.
 //
-// Safety: it compares against the highest effective head across eligible
-// upstreams, static caps included (servedTipReference.Available), so it never
-// nulls out a block any upstream actually serves. It runs when the network sets
+// Safety: it compares against the highest effective latest head across every
+// upstream of the network, static caps included, and fails open when any of
+// them has no known head (see futureBlockCeiling), so it never nulls out a
+// block any upstream actually serves. It runs when the network sets
 // evm.shortCircuitFutureBlocks or enables served-tip for the latest axis (see
 // EvmNetworkConfig.ShortCircuitFutureBlocksEnabled), and the synthesized
 // response is returned directly from Forward, so it is never written to cache
@@ -931,18 +911,9 @@ func (n *Network) tryShortCircuitFutureBlock(ctx context.Context, req *common.No
 		// params carry no concrete future number — never short-circuit.
 		return nil, false
 	}
-	// Latest heads, whatever emptyResultConfidence says: that setting decides how
-	// an empty upstream answer is treated, while this decides whether any
-	// upstream can have the block at all. An unfinalized block an upstream
-	// already has must still be dispatched.
-	maxHead := n.evmHeadReference(ctx, false).Available
-	if maxHead <= 0 || bn <= maxHead {
+	maxHead, known := n.futureBlockCeiling(ctx)
+	if !known || bn <= maxHead {
 		// Unknown head (fail open) or block within reach of some upstream.
-		return nil, false
-	}
-	if bn <= dispatchableSyncingHead(n.tipCandidateUpstreams(ctx, "*")) {
-		// Available leaves syncing upstreams out, but one that still receives
-		// requests may already have the block.
 		return nil, false
 	}
 	jrr, err := common.NewJsonRpcResponse(req.ID(), nil, nil)
@@ -952,6 +923,34 @@ func (n *Network) tryShortCircuitFutureBlock(ctx context.Context, req *common.No
 	resp := common.NewNormalizedResponse().WithRequest(req).WithJsonRpcResponse(jrr)
 	resp.SetEvmBlockNumber(bn)
 	return resp, true
+}
+
+// futureBlockCeiling returns the highest effective latest head across every
+// upstream of the network, regardless of selection policy, tier or syncing
+// state: any of them can end up serving a request (policy order, the fallback
+// escape, syncing upstreams without skipWhenSyncing). It uses latest heads
+// whatever emptyResultConfidence says: that setting decides how an empty answer
+// is treated, not whether an upstream can have the block. known is false when
+// the network has no upstreams or any upstream's head is unknown.
+func (n *Network) futureBlockCeiling(ctx context.Context) (head int64, known bool) {
+	if n.upstreamsRegistry == nil {
+		return 0, false
+	}
+	ups := n.upstreamsRegistry.GetNetworkUpstreams(ctx, n.networkId)
+	if len(ups) == 0 {
+		return 0, false
+	}
+	for _, u := range ups {
+		if u.EvmStatePoller() == nil {
+			return 0, false
+		}
+		blk, _ := evmTipObservation(u, false)
+		if blk <= 0 {
+			return 0, false
+		}
+		head = max(head, blk)
+	}
+	return head, true
 }
 
 // servedTip computes the majority served tip for one axis over the
@@ -1513,7 +1512,7 @@ func (n *Network) SvmEnforceBlockAvailability() bool {
 // This is used only by the networkPreForward_getBlock guard — its job is to
 // avoid short-circuiting requests that ANY upstream can serve. It therefore
 // uses MAX, not the majority (median) tip. This mirrors how EVM's
-// tryShortCircuitFutureBlock uses evmHeadReference.Max (not PickServedTip.Tip):
+// tryShortCircuitFutureBlock uses the max head across upstreams (not PickServedTip.Tip):
 // "never null out a block the most-ahead upstream actually has."
 // SvmHighestLatestSlot / SvmHighestFinalizedSlot remain median-based because
 // they advertise the chain head to clients — a different, conservative goal.

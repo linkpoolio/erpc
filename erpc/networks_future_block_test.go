@@ -259,10 +259,9 @@ func TestForward_FutureBlock_OptInWithoutServedTip_OnlyMostAheadHasBlock_Dispatc
 		"a block the most-ahead upstream has must be dispatched, not short-circuited")
 }
 
-// A syncing upstream is left out of the head reference, but without
-// evm.skipWhenSyncing it still receives requests and may have the block, so a
-// block at or below its head must be dispatched.
-func TestForward_FutureBlock_OptIn_DispatchableSyncingUpstreamAhead_Dispatches(t *testing.T) {
+// Every upstream of the network counts toward the ceiling, syncing ones
+// included: a block at or below a syncing upstream's head must be dispatched.
+func TestForward_FutureBlock_OptIn_SyncingUpstreamAhead_Dispatches(t *testing.T) {
 	util.ResetGock()
 	defer util.ResetGock()
 	util.SetupMocksForEvmStatePoller()
@@ -284,38 +283,36 @@ func TestForward_FutureBlock_OptIn_DispatchableSyncingUpstreamAhead_Dispatches(t
 	jrr, err := resp.JsonRpcResponse(ctx)
 	require.NoError(t, err)
 	assert.Contains(t, jrr.GetResultString(), "0x270f",
-		"a dispatchable syncing upstream may have the block; it must be dispatched")
+		"a syncing upstream may have the block; it must be dispatched")
 }
 
-// A syncing upstream with evm.skipWhenSyncing never receives requests, so its
-// head does not hold the short-circuit back.
-func TestForward_FutureBlock_OptIn_SkippedSyncingUpstreamAhead_ShortCircuitsToNull(t *testing.T) {
+// An upstream with no known head may already have the block, so the
+// short-circuit fails open and the request is dispatched.
+func TestForward_FutureBlock_OptIn_UpstreamWithUnknownHead_Dispatches(t *testing.T) {
 	util.ResetGock()
 	defer util.ResetGock()
 	util.SetupMocksForEvmStatePoller()
 	var dispatched atomic.Int64
-	mockGetBlockByNumberAt("0x69", "null", &dispatched, "fb1", "fb2", "sync1")
+	mockGetBlockByNumberAt("0x65", futureBlockSentinel, &dispatched, "fb1", "fb2", "nohead")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	network, ups := setupServedTipNetworkWith(t, ctx, []servedTipFixture{
+	network, _ := setupServedTipNetworkWith(t, ctx, []servedTipFixture{
 		{id: "fb1", chainID: 123, latestBlock: 100},
 		{id: "fb2", chainID: 123, latestBlock: 99},
-		{id: "sync1", chainID: 123, latestBlock: 110, syncing: true},
+		// no latestBlock: the poller never learns a head for this upstream
+		{id: "nohead", chainID: 123},
 	}, nil)
 	network.cfg.Evm.ShortCircuitFutureBlocks = util.BoolPtr(true)
-	for _, u := range ups {
-		if u.Id() == "sync1" {
-			u.Config().Evm.SkipWhenSyncing = util.BoolPtr(true)
-		}
-	}
 
-	resp := forwardGetBlockByNumber(t, ctx, network, "0x69")
-	assert.True(t, resp.IsResultEmptyish(ctx),
-		"a syncing upstream that skips requests cannot serve the block")
-	assert.Zero(t, dispatched.Load(),
-		"a block beyond every dispatchable upstream's head must not be dispatched")
+	// block 101 (0x65) is above every known head (100).
+	resp := forwardGetBlockByNumber(t, ctx, network, "0x65")
+	jrr, err := resp.JsonRpcResponse(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, jrr.GetResultString(), "0x270f",
+		"an upstream with an unknown head may have the block; it must be dispatched")
+	assert.Positive(t, dispatched.Load())
 }
 
 // emptyResultConfidence: finalizedBlock decides how an empty upstream answer is
@@ -348,4 +345,31 @@ func TestForward_FutureBlock_OptIn_FinalizedConfidence_UnfinalizedBlock_Dispatch
 	require.NoError(t, err)
 	assert.Contains(t, jrr.GetResultString(), "0x270f",
 		"an unfinalized block the upstreams already have must be dispatched")
+}
+
+// A fallback the selection policy cordons off can still serve through the
+// per-request escape, so its head counts toward the ceiling: a block between
+// the primaries' head and the fallbacks' head is dispatched, not nulled.
+func TestForward_FutureBlock_OptIn_CordonedFallbackAhead_Dispatches(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer util.ResetGock()
+
+	var dispatched atomic.Int64
+	network, _, _ := setupFailoverFixture(t, ctx, failoverFixtureOpts{
+		primaryLatest:  "0x64", // 100
+		fallbackLatest: "0x6e", // 110
+		enableFailover: true,
+		mocks: func() {
+			mockGetBlockByNumberAt("0x69", "null", &dispatched, "rpc1", "rpc2", "rpc3", "rpc4")
+		},
+		network: func(cfg *common.NetworkConfig) {
+			cfg.Evm.ShortCircuitFutureBlocks = util.BoolPtr(true)
+		},
+	})
+
+	// block 105 (0x69) is above the primaries' head but below the fallbacks'.
+	forwardGetBlockByNumber(t, ctx, network, "0x69")
+	assert.Positive(t, dispatched.Load(),
+		"a block a cordoned fallback may have must be dispatched, not short-circuited")
 }

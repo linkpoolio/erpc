@@ -170,12 +170,48 @@ func TestForward_FutureBlock_LatestTag_Dispatches(t *testing.T) {
 		"latest tag has no concrete future number; must dispatch normally")
 }
 
+// mockGetBlockByNumberAt makes every listed upstream answer
+// eth_getBlockByNumber for blockHex only, counting each dispatch. Matching the
+// concrete number keeps the state poller's latest/finalized polls off it, so it
+// can be registered before the network is set up.
+func mockGetBlockByNumberAt(blockHex, result string, dispatched *atomic.Int64, ids ...string) {
+	for _, id := range ids {
+		gock.New("http://" + id + ".localhost").
+			Post("").
+			Persist().
+			Filter(func(r *http.Request) bool {
+				body := util.SafeReadBody(r)
+				if !strings.Contains(body, "eth_getBlockByNumber") || !strings.Contains(body, `"`+blockHex+`"`) {
+					return false
+				}
+				dispatched.Add(1)
+				return true
+			}).
+			Reply(200).
+			JSON([]byte(`{"jsonrpc":"2.0","id":1,"result":` + result + `}`))
+	}
+}
+
+const futureBlockSentinel = `{"number":"0x270f","hash":"0xabc"}`
+
+func forwardGetBlockByNumber(t *testing.T, ctx context.Context, network *Network, blockHex string) *common.NormalizedResponse {
+	t.Helper()
+	req := common.NewNormalizedRequest([]byte(
+		`{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["` + blockHex + `",false]}`))
+	resp, err := network.Forward(ctx, req)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	return resp
+}
+
 // evm.shortCircuitFutureBlocks enables the short-circuit without served-tip: a
 // block above every head returns null and reaches no upstream.
 func TestForward_FutureBlock_OptInWithoutServedTip_ShortCircuitsToNull(t *testing.T) {
 	util.ResetGock()
 	defer util.ResetGock()
 	util.SetupMocksForEvmStatePoller()
+	var dispatched atomic.Int64
+	mockGetBlockByNumberAt("0x69", "null", &dispatched, "fb1", "fb2", "fb3")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -186,27 +222,9 @@ func TestForward_FutureBlock_OptInWithoutServedTip_ShortCircuitsToNull(t *testin
 		{id: "fb3", chainID: 123, latestBlock: 98},
 	}, nil)
 	network.cfg.Evm.ShortCircuitFutureBlocks = util.BoolPtr(true)
-	var dispatched atomic.Int64
-	for _, id := range []string{"fb1", "fb2", "fb3"} {
-		gock.New("http://" + id + ".localhost").
-			Post("").
-			Persist().
-			Filter(func(r *http.Request) bool {
-				if !strings.Contains(util.SafeReadBody(r), "eth_getBlockByNumber") {
-					return false
-				}
-				dispatched.Add(1)
-				return true
-			}).
-			Reply(200).
-			JSON([]byte(`{"jsonrpc":"2.0","id":1,"result":null}`))
-	}
 
-	req := common.NewNormalizedRequest([]byte(
-		`{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["0x69",false]}`))
-	resp, err := network.Forward(ctx, req)
-	require.NoError(t, err)
-	require.NotNil(t, resp)
+	// max head = 100; block 105 (0x69) is beyond every upstream.
+	resp := forwardGetBlockByNumber(t, ctx, network, "0x69")
 	assert.True(t, resp.IsResultEmptyish(ctx),
 		"block 105 > max head 100 must short-circuit to null")
 	assert.Zero(t, dispatched.Load(),
@@ -220,6 +238,8 @@ func TestForward_FutureBlock_OptInWithoutServedTip_OnlyMostAheadHasBlock_Dispatc
 	util.ResetGock()
 	defer util.ResetGock()
 	util.SetupMocksForEvmStatePoller()
+	var dispatched atomic.Int64
+	mockGetBlockByNumberAt("0x64", futureBlockSentinel, &dispatched, "fb1", "fb2", "fb3")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -230,16 +250,70 @@ func TestForward_FutureBlock_OptInWithoutServedTip_OnlyMostAheadHasBlock_Dispatc
 		{id: "fb3", chainID: 123, latestBlock: 98},
 	}, nil)
 	network.cfg.Evm.ShortCircuitFutureBlocks = util.BoolPtr(true)
-	mockGetBlockByNumberNonNull("fb1", "fb2", "fb3")
 
 	// block 100 (0x64) is above the corroborated head (99) but fb1 has it.
-	req := common.NewNormalizedRequest([]byte(
-		`{"jsonrpc":"2.0","id":1,"method":"eth_getBlockByNumber","params":["0x64",false]}`))
-	resp, err := network.Forward(ctx, req)
-	require.NoError(t, err)
-	require.NotNil(t, resp)
+	resp := forwardGetBlockByNumber(t, ctx, network, "0x64")
 	jrr, err := resp.JsonRpcResponse(ctx)
 	require.NoError(t, err)
 	assert.Contains(t, jrr.GetResultString(), "0x270f",
 		"a block the most-ahead upstream has must be dispatched, not short-circuited")
+}
+
+// A syncing upstream is left out of the head reference, but without
+// evm.skipWhenSyncing it still receives requests and may have the block, so a
+// block at or below its head must be dispatched.
+func TestForward_FutureBlock_OptIn_DispatchableSyncingUpstreamAhead_Dispatches(t *testing.T) {
+	util.ResetGock()
+	defer util.ResetGock()
+	util.SetupMocksForEvmStatePoller()
+	var dispatched atomic.Int64
+	mockGetBlockByNumberAt("0x69", futureBlockSentinel, &dispatched, "fb1", "fb2", "sync1")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	network, _ := setupServedTipNetworkWith(t, ctx, []servedTipFixture{
+		{id: "fb1", chainID: 123, latestBlock: 100},
+		{id: "fb2", chainID: 123, latestBlock: 99},
+		{id: "sync1", chainID: 123, latestBlock: 110, syncing: true},
+	}, nil)
+	network.cfg.Evm.ShortCircuitFutureBlocks = util.BoolPtr(true)
+
+	// block 105 (0x69) is above every non-syncing head (100) but below sync1's.
+	resp := forwardGetBlockByNumber(t, ctx, network, "0x69")
+	jrr, err := resp.JsonRpcResponse(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, jrr.GetResultString(), "0x270f",
+		"a dispatchable syncing upstream may have the block; it must be dispatched")
+}
+
+// A syncing upstream with evm.skipWhenSyncing never receives requests, so its
+// head does not hold the short-circuit back.
+func TestForward_FutureBlock_OptIn_SkippedSyncingUpstreamAhead_ShortCircuitsToNull(t *testing.T) {
+	util.ResetGock()
+	defer util.ResetGock()
+	util.SetupMocksForEvmStatePoller()
+	var dispatched atomic.Int64
+	mockGetBlockByNumberAt("0x69", "null", &dispatched, "fb1", "fb2", "sync1")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	network, ups := setupServedTipNetworkWith(t, ctx, []servedTipFixture{
+		{id: "fb1", chainID: 123, latestBlock: 100},
+		{id: "fb2", chainID: 123, latestBlock: 99},
+		{id: "sync1", chainID: 123, latestBlock: 110, syncing: true},
+	}, nil)
+	network.cfg.Evm.ShortCircuitFutureBlocks = util.BoolPtr(true)
+	for _, u := range ups {
+		if u.Id() == "sync1" {
+			u.Config().Evm.SkipWhenSyncing = util.BoolPtr(true)
+		}
+	}
+
+	resp := forwardGetBlockByNumber(t, ctx, network, "0x69")
+	assert.True(t, resp.IsResultEmptyish(ctx),
+		"a syncing upstream that skips requests cannot serve the block")
+	assert.Zero(t, dispatched.Load(),
+		"a block beyond every dispatchable upstream's head must not be dispatched")
 }

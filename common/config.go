@@ -2772,7 +2772,7 @@ type EvmServedTipConfig struct {
 
 // ShortCircuitFutureBlocksEnabled reports whether a numbered eth_getBlockByNumber
 // above every eligible upstream's head returns null without dispatching: when
-// ShortCircuitFutureBlocks is set, or servedTip is enabled for "latest".
+// ShortCircuitFutureBlocks is true, or servedTip is enabled for "latest".
 // Nil-receiver safe.
 func (c *EvmNetworkConfig) ShortCircuitFutureBlocksEnabled() bool {
 	if c == nil {

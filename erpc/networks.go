@@ -631,6 +631,27 @@ func evmTipObservation(u common.EvmUpstream, useFinalized bool) (blk int64, boun
 	return blk, head > 0 && *exact < head
 }
 
+// dispatchableSyncingHead returns the highest head among the upstreams that
+// report syncing but still receive requests (evm.skipWhenSyncing unset or
+// false). evmTipBallot leaves syncing upstreams out of the head reference, so
+// the future-block short-circuit checks these separately.
+func dispatchableSyncingHead(upstreams []common.Upstream, useFinalized bool) int64 {
+	var head int64
+	for _, cu := range upstreams {
+		u, ok := cu.(common.EvmUpstream)
+		if !ok || u.EvmStatePoller() == nil || u.EvmSyncingState() != common.EvmSyncingStateSyncing {
+			continue
+		}
+		if cfg := u.Config(); cfg != nil && cfg.Evm != nil && cfg.Evm.SkipWhenSyncing != nil && *cfg.Evm.SkipWhenSyncing {
+			continue
+		}
+		if blk, _ := evmTipObservation(u, useFinalized); blk > head {
+			head = blk
+		}
+	}
+	return head
+}
+
 // configuredUpperExactBlock returns the upstream's configured
 // blockAvailability.upper.exactBlock, or nil when it declares no such constant.
 func configuredUpperExactBlock(u common.Upstream) *int64 {
@@ -914,6 +935,11 @@ func (n *Network) tryShortCircuitFutureBlock(ctx context.Context, req *common.No
 	maxHead := n.evmHeadReference(ctx, useFinalized).Available
 	if maxHead <= 0 || bn <= maxHead {
 		// Unknown head (fail open) or block within reach of some upstream.
+		return nil, false
+	}
+	if bn <= dispatchableSyncingHead(n.tipCandidateUpstreams(ctx, "*"), useFinalized) {
+		// Available leaves syncing upstreams out, but one that still receives
+		// requests may already have the block.
 		return nil, false
 	}
 	jrr, err := common.NewJsonRpcResponse(req.ID(), nil, nil)

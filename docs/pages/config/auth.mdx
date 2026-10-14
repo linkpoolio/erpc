@@ -119,6 +119,8 @@ For each HTTP request, eRPC extracts credential signals from query params and he
 8. `X-Siwe-Message` + `X-Siwe-Signature` headers → `AuthTypeSiwe`
 9. No credential present → `AuthTypeNetwork` (fallback)
 
+**Additional secret locations (opt-in).** When none of 1–4 supplied a secret, eRPC also looks, in this order, at `?apikey=` (`apikeyQuery`), the `X-Api-Key` / `apikey` header (`apikeyHeader`), and — only when a [domain alias](/config/server) preselects project, architecture **and** chain so the path is not used for routing — a single path segment (`path`: `https://rpc.example.com/<secret>`; `/admin`, `/healthcheck` and `/metrics` are never treated as secrets). A `secret` or `database` strategy only accepts a secret found there when it lists the location in its `additionalLocations`; without it (the default) such a secret is ignored. These locations do **not** change the credential type either: a request that only carries one of them still reaches a `network` strategy, so existing setups behave as before.
+
 The `forwardedClientId` strategy does not take part in this order: it is offered every request that carries its configured header (whatever credential type was extracted), in declaration order like any other strategy.
 
 gRPC metadata uses a parallel order without query-param equivalents: `x-erpc-secret-token`, then `authorization: Basic`, `authorization: Bearer`, then `x-siwe-message`+`x-siwe-signature`, then network fallback. gRPC has no `?token=` / `?secret=` / `?jwt=` equivalents — query params are not available in gRPC metadata.
@@ -129,7 +131,9 @@ gRPC metadata uses a parallel order without query-param equivalents: `x-erpc-sec
 
 #### secret strategy
 
-The simplest backend-to-backend gate. The client sends the token as `?secret=VALUE` or the `X-ERPC-Secret-Token` header. `Authorization: Basic` is also accepted; only the password field is used — the username is silently discarded.
+The simplest backend-to-backend gate. The client sends the token as `?secret=VALUE` or the `X-ERPC-Secret-Token` header. `Authorization: Basic` is also accepted; only the password field is used — the username is silently discarded. `?apikey=`, `X-Api-Key` / `apikey` headers and, on a fully aliased domain, the path (`/<secret>`) are accepted too when listed in `additionalLocations` (`apikeyQuery`, `apikeyHeader`, `path`; see above).
+
+A secret in the URL (query or path) ends up in the access logs of every proxy and load balancer on the way and in browser history; prefer headers where clients support them. eRPC replaces it with `REDACTED` / `/REDACTED` in the `http.url` span attribute and the CORS metrics' path label.
 
 Authenticate: exact equality match (`ap.Secret.Value != s.cfg.Value`). Returns `ErrAuthUnauthorized` on mismatch. No timing-safe compare — plain Go string inequality. For public internet deployments, prefer `database` or `jwt`.
 
@@ -224,8 +228,9 @@ YAML prefix: `auth.strategies[*].secret`
 | `secret.id` | `string` | `""` | Returned as `User.Id` on success. May be empty. <SourceLink file="common/config.go" lines="2461" /> |
 | `secret.value` | `string` | required | Exact token to match. Plain string equality (not timing-safe). Redacted in JSON/YAML marshal. <SourceLink file="auth/strategy_secret.go" lines="24" /> |
 | `secret.rateLimitBudget` | `string` | `""` | Attached to returned `User.RateLimitBudget` if non-empty. <SourceLink file="auth/strategy_secret.go" lines="29-31" /> |
+| `secret.additionalLocations` | `SecretLocation[]` | `[]` | Also accept the secret from `apikeyQuery` (`?apikey=`), `apikeyHeader` (`X-Api-Key` / `apikey`) and/or `path` (`/<secret>` on a fully aliased domain). Unknown values fail validation. |
 
-Supports: `AuthTypeSecret` only. `SetDefaults`: no-op.
+Supports: `AuthTypeSecret`, or a payload carrying a secret from one of its `additionalLocations`. `SetDefaults`: no-op.
 
 **`jwt` strategy — `JwtStrategyConfig`**
 
@@ -293,6 +298,7 @@ YAML prefix: `auth.strategies[*].database`
 |---|---|---|---|
 | `database.connector` | `*ConnectorConfig` | auto-created | Drivers: `postgresql`, `dynamodb`, `redis`, `memory`, `grpc`. Connector id defaults to `"auth-<driver>"`. <SourceLink file="common/defaults.go" lines="2676-2678" /> |
 | `database.maxWait` | `Duration` | `1s` | Per-request context timeout for the full DB lookup (singleflight + retries). <SourceLink file="common/defaults.go" lines="2718-2720" /> |
+| `database.additionalLocations` | `SecretLocation[]` | `[]` | Also accept the secret from `apikeyQuery` (`?apikey=`), `apikeyHeader` (`X-Api-Key` / `apikey`) and/or `path` (`/<secret>` on a fully aliased domain). Unknown values fail validation. |
 | `database.cache.ttl` | `*time.Duration` | `1h` | Positive-cache TTL in Ristretto. <SourceLink file="common/defaults.go" lines="2691-2694" /> |
 | `database.cache.maxSize` | `*int64` | `10000` | Max positive-cache entries. <SourceLink file="common/defaults.go" lines="2696-2699" /> |
 | `database.cache.maxCost` | `*int64` | `1073741824` (1 GiB) | Ristretto MaxCost for positive cache. <SourceLink file="common/defaults.go" lines="2701-2704" /> |
@@ -305,7 +311,7 @@ YAML prefix: `auth.strategies[*].database`
 
 Negative cache: hardcoded 5-second TTL, 1 MiB MaxCost. Not configurable. Disabled/invalid keys stay rejected up to 5 seconds after change.
 
-**`database` strategy `Supports`**: accepts both `AuthTypeSecret` (token delivered via header/query) and `AuthTypeDatabase`. The `AuthTypeDatabase` enum value is never set by any current HTTP or gRPC payload extractor — it is reserved for future or programmatic use. <SourceLink file="auth/strategy_database.go" lines="118-120" />
+**`database` strategy `Supports`**: accepts `AuthTypeSecret` (token delivered via header/query), `AuthTypeDatabase`, and a payload carrying a secret from one of its `additionalLocations` (`apikeyQuery`, `apikeyHeader`, `path`). The `AuthTypeDatabase` enum value is never set by any current HTTP or gRPC payload extractor — it is reserved for future or programmatic use. <SourceLink file="auth/strategy_database.go" lines="118-120" />
 
 **database connector error classification** — determines whether `connectorDown` latch is set ([`auth/strategy_database.go:L487-L517`](https://github.com/erpc/erpc/blob/main/auth/strategy_database.go#L487-L517)):
 
@@ -641,6 +647,52 @@ each forwarded client its own quota via a `perUser` budget rule:
 },`}
 />
 
+**7. API key in the URL path for clients that only accept a URL.** Some wallets and SDKs
+take a single RPC URL and cannot set headers. On a domain alias that pins project,
+architecture and chain, `https://eth.rpc.example.com/<secret>` authenticates with the
+`secret` (or `database`) strategy that lists `path` in `additionalLocations`:
+
+<ConfigTabs
+  path="server.aliasing + projects[].auth.strategies[]"
+  yaml={`server:
+  aliasing:
+    rules:
+      # all three are preselected, so the path is free to carry the secret
+      - matchDomain: "eth.rpc.example.com"
+        serveProject: main
+        serveArchitecture: evm
+        serveChain: "1"
+projects:
+  - id: main
+    auth:
+      strategies:
+        - type: secret
+          secret:
+            id: wallet-app
+            value: \${WALLET_APP_SECRET}
+            additionalLocations: [path]`}
+  ts={`server: {
+  aliasing: {
+    rules: [{
+      // all three are preselected, so the path is free to carry the secret
+      matchDomain: "eth.rpc.example.com",
+      serveProject: "main",
+      serveArchitecture: "evm",
+      serveChain: "1",
+    }],
+  },
+},
+projects: [{
+  id: "main",
+  auth: {
+    strategies: [{
+      type: "secret",
+      secret: { id: "wallet-app", value: process.env.WALLET_APP_SECRET, additionalLocations: ["path"] },
+    }],
+  },
+}]`}
+/>
+
 ### Request/response behavior
 
 - A successful auth attaches `User{Id, RateLimitBudget}` to the request; `User.Id` flows into log context and Prometheus labels on every downstream metric. [<SourceLink file="auth/registry.go" lines="74-76" />]
@@ -694,6 +746,8 @@ each forwarded client its own quota via a `perUser` budget rule:
 
 27. **JWT `jwt.Parse` failures are classified into `AuthUnauthorizedReason`.** Bad signatures → `invalid_signature` / "invalid signature"; expired tokens (`ValidationErrorExpired`) → `token_expired` / "token expired". If both bits are set, signature wins — claims (including `exp`) are untrusted without a valid sig. Other `ValidationError` flags keep the jwt library text without a `reason` detail. Classification lives in auth (not `common`) to avoid importing `golang-jwt` into `common`. [<SourceLink file="auth/strategy_jwt.go" />, <SourceLink file="common/errors.go" lines="548-615" />]
 28. **`forwardedClientId` trusts a header.** It authenticates whoever can set the header. A proxy that *appends* to the header rather than overwriting it yields two values, which the strategy rejects; a proxy that passes a client-supplied header through untouched is a full auth bypass. The id is used verbatim in logs, metric labels and `perUser` rate-limit keys.
+29. **Additional secret locations never shadow `network`.** `?apikey=`, `X-Api-Key`/`apikey` and the `/<secret>` path leave the credential type as `network` when nothing else was supplied. With `[network, secret]` and a caller from an allowed IP, `network` wins (declaration order) and the key is not used for identity; put `secret`/`database` first if the key should decide the identity.
+30. **Path secrets need a fully aliased domain.** If the alias leaves any of project/architecture/chain to the path, the single segment is routing (`/main`, `/1`, a network alias) and is never read as a secret.
 
 ### Observability
 
@@ -725,7 +779,7 @@ No dedicated auth trace spans — auth runs inline inside the HTTP handler gorou
 
 - [`auth/registry.go:L46-L96`](https://github.com/erpc/erpc/blob/main/auth/registry.go#L46-L96) — `AuthRegistry.Authenticate`: first-win loop, error accumulation
 - [`auth/authorizer.go:L83-L157`](https://github.com/erpc/erpc/blob/main/auth/authorizer.go#L83-L157) — `shouldApplyToMethod`, `acquireRateLimitPermit`, budget cascade
-- [`auth/http.go:L13-L88`](https://github.com/erpc/erpc/blob/main/auth/http.go#L13-L88) — `NewPayloadFromHttp`: credential extraction priority order
+- [`auth/http.go`](https://github.com/erpc/erpc/blob/main/auth/http.go) — `NewPayloadFromHttp`: credential extraction priority order, additional secret locations, `PathSegmentSecret`
 - [`auth/strategy_database.go:L271-L357`](https://github.com/erpc/erpc/blob/main/auth/strategy_database.go#L271-L357) — connector-down circuit-breaker, probe election, fail-open
 - [`auth/strategy_jwt.go:L100-L116`](https://github.com/erpc/erpc/blob/main/auth/strategy_jwt.go#L100-L116) — JWT key selection (kid lookup + type-compatibility scan)
 - [`auth/strategy_siwe.go:L22-L67`](https://github.com/erpc/erpc/blob/main/auth/strategy_siwe.go#L22-L67) — SIWE signature verification + domain allowlist

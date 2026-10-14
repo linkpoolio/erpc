@@ -24,6 +24,26 @@ type AuthPayload struct {
 // This payload is used by both "secret" and "database" strategies
 type SecretPayload struct {
 	Value string
+	// Location is where an additional-location secret was found (see
+	// common.SecretLocation); "" for the standard locations.
+	Location common.SecretLocation
+}
+
+// secretAccepted reports whether ap carries a secret from a location a
+// strategy accepts: a standard one, or one of its additional locations.
+func secretAccepted(ap *AuthPayload, additional []common.SecretLocation) bool {
+	if ap.Secret == nil {
+		return false
+	}
+	if ap.Secret.Location == "" {
+		return true
+	}
+	for _, l := range additional {
+		if l == ap.Secret.Location {
+			return true
+		}
+	}
+	return false
 }
 
 type JwtPayload struct {

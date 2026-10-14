@@ -982,9 +982,24 @@ func (s *AuthStrategyConfig) Validate() error {
 	return nil
 }
 
+func validateSecretLocations(field string, locations []SecretLocation) error {
+	for _, l := range locations {
+		switch l {
+		case SecretLocationApikeyQuery, SecretLocationApikeyHeader, SecretLocationPath:
+		default:
+			return fmt.Errorf("%s: unknown location %q (supported: %s, %s, %s)",
+				field, l, SecretLocationApikeyQuery, SecretLocationApikeyHeader, SecretLocationPath)
+		}
+	}
+	return nil
+}
+
 func (s *DatabaseStrategyConfig) Validate() error {
 	if s.Connector == nil {
 		return fmt.Errorf("auth.*.database.connector is required")
+	}
+	if err := validateSecretLocations("auth.*.database.additionalLocations", s.AdditionalLocations); err != nil {
+		return err
 	}
 
 	if s.Cache != nil {
@@ -1013,7 +1028,7 @@ func (s *SecretStrategyConfig) Validate() error {
 	if s.Value == "" {
 		return fmt.Errorf("auth.*.secret.value is required")
 	}
-	return nil
+	return validateSecretLocations("auth.*.secret.additionalLocations", s.AdditionalLocations)
 }
 
 func (j *JwtStrategyConfig) Validate() error {

@@ -67,7 +67,10 @@ func InjectHTTPResponseTraceContext(ctx context.Context, w http.ResponseWriter) 
 
 // credentialQueryParams are the query parameters the HTTP auth payload
 // extractor reads credentials from (see auth.NewPayloadFromHttp).
-var credentialQueryParams = []string{"token", "secret", "jwt"}
+var credentialQueryParams = []string{"token", "secret", "jwt", "apikey"}
+
+// RedactedPath replaces a request path that carries a credential in telemetry.
+const RedactedPath = "/REDACTED"
 
 // RedactedRequestURL renders u for telemetry with the values of
 // credential-carrying query parameters replaced, so secrets passed in the
@@ -95,6 +98,19 @@ func RedactedRequestURL(u *url.URL) string {
 	c := *u
 	c.RawQuery = q.Encode()
 	return c.String()
+}
+
+// RedactHTTPServerSpanPath overwrites the http.url attribute of the server
+// span in ctx with u's path replaced by RedactedPath, for requests whose path
+// carries a credential.
+func RedactHTTPServerSpanPath(ctx context.Context, u *url.URL) {
+	if !IsTracingEnabled || u == nil {
+		return
+	}
+	c := *u
+	c.Path = RedactedPath
+	c.RawPath = ""
+	trace.SpanFromContext(ctx).SetAttributes(semconv.HTTPURLKey.String(RedactedRequestURL(&c)))
 }
 
 func StartHTTPServerSpan(ctx context.Context, r *http.Request) (context.Context, trace.Span) {

@@ -3089,11 +3089,29 @@ type AuthStrategyConfig struct {
 	ForwardedClientId *ForwardedClientIdStrategyConfig `yaml:"forwardedClientId,omitempty" json:"forwardedClientId,omitempty"`
 }
 
+// SecretLocation is a request location a secret can be read from besides the
+// standard ones (?secret=, ?token=, X-ERPC-Secret-Token, Authorization: Basic).
+type SecretLocation string
+
+const (
+	// SecretLocationApikeyQuery is the ?apikey= query parameter.
+	SecretLocationApikeyQuery SecretLocation = "apikeyQuery"
+	// SecretLocationApikeyHeader is the X-Api-Key or apikey header.
+	SecretLocationApikeyHeader SecretLocation = "apikeyHeader"
+	// SecretLocationPath is the URL path as a single segment
+	// (https://host/<secret>), only when a domain alias preselects project,
+	// architecture and chain so the path is not used for routing.
+	SecretLocationPath SecretLocation = "path"
+)
+
 type SecretStrategyConfig struct {
 	Id    string `yaml:"id" json:"id"`
 	Value string `yaml:"value" json:"value"`
 	// RateLimitBudget, if set, is applied to the authenticated user from this strategy
 	RateLimitBudget string `yaml:"rateLimitBudget,omitempty" json:"rateLimitBudget,omitempty"`
+	// AdditionalLocations also accepts the secret from these locations. Empty
+	// (the default) accepts only the standard ones.
+	AdditionalLocations []SecretLocation `yaml:"additionalLocations,omitempty" json:"additionalLocations,omitempty" tstype:"SecretLocation[]"`
 }
 
 // custom json marshaller to redact the secret value
@@ -3104,11 +3122,15 @@ func (s *SecretStrategyConfig) MarshalJSON() ([]byte, error) {
 }
 
 func (s *SecretStrategyConfig) MarshalYAML() (interface{}, error) {
-	return map[string]string{
+	out := map[string]interface{}{
 		"id":              s.Id,
 		"value":           "REDACTED",
 		"rateLimitBudget": s.RateLimitBudget,
-	}, nil
+	}
+	if len(s.AdditionalLocations) > 0 {
+		out["additionalLocations"] = s.AdditionalLocations
+	}
+	return out, nil
 }
 
 type DatabaseStrategyConfig struct {
@@ -3117,6 +3139,9 @@ type DatabaseStrategyConfig struct {
 	Retry     *DatabaseRetryConfig         `yaml:"retry,omitempty" json:"retry,omitempty"`
 	FailOpen  *DatabaseFailOpenConfig      `yaml:"failOpen,omitempty" json:"failOpen,omitempty"`
 	MaxWait   Duration                     `yaml:"maxWait,omitempty" json:"maxWait" tstype:"Duration"`
+	// AdditionalLocations also accepts the secret from these locations. Empty
+	// (the default) accepts only the standard ones.
+	AdditionalLocations []SecretLocation `yaml:"additionalLocations,omitempty" json:"additionalLocations,omitempty" tstype:"SecretLocation[]"`
 }
 
 type DatabaseStrategyCacheConfig struct {

@@ -423,7 +423,7 @@ are recorded. Use `sampleRate: 0.0000001` because `sampleRate: 0` is rewritten t
 | Attribute | Phase | Value |
 |---|---|---|
 | `http.method` | on request | HTTP method (semconv) |
-| `http.url` | on request | Full request URL; values of credential query parameters (`secret`, `token`, `jwt`) are replaced with `REDACTED` |
+| `http.url` | on request | Full request URL; values of credential query parameters (`secret`, `token`, `jwt`, `apikey`) are replaced with `REDACTED`, and a path that carries a secret is replaced with `/REDACTED` |
 | `http.scheme` | on request | URL scheme |
 | `http.user_agent` | on request | User-Agent header value |
 | `erpc.force_trace` | on request, when forced | `true` (if forced via header/query) |

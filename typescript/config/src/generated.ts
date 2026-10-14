@@ -1991,6 +1991,25 @@ export interface AuthStrategyConfig {
   siwe?: SiweStrategyConfig;
   forwardedClientId?: ForwardedClientIdStrategyConfig;
 }
+/**
+ * SecretLocation is a request location a secret can be read from besides the
+ * standard ones (?secret=, ?token=, X-ERPC-Secret-Token, Authorization: Basic).
+ */
+export type SecretLocation = string;
+/**
+ * SecretLocationApikeyQuery is the ?apikey= query parameter.
+ */
+export const SecretLocationApikeyQuery: SecretLocation = "apikeyQuery";
+/**
+ * SecretLocationApikeyHeader is the X-Api-Key or apikey header.
+ */
+export const SecretLocationApikeyHeader: SecretLocation = "apikeyHeader";
+/**
+ * SecretLocationPath is the URL path as a single segment
+ * (https://host/<secret>), only when a domain alias preselects project,
+ * architecture and chain so the path is not used for routing.
+ */
+export const SecretLocationPath: SecretLocation = "path";
 export interface SecretStrategyConfig {
   id: string;
   value: string;
@@ -1998,6 +2017,11 @@ export interface SecretStrategyConfig {
    * RateLimitBudget, if set, is applied to the authenticated user from this strategy
    */
   rateLimitBudget?: string;
+  /**
+   * AdditionalLocations also accepts the secret from these locations. Empty
+   * (the default) accepts only the standard ones.
+   */
+  additionalLocations?: SecretLocation[];
 }
 export interface DatabaseStrategyConfig {
   connector?: ConnectorConfig;
@@ -2005,6 +2029,11 @@ export interface DatabaseStrategyConfig {
   retry?: DatabaseRetryConfig;
   failOpen?: DatabaseFailOpenConfig;
   maxWait?: Duration;
+  /**
+   * AdditionalLocations also accepts the secret from these locations. Empty
+   * (the default) accepts only the standard ones.
+   */
+  additionalLocations?: SecretLocation[];
 }
 export interface DatabaseStrategyCacheConfig {
   ttl?: number /* time in nanoseconds (time.Duration) */;

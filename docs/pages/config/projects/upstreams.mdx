@@ -107,7 +107,7 @@ fields; all-or-nothing for `tags`, `failsafe`, and `routing`; per-field merge fo
 EVM sub-fields; wholesale-then-per-field for SVM sub-fields — then `SetDefaults` fills
 remaining gaps: deriving an `id` if empty,
 defaulting `type` to `evm` **only when it was omitted** (so an SVM upstream must say
-`type: svm`), injecting `ignoreMethods: ["*"]` when `allowMethods` is set
+`type: svm`; a `jsonRpc.networkId` without a `type` infers `type: jsonrpc`), injecting `ignoreMethods: ["*"]` when `allowMethods` is set
 without an explicit `ignoreMethods`. Endpoints using a vendor shorthand
 (`alchemy://KEY`, `drpc://KEY`, and 20+ other prefixes) are converted into provider
 configs at this stage; the rest of the upstream block travels as a `"*"` override.
@@ -213,7 +213,7 @@ All paths relative to `projects[*]`. "Default" = value after `SetDefaults`/`Appl
 | Field | Type | Default | Behavior / footguns |
 |---|---|---|---|
 | `upstreams[*].id` | string | Derived: native-scheme endpoint → `<hostname>-<N>`; non-native → `<scheme>-<N>`; if `vendorName` set → `<vendorName>-<N>` (<SourceLink file="common/defaults.go" lines="1596-1615" />) | Used in task names, metrics labels, `use-upstream` matching, admin cordon RPCs. |
-| `upstreams[*].type` | `UpstreamType` | `"evm"` when omitted (<SourceLink file="common/defaults.go" lines="1715-1718" />) | `evm` and `svm` are both supported at runtime. The `evm+<vendor>` shorthand schemes are normalized to `"evm"` at defaults time. **Footgun**: `svm` is never inferred — an upstream serving Solana that omits `type` silently becomes an EVM upstream and fails to bootstrap. Always write `type: svm` explicitly. |
+| `upstreams[*].type` | `UpstreamType` | `"evm"` when omitted (<SourceLink file="common/defaults.go" lines="1715-1718" />) | `evm`, `svm` and `jsonrpc` are supported at runtime. The `evm+<vendor>` shorthand schemes are normalized to `"evm"` at defaults time. **Footgun**: `svm` is never inferred — an upstream serving Solana that omits `type` silently becomes an EVM upstream and fails to bootstrap. Always write `type: svm` explicitly. `jsonrpc` (generic passthrough, see [Networks](/config/projects/networks)) is inferred when `jsonRpc.networkId` is set. |
 | `upstreams[*].endpoint` | string | `""` (required) | Native schemes: `http://`, `https://`, `ws://`, `wss://`, `grpc://`, `grpc+bds://`. Non-native (e.g. `alchemy://KEY`) converts the upstream into a provider. `ws://`/`wss://` create a persistent WebSocket client (auto-reconnect, keepalive) that serves regular requests and `eth_subscribe` — see [WebSocket](/operation/websocket). Redacted in JSON/YAML output. |
 | `upstreams[*].tags` | `[]string` | nil; all-or-nothing inheritance from `upstreamDefaults.tags` (<SourceLink file="common/defaults.go" lines="1505-1510" />) | `<dim>:<value>` convention. Matched by `use-upstream` and policy stdlib. **Footgun**: one tag on the upstream drops ALL defaults tags. |
 | `upstreams[*].vendorName` | string | `""`; at runtime filled by URL pattern match or `guessVendorName()` | When non-empty, forces name-lookup only — `OwnsUpstream` URL matching is skipped. Mismatch silently applies the wrong error normalizer. No warning is logged. |
@@ -237,6 +237,8 @@ All paths relative to `projects[*]`. "Default" = value after `SetDefaults`/`Appl
 | `upstreams[*].jsonRpc.enableGzip` | `*bool` | nil (false) | Compresses outbound request body. Client always sends `Accept-Encoding: gzip` and decompresses responses regardless. |
 | `upstreams[*].jsonRpc.headers` | `map[string]string` | nil | Static headers on every outbound request. Applied via `Header.Set` (overwrites defaults for matching keys). |
 | `upstreams[*].jsonRpc.proxyPool` | string | `""` | References `proxyPools[].id`. Error at startup if pool not found. |
+| `upstreams[*].jsonRpc.networkId` | string | `""`; **not** inherited from `upstreamDefaults.jsonRpc` | Required for `type: jsonrpc`: binds the upstream to the passthrough network `jsonrpc:<networkId>` (slug only, charset `[a-zA-Z0-9_-]+`). Bootstrap sends nothing to the upstream — no chain-id detection, no state poller. Only `http(s)://` and `ws(s)://` endpoints are accepted. Ignored for other types. Not inherited because a project-wide `jsonRpc` block is usually shared with EVM upstreams, which would otherwise be retyped. |
+| `upstreams[*].jsonRpc.omitEmptyParams` | `*bool` | `true` for `type: jsonrpc`, `false` otherwise | Leaves the `params` member out of outbound requests whose params are empty instead of sending `"params":[]`. `params` is optional in JSON-RPC 2.0, but some servers reject an empty array for methods without parameters. Applies to the HTTP client (single and batch) and the WebSocket client; cache keys are unaffected. |
 | `upstreams[*].grpc.headers` | `map[string]string` | nil | Applied as gRPC metadata on every outbound request. |
 | `upstreams[*].shadow.enabled` | bool | `false` | Registers into `networkShadowUpstreams`; never serves real traffic; receives async mirrored traffic post-response. |
 | `upstreams[*].shadow.sampleRate` | `*float64` | nil → effective `1.0` | Probability a real response triggers a mirror to this upstream. |
@@ -809,6 +811,44 @@ SVM upstream gets its own slot/health poller automatically:
   ],
 }]`}
 />
+
+**7. Generic JSON-RPC upstreams (`type: jsonrpc`).** For JSON-RPC nodes that are neither
+EVM nor SVM, `jsonRpc.networkId` names the passthrough network the upstream serves. eRPC
+does not probe the node at bootstrap and forwards every method unchanged; failover,
+retries, rate limits and metrics work as for any other upstream:
+
+<ConfigTabs
+  path="projects[].upstreams[]"
+  focusYaml="5,7,10-11"
+  focusTs="6,8,10-11"
+  yaml={`projects:
+  - id: main
+    upstreams:
+      - id: btc-node-1
+        type: jsonrpc
+        endpoint: https://rpc.example.com
+        jsonRpc: { networkId: bitcoin-mainnet }
+      - id: btc-node-2
+        endpoint: wss://rpc2.example.com
+        # type omitted: inferred as jsonrpc from networkId
+        jsonRpc: { networkId: bitcoin-mainnet }`}
+  ts={`projects: [{
+  id: "main",
+  upstreams: [
+    {
+      id: "btc-node-1",
+      type: "jsonrpc",
+      endpoint: "https://rpc.example.com",
+      jsonRpc: { networkId: "bitcoin-mainnet" },
+    },
+    // type omitted: inferred as jsonrpc from networkId
+    { id: "btc-node-2", endpoint: "wss://rpc2.example.com", jsonRpc: { networkId: "bitcoin-mainnet" } },
+  ],
+}]`}
+/>
+
+Without a matching entry in `networks[]`, the `jsonrpc:bitcoin-mainnet` network is created
+on its first request (`POST /main/jsonrpc/bitcoin-mainnet`).
 
 ### Request/response behavior
 

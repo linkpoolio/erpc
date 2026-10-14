@@ -358,6 +358,21 @@ eRPC minimises the gap in three ways:
 
 Even so, a transient single-block lag can reach a client when the chain produces a block faster than an in-flight HTTP round-trip completes. If your consumer treats single-block HTTP-vs-WS lag as a hard failure, widen its tolerance to match the chain's block time rather than expect eRPC (or any proxy) to eliminate it.
 
+## Metrics
+
+Requests that reach the network are counted in the same metrics as HTTP traffic; `erpc_network_request_received_total` carries `transport="ws"` for them (`"http"` otherwise). The metrics below cover the WebSocket connection itself; the [metrics reference](/reference/metrics) also lists the subscription pressure metrics (queue length, bytes, upstream subscriptions, dedup):
+
+| Metric | Type | Labels | What it counts |
+|---|---|---|---|
+| `erpc_websocket_connections_active` | gauge | project, network | Client connections currently open. |
+| `erpc_websocket_connections_closed_total` | counter | project, network, close_code, initiator | Closed client connections. `initiator="client"` when the client ended the connection (`close_code` is the code it sent, `1006` when it went away without a close frame or stopped answering pings); `initiator="server"` when eRPC did (for example `1001` on shutdown, `1013` on a `logs` buffer overflow). Codes outside `1000`-`1015` are reported as `other`. |
+| `erpc_websocket_requests_total` | counter | project, network, category, user, agent_name, outcome | Every JSON-RPC request received on a client connection, batch items counted individually, including requests rejected before they reach the network. `outcome` is one of `ok`, `error`, `rate_limited`, `invalid`, `invalid_batch`, `method_not_allowed`, `unauthorized`, `network_unavailable`. `category` is the method once the request is authenticated and `n/a` before that, so unauthenticated clients cannot create series with arbitrary method names. |
+| `erpc_websocket_subscriptions_active` | gauge | project, network, kind | Active `eth_subscribe` subscriptions. |
+| `erpc_websocket_notifications_sent_total` | counter | project, network, kind, user, agent_name | Subscription notifications written to clients. |
+| `erpc_websocket_subscription_notifications_dropped_total` | counter | project, network, kind, user, agent_name | Notifications dropped because the subscription's buffer was full (see [Subscription features](#subscription-features)). |
+
+`user` and `agent_name` are the values of the request (or of the `eth_subscribe` call, for subscription metrics), and can be dropped with a [`metrics.customizations`](/operation/monitoring) label rule like on every other counter. Gauges carry no `user` label because gauge labels cannot be customized.
+
 ## Directives
 
 [Request directives](/operation/directives) can be set via headers or query parameters on the initial WebSocket upgrade request. They apply to every regular RPC request on that connection, batches included, subject to the same `allowClientDirectives` rules as HTTP:

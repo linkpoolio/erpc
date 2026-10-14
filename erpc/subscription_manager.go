@@ -88,7 +88,7 @@ func (sm *SubscriptionManager) Subscribe(
 		return nil, err
 	}
 
-	conn := sm.getOrCreateConn(wsc, nw.Label())
+	conn := sm.getOrCreateConn(wsc)
 	if conn == nil {
 		return nil, wsclient.ErrClosed
 	}
@@ -365,7 +365,7 @@ func (sm *SubscriptionManager) resolveSubscription(ctx context.Context, networkI
 
 // getOrCreateConn returns the connection's entry, attaching a new egress
 // on first use, or nil once the connection was cleaned up.
-func (sm *SubscriptionManager) getOrCreateConn(wsc *WsConnection, networkLabel string) *connEntry {
+func (sm *SubscriptionManager) getOrCreateConn(wsc *WsConnection) *connEntry {
 	sm.connMu.Lock()
 	defer sm.connMu.Unlock()
 	if wsc.subsClosed {
@@ -374,7 +374,6 @@ func (sm *SubscriptionManager) getOrCreateConn(wsc *WsConnection, networkLabel s
 	if existing, ok := sm.conns[wsc.id]; ok {
 		return existing
 	}
-	wsc.networkLabel = networkLabel
 	adapter := wsclient.New(wsc.id, wsc, sm.logger, wsc.server.serverCfg.WebSocket.SubscriptionBufferSize)
 	entry := &connEntry{adapter: adapter, detach: sm.idx.Attach(adapter)}
 	sm.conns[wsc.id] = entry

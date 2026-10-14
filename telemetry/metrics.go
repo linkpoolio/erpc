@@ -135,6 +135,30 @@ var (
 		Help:      "Whether the upstream WebSocket connection is currently established (1) or down/wedged (0).",
 	}, []string{"project", "vendor", "network", "upstream"})
 
+	// MetricWebsocketConnectionsClosedTotal counts closed client WebSocket
+	// connections. initiator is "client" when the peer ended the connection
+	// (close_code is the code it sent, or 1006 when it vanished without a close
+	// frame) and "server" otherwise (close_code is the code eRPC sent). Codes
+	// outside the range defined by RFC 6455 are reported as "other" so a client
+	// cannot mint series by choosing arbitrary close codes.
+	MetricWebsocketConnectionsClosedTotal = DefineCounter(prometheus.CounterOpts{
+		Namespace: "erpc",
+		Name:      "websocket_connections_closed_total",
+		Help:      "Total number of client WebSocket connections closed, by close code and initiator.",
+	}, []string{"project", "network", "close_code", "initiator"})
+
+	// MetricWebsocketRequestsTotal counts every JSON-RPC request a client sends
+	// over WebSocket (batch items individually), including those rejected
+	// before they reach the network and therefore absent from
+	// network_request_received_total. category is "n/a" until the request is
+	// authenticated, so unauthenticated clients cannot mint series with
+	// arbitrary method names.
+	MetricWebsocketRequestsTotal = DefineLabeledCounter(prometheus.CounterOpts{
+		Namespace: "erpc",
+		Name:      "websocket_requests_total",
+		Help:      "Total number of JSON-RPC requests received over client WebSocket connections, by outcome (ok, error, invalid, invalid_batch, method_not_allowed, unauthorized, rate_limited, network_unavailable).",
+	}, []string{"project", "network", "category", "user", "agent_name", "outcome"})
+
 	MetricWebsocketSubscriptionNotificationsDroppedTotal = DefineCounter(prometheus.CounterOpts{
 		Namespace: "erpc",
 		Name:      "websocket_subscription_notifications_dropped_total",
@@ -145,7 +169,7 @@ var (
 		Namespace: "erpc",
 		Name:      "websocket_connections_active",
 		Help:      "Open client WebSocket connections.",
-	}, []string{"project"})
+	}, []string{"project", "network"})
 
 	MetricWebsocketSubscriptionsActive = DefineGauge(prometheus.GaugeOpts{
 		Namespace: "erpc",

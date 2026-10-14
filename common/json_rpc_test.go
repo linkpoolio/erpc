@@ -238,6 +238,36 @@ func TestJsonRpcRequest_MarshalParams(t *testing.T) {
 	})
 }
 
+func TestJsonRpcResponse_ErrorNullIsSuccess(t *testing.T) {
+	t.Run("ParseFromStream", func(t *testing.T) {
+		raw := `{"result":67851510,"error":null,"id":1}`
+		r := &JsonRpcResponse{}
+		require.NoError(t, r.ParseFromStream(nil, bytes.NewReader([]byte(raw)), len(raw)))
+		assert.Nil(t, r.Error)
+		assert.Equal(t, "67851510", string(r.result))
+	})
+
+	t.Run("ParseError", func(t *testing.T) {
+		r := &JsonRpcResponse{}
+		require.NoError(t, r.ParseError("null"))
+		assert.Nil(t, r.Error)
+	})
+
+	t.Run("FromBytes", func(t *testing.T) {
+		r, err := NewJsonRpcResponseFromBytes([]byte("1"), []byte(`"ok"`), []byte("null"))
+		require.NoError(t, err)
+		assert.Nil(t, r.Error)
+	})
+
+	t.Run("NonNullErrorStillParsed", func(t *testing.T) {
+		raw := `{"result":null,"error":{"code":-32601,"message":"Method not found"},"id":1}`
+		r := &JsonRpcResponse{}
+		require.NoError(t, r.ParseFromStream(nil, bytes.NewReader([]byte(raw)), len(raw)))
+		require.NotNil(t, r.Error)
+		assert.Equal(t, -32601, r.Error.Code)
+	})
+}
+
 func TestJsonRpcResponse_CanonicalHash_EmptyishNormalization(t *testing.T) {
 	// Test cases that should produce the same hash due to emptyish normalization
 	testGroups := []struct {

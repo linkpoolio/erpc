@@ -12,7 +12,9 @@ import (
 
 func NewPayloadFromHttp(method string, remoteAddr string, headers http.Header, args url.Values) (*AuthPayload, error) {
 	ap := &AuthPayload{
-		Method: method,
+		Method:     method,
+		Headers:    headers,
+		RemoteAddr: remoteAddr,
 	}
 
 	if token := args.Get("token"); token != "" { // deprecated

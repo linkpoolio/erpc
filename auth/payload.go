@@ -1,6 +1,10 @@
 package auth
 
-import "github.com/erpc/erpc/common"
+import (
+	"net/http"
+
+	"github.com/erpc/erpc/common"
+)
 
 type AuthPayload struct {
 	Method string
@@ -8,6 +12,13 @@ type AuthPayload struct {
 	Secret *SecretPayload
 	Jwt    *JwtPayload
 	Siwe   *SiwePayload
+
+	// Headers and RemoteAddr carry the raw transport context for strategies
+	// that need it rather than a credential extracted up front (e.g.
+	// forwardedClientId reads its configured header and checks the direct
+	// peer). They are only populated for HTTP and WebSocket requests.
+	Headers    http.Header
+	RemoteAddr string
 }
 
 // This payload is used by both "secret" and "database" strategies

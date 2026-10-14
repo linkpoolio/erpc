@@ -119,6 +119,8 @@ For each HTTP request, eRPC extracts credential signals from query params and he
 8. `X-Siwe-Message` + `X-Siwe-Signature` headers → `AuthTypeSiwe`
 9. No credential present → `AuthTypeNetwork` (fallback)
 
+The `forwardedClientId` strategy does not take part in this order: it is offered every request that carries its configured header (whatever credential type was extracted), in declaration order like any other strategy.
+
 gRPC metadata uses a parallel order without query-param equivalents: `x-erpc-secret-token`, then `authorization: Basic`, `authorization: Bearer`, then `x-siwe-message`+`x-siwe-signature`, then network fallback. gRPC has no `?token=` / `?secret=` / `?jwt=` equivalents — query params are not available in gRPC metadata.
 
 **Method filtering.** Every strategy accepts `ignoreMethods` and `allowMethods` wildcard lists. `ignoreMethods` is evaluated first; `allowMethods` overrides it. The canonical pattern for restricting a strategy to one method is `ignoreMethods: ["*"]` plus `allowMethods: ["eth_getLogs"]`.
@@ -152,6 +154,19 @@ Both raw and base64-encoded message forms are accepted. SIWE requires both `?sig
 Authorizes requests by client IP address against an allowlist of exact IPs and CIDR ranges. This is the credential-less fallback — any request arriving without a recognizable token, JWT, or SIWE payload receives `AuthTypeNetwork` and is routed here if configured.
 
 Authenticate: reads `req.ClientIP()` (proxy-resolved by HTTP ingress). Checks localhost → exact IP list → CIDR list. First match wins. `ipAsUser=false` (default): all IPs in a CIDR range share one identity (`cidr.String()`). `ipAsUser=true`: each IP gets its own identity (`clientIP.String()`).
+
+#### forwardedClientId strategy
+
+For deployments where eRPC sits behind an API gateway or reverse proxy that already authenticates callers (API keys, OAuth, mTLS, …) and forwards the authenticated client's id in a request header. eRPC trusts that header as the `User.Id` without verifying any credential itself, so per-client rate-limit budgets, `allowMethods`/`ignoreMethods` scoping and the `user` metric label all work without duplicating the gateway's key store in eRPC.
+
+**Security model.** Anyone who can reach eRPC directly and set the header can claim any id. Only enable this strategy when every request reaches eRPC through a proxy that **strips or overwrites** the header on incoming client requests, and keep eRPC itself off the public network. Defense in depth:
+- `allowedProxies` — only trust the header when the direct TCP peer (the socket's remote address, not the `X-Forwarded-For`-resolved client IP) is one of these IPs/CIDRs.
+- `allowedIds` — reject any id not in the list; also bounds the cardinality of the `user` label.
+- A header with more than one value is rejected (the proxy appended instead of overwriting, so a client-supplied copy might come first). Ids must be 1–256 visible ASCII characters without commas.
+
+Supports: any HTTP or WebSocket request carrying the configured header (WebSocket uses the upgrade request's headers). gRPC is not supported. The strategy is never active unless it is configured — a request carrying the header against a project without this strategy is unaffected.
+
+Compared to the project-level `trustUserIdHeader` (identity for metrics/logs only, never authenticates), `forwardedClientId` **authenticates**: the request is admitted because the header is present, and the strategy's `rateLimitBudget`/`allowClientDirectives` apply.
 
 #### database strategy
 
@@ -195,7 +210,7 @@ Authenticate fast paths (in evaluation order):
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `strategies[*].type` | `string` | Inferred from sub-config block | `"secret"`, `"jwt"`, `"siwe"`, `"network"`, `"database"`. Block presence force-overwrites `type` for secret/database/jwt/siwe. For network, only `type: "network"` triggers auto-creation; the network block does not overwrite type. <SourceLink file="common/defaults.go" lines="2636-2666" /> |
+| `strategies[*].type` | `string` | Inferred from sub-config block | `"secret"`, `"jwt"`, `"siwe"`, `"network"`, `"database"`, `"forwardedClientId"`. Block presence force-overwrites `type` for secret/database/jwt/siwe/forwardedClientId. For network, only `type: "network"` triggers auto-creation; the network block does not overwrite type. <SourceLink file="common/defaults.go" lines="2636-2666" /> |
 | `strategies[*].ignoreMethods` | `[]string` | `nil` | Wildcard patterns (supports `*`, `\|`, `&`, `!`). Applied before `allowMethods`. <SourceLink file="auth/authorizer.go" lines="86-98" /> |
 | `strategies[*].allowMethods` | `[]string` | `nil` | Overrides `ignoreMethods`; any matching allow re-enables the strategy for that method. <SourceLink file="auth/authorizer.go" lines="100-113" /> |
 | `strategies[*].rateLimitBudget` | `string` | `""` | Strategy-level budget ID. Overridden by per-user budget when non-empty. <SourceLink file="auth/authorizer.go" lines="119-127" /> |
@@ -241,6 +256,19 @@ YAML prefix: `auth.strategies[*].siwe`
 | `siwe.rateLimitBudget` | `string` | `""` | Attached to `User.RateLimitBudget` if non-empty. <SourceLink file="auth/strategy_siwe.go" lines="53-55" /> |
 
 Supports: `AuthTypeSiwe` only. `SetDefaults`: no-op.
+
+**`forwardedClientId` strategy — `ForwardedClientIdStrategyConfig`**
+
+YAML prefix: `auth.strategies[*].forwardedClientId`
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `forwardedClientId.header` | `string` | `"X-Client-Id"` | Request header carrying the client id (case-insensitive). Must be a valid header name. Its trimmed value becomes `User.Id`. <SourceLink file="auth/strategy_forwarded_client_id.go" /> |
+| `forwardedClientId.allowedIds` | `[]string` | `nil` (any id) | If set, ids outside the list are rejected with `ErrAuthUnauthorized`. <SourceLink file="auth/strategy_forwarded_client_id.go" /> |
+| `forwardedClientId.allowedProxies` | `[]string` | `nil` (any peer) | IPs/CIDRs of the proxy allowed to set the header, matched against the direct TCP peer address. Invalid entries fail startup validation. <SourceLink file="auth/strategy_forwarded_client_id.go" /> |
+| `forwardedClientId.rateLimitBudget` | `string` | `""` | Attached to `User.RateLimitBudget` if non-empty. Combine with a `perUser` rule to give every forwarded client its own quota. <SourceLink file="auth/strategy_forwarded_client_id.go" /> |
+
+Supports: any payload carrying the configured header (independent of the extracted credential type). `SetDefaults`: sets `header = "X-Client-Id"` if empty; `type: forwardedClientId` auto-creates the block and the block forces `type`.
 
 **`network` strategy — `NetworkStrategyConfig`**
 
@@ -579,6 +607,40 @@ they naturally expire. Always set `allowedAlgorithms` to prevent algorithm-confu
 }`}
 />
 
+**6. Behind an API gateway that authenticates callers and forwards their id.** The gateway
+validates the caller's API key, strips any client-supplied `X-Client-Id`, and sets it to the
+authenticated consumer's name. eRPC trusts it only from the gateway's address range and gives
+each forwarded client its own quota via a `perUser` budget rule:
+
+<ConfigTabs
+  path="projects[].auth.strategies[]"
+  yaml={`# ONLY safe when the gateway strips/overwrites X-Client-Id on incoming
+# requests and eRPC is not reachable without going through it.
+- type: forwardedClientId
+  forwardedClientId:
+    header: X-Client-Id
+    # direct TCP peer must be the gateway (not the X-Forwarded-For client IP)
+    allowedProxies: ["10.20.0.0/16"]
+    # optional: reject ids the gateway should never send
+    allowedIds: ["client-a", "client-b"]
+    # pair with a perUser rule so every client id gets its own quota
+    rateLimitBudget: per-client`}
+  ts={`// ONLY safe when the gateway strips/overwrites X-Client-Id on incoming
+// requests and eRPC is not reachable without going through it.
+{
+  type: "forwardedClientId",
+  forwardedClientId: {
+    header: "X-Client-Id",
+    // direct TCP peer must be the gateway (not the X-Forwarded-For client IP)
+    allowedProxies: ["10.20.0.0/16"],
+    // optional: reject ids the gateway should never send
+    allowedIds: ["client-a", "client-b"],
+    // pair with a perUser rule so every client id gets its own quota
+    rateLimitBudget: "per-client",
+  },
+},`}
+/>
+
 ### Request/response behavior
 
 - A successful auth attaches `User{Id, RateLimitBudget}` to the request; `User.Id` flows into log context and Prometheus labels on every downstream metric. [<SourceLink file="auth/registry.go" lines="74-76" />]
@@ -598,6 +660,7 @@ they naturally expire. Always set `allowedAlgorithms` to prevent algorithm-confu
 - **Never set `rateLimitBudget` on a `healthCheck.auth` strategy** — the healthcheck auth registry is created with a nil rate-limiter registry; reaching the budget-acquisition path causes a nil pointer panic.
 - **Enable `failOpen` with a capped emergency budget on `database`** — a DB outage should not make your RPC endpoint unreachable; the circuit-breaker bounds probe load to ~1 query/second per replica.
 - **DynamoDB `lockRetryInterval` defaults to `0`** — zero means busy-spin retries during lock contention; set to `100ms` or higher in production to avoid rapid API calls and unexpected cost.
+- **Pin `forwardedClientId` to the proxy with `allowedProxies`** — the header is a claim, not a credential; make sure only the proxy that strips/overwrites it can deliver it, and consider `allowedIds` to bound the `user` label cardinality.
 - **Use `secret` only for private, server-side callers** — the plain string comparison is not timing-safe; for browser-reachable endpoints, prefer `jwt` or `database`.
 
 ### Edge cases & gotchas
@@ -612,7 +675,7 @@ they naturally expire. Always set `allowedAlgorithms` to prevent algorithm-confu
 8. **secret uses non-constant-time comparison.** Plain `!=` is timing-side-channel vulnerable for public internet exposures.
 9. **Database negative cache TTL is hardcoded at 5 seconds.** Not configurable. Re-enabled keys are rejected for up to 5 seconds.
 10. **Connector-down probe is per-process.** One probe/second per replica, no cross-replica coordination.
-11. **type inference conflict.** Setting multiple sub-config blocks (e.g. both `secret:` and `jwt:`) in one strategy entry causes the last-evaluated block to silently overwrite `type`. Evaluation order: `secret → database → jwt → siwe`. Never set multiple sub-config blocks in one strategy entry.
+11. **type inference conflict.** Setting multiple sub-config blocks (e.g. both `secret:` and `jwt:`) in one strategy entry causes the last-evaluated block to silently overwrite `type`. Evaluation order: `secret → database → jwt → siwe → forwardedClientId`. Never set multiple sub-config blocks in one strategy entry.
 12. **`Authorization: Basic` username is silently discarded.** Only the password field is used as the secret value. `alice:mysecret` and `bob:mysecret` are treated identically.
 13. **JWT requires keys.** Configure `verificationKeys` and/or `verificationJwksUrl`. With neither, startup validation fails. An empty resolved key map rejects every JWT (deny-all, not allow-all).
 14. **SIWE requires both signature and message together.** Missing either one causes silent fallthrough to network-strategy payload extraction.
@@ -630,6 +693,7 @@ they naturally expire. Always set `allowedAlgorithms` to prevent algorithm-confu
 26. **`verificationJwksUrl` must be absolute HTTP(S).** Non-empty values are parsed at startup; scheme must be `http` or `https` and a host is required. Scheme-less hosts, `file://`, and other schemes fail validation even when static `verificationKeys` are also set. [<SourceLink file="common/validation.go" />]
 
 27. **JWT `jwt.Parse` failures are classified into `AuthUnauthorizedReason`.** Bad signatures → `invalid_signature` / "invalid signature"; expired tokens (`ValidationErrorExpired`) → `token_expired` / "token expired". If both bits are set, signature wins — claims (including `exp`) are untrusted without a valid sig. Other `ValidationError` flags keep the jwt library text without a `reason` detail. Classification lives in auth (not `common`) to avoid importing `golang-jwt` into `common`. [<SourceLink file="auth/strategy_jwt.go" />, <SourceLink file="common/errors.go" lines="548-615" />]
+28. **`forwardedClientId` trusts a header.** It authenticates whoever can set the header. A proxy that *appends* to the header rather than overwriting it yields two values, which the strategy rejects; a proxy that passes a client-supplied header through untouched is a full auth bypass. The id is used verbatim in logs, metric labels and `perUser` rate-limit keys.
 
 ### Observability
 
@@ -665,6 +729,7 @@ No dedicated auth trace spans — auth runs inline inside the HTTP handler gorou
 - [`auth/strategy_database.go:L271-L357`](https://github.com/erpc/erpc/blob/main/auth/strategy_database.go#L271-L357) — connector-down circuit-breaker, probe election, fail-open
 - [`auth/strategy_jwt.go:L100-L116`](https://github.com/erpc/erpc/blob/main/auth/strategy_jwt.go#L100-L116) — JWT key selection (kid lookup + type-compatibility scan)
 - [`auth/strategy_siwe.go:L22-L67`](https://github.com/erpc/erpc/blob/main/auth/strategy_siwe.go#L22-L67) — SIWE signature verification + domain allowlist
+- [`auth/strategy_forwarded_client_id.go`](https://github.com/erpc/erpc/blob/main/auth/strategy_forwarded_client_id.go) — ForwardedClientIdStrategy: header lookup, proxy pinning, id validation, `allowedIds`
 - [`auth/strategy_network.go:L47-L93`](https://github.com/erpc/erpc/blob/main/auth/strategy_network.go#L47-L93) — NetworkStrategy: localhost/IP/CIDR checks, `ipAsUser` mode
 - [`common/config.go:L2433-L2534`](https://github.com/erpc/erpc/blob/main/common/config.go#L2433-L2534) — all auth config type declarations
 - [`common/defaults.go:L2611-L2761`](https://github.com/erpc/erpc/blob/main/common/defaults.go#L2611-L2761) — SetDefaults for all auth types

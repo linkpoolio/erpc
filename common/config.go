@@ -3043,11 +3043,12 @@ func (s *SelectionPolicyConfig) UnmarshalYAML(unmarshal func(interface{}) error)
 type AuthType string
 
 const (
-	AuthTypeSecret   AuthType = "secret"
-	AuthTypeDatabase AuthType = "database"
-	AuthTypeJwt      AuthType = "jwt"
-	AuthTypeSiwe     AuthType = "siwe"
-	AuthTypeNetwork  AuthType = "network"
+	AuthTypeSecret            AuthType = "secret"
+	AuthTypeDatabase          AuthType = "database"
+	AuthTypeJwt               AuthType = "jwt"
+	AuthTypeSiwe              AuthType = "siwe"
+	AuthTypeNetwork           AuthType = "network"
+	AuthTypeForwardedClientId AuthType = "forwardedClientId"
 )
 
 type AuthConfig struct {
@@ -3084,6 +3085,8 @@ type AuthStrategyConfig struct {
 	Database *DatabaseStrategyConfig `yaml:"database,omitempty" json:"database,omitempty"`
 	Jwt      *JwtStrategyConfig      `yaml:"jwt,omitempty" json:"jwt,omitempty"`
 	Siwe     *SiweStrategyConfig     `yaml:"siwe,omitempty" json:"siwe,omitempty"`
+
+	ForwardedClientId *ForwardedClientIdStrategyConfig `yaml:"forwardedClientId,omitempty" json:"forwardedClientId,omitempty"`
 }
 
 type SecretStrategyConfig struct {
@@ -3151,6 +3154,32 @@ type JwtStrategyConfig struct {
 	// will be used to set the per-user RateLimitBudget override.
 	// Defaults to "rlm".
 	RateLimitBudgetClaimName string `yaml:"rateLimitBudgetClaimName,omitempty" json:"rateLimitBudgetClaimName,omitempty"`
+}
+
+// DefaultForwardedClientIdHeader is the request header the forwardedClientId
+// auth strategy reads when no header is configured.
+const DefaultForwardedClientIdHeader = "X-Client-Id"
+
+// ForwardedClientIdStrategyConfig authenticates callers by a client id that a
+// trusted reverse proxy / API gateway has already authenticated and forwarded
+// in a request header. eRPC does not verify any credential itself: anyone who
+// can reach eRPC directly and set this header can claim any id. Only enable it
+// when every request reaches eRPC through a proxy that strips or overwrites
+// the header on incoming client requests, and prefer pinning that proxy with
+// AllowedProxies.
+type ForwardedClientIdStrategyConfig struct {
+	// Header is the request header carrying the client id.
+	// Defaults to "X-Client-Id".
+	Header string `yaml:"header,omitempty" json:"header,omitempty"`
+	// AllowedIds, if set, restricts accepted client ids to this list. Any
+	// other id is rejected. Also bounds the cardinality of the `user` label.
+	AllowedIds []string `yaml:"allowedIds,omitempty" json:"allowedIds,omitempty"`
+	// AllowedProxies, if set, only trusts the header when the direct TCP peer
+	// (not the X-Forwarded-For resolved client IP) matches one of these IPs or
+	// CIDRs, so callers that bypass the proxy cannot set the header.
+	AllowedProxies []string `yaml:"allowedProxies,omitempty" json:"allowedProxies,omitempty"`
+	// RateLimitBudget, if set, is applied to the authenticated user.
+	RateLimitBudget string `yaml:"rateLimitBudget,omitempty" json:"rateLimitBudget,omitempty"`
 }
 
 type SiweStrategyConfig struct {

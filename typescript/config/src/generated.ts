@@ -1957,6 +1957,7 @@ export const AuthTypeDatabase: AuthType = "database";
 export const AuthTypeJwt: AuthType = "jwt";
 export const AuthTypeSiwe: AuthType = "siwe";
 export const AuthTypeNetwork: AuthType = "network";
+export const AuthTypeForwardedClientId: AuthType = "forwardedClientId";
 export interface AuthConfig {
   strategies: TsAuthStrategyConfig[];
 }
@@ -1988,6 +1989,7 @@ export interface AuthStrategyConfig {
   database?: DatabaseStrategyConfig;
   jwt?: JwtStrategyConfig;
   siwe?: SiweStrategyConfig;
+  forwardedClientId?: ForwardedClientIdStrategyConfig;
 }
 export interface SecretStrategyConfig {
   id: string;
@@ -2039,6 +2041,42 @@ export interface JwtStrategyConfig {
    * Defaults to "rlm".
    */
   rateLimitBudgetClaimName?: string;
+}
+/**
+ * DefaultForwardedClientIdHeader is the request header the forwardedClientId
+ * auth strategy reads when no header is configured.
+ */
+export const DefaultForwardedClientIdHeader = "X-Client-Id";
+/**
+ * ForwardedClientIdStrategyConfig authenticates callers by a client id that a
+ * trusted reverse proxy / API gateway has already authenticated and forwarded
+ * in a request header. eRPC does not verify any credential itself: anyone who
+ * can reach eRPC directly and set this header can claim any id. Only enable it
+ * when every request reaches eRPC through a proxy that strips or overwrites
+ * the header on incoming client requests, and prefer pinning that proxy with
+ * AllowedProxies.
+ */
+export interface ForwardedClientIdStrategyConfig {
+  /**
+   * Header is the request header carrying the client id.
+   * Defaults to "X-Client-Id".
+   */
+  header?: string;
+  /**
+   * AllowedIds, if set, restricts accepted client ids to this list. Any
+   * other id is rejected. Also bounds the cardinality of the `user` label.
+   */
+  allowedIds?: string[];
+  /**
+   * AllowedProxies, if set, only trusts the header when the direct TCP peer
+   * (not the X-Forwarded-For resolved client IP) matches one of these IPs or
+   * CIDRs, so callers that bypass the proxy cannot set the header.
+   */
+  allowedProxies?: string[];
+  /**
+   * RateLimitBudget, if set, is applied to the authenticated user.
+   */
+  rateLimitBudget?: string;
 }
 export interface SiweStrategyConfig {
   allowedDomains: string[];

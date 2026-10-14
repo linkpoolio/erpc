@@ -2839,9 +2839,9 @@ func (n *Network) prepareRequest(ctx context.Context, nr *common.NormalizedReque
 			)
 		}
 		evm.NormalizeHttpJsonRpc(ctx, nr, jsonRpcReq)
-	case common.ArchitectureSvm:
-		// SVM doesn't need any EVM-style normalization (hex padding, block tag expansion, etc.).
-		// Validate that the request parses as JSON-RPC and move on.
+	case common.ArchitectureSvm, common.ArchitectureJsonRpc:
+		// SVM doesn't need any EVM-style normalization (hex padding, block tag expansion, etc.),
+		// and jsonrpc is a passthrough. Validate that the request parses as JSON-RPC and move on.
 		if _, err := nr.JsonRpcRequest(ctx); err != nil {
 			return common.NewErrJsonRpcExceptionInternal(
 				0,
@@ -2904,6 +2904,11 @@ func (n *Network) GetFinality(ctx context.Context, req *common.NormalizedRequest
 	// plumbing Network's internal upstreams registry through the generic interface.
 	if n.cfg.Architecture == common.ArchitectureSvm {
 		return svm.GetFinality(ctx, n, req, resp)
+	}
+	// The jsonrpc passthrough has no chain model to derive finality from; only
+	// the per-method finalized/realtime config above applies.
+	if n.cfg.Architecture == common.ArchitectureJsonRpc {
+		return finality
 	}
 
 	blockRef, blockNumber, _ := evm.ExtractBlockReferenceFromRequest(ctx, req)

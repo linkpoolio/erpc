@@ -47,3 +47,35 @@ func TestClientRegistryRejectsProxyPoolForWebSocket(t *testing.T) {
 	_, err = registry.GetOrCreateClient(ctx, up)
 	require.ErrorContains(t, err, "proxyPool is not supported for WebSocket")
 }
+
+// jsonrpc (passthrough) upstreams reuse the generic HTTP and WebSocket
+// JSON-RPC clients; gRPC endpoints are EVM-only and must be refused.
+func TestClientRegistryJsonRpcUpstreams(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	logger := zerolog.Nop()
+	registry := NewClientRegistry(&logger, "test-project", nil, nil)
+
+	newUps := func(id, endpoint string) common.Upstream {
+		up := common.NewFakeUpstream(id)
+		up.Config().Type = common.UpstreamTypeJsonRpc
+		up.Config().Endpoint = endpoint
+		up.Config().JsonRpc = &common.JsonRpcUpstreamConfig{NetworkId: "bitcoin-mainnet"}
+		return up
+	}
+
+	client, err := registry.GetOrCreateClient(ctx, newUps("http-upstream", "http://rpc1.localhost"))
+	require.NoError(t, err)
+	require.IsType(t, &GenericHttpJsonRpcClient{}, client)
+
+	// Nothing listens on port 1: the initial dial fails fast and the client
+	// keeps retrying in the background until ctx is cancelled.
+	client, err = registry.GetOrCreateClient(ctx, newUps("ws-upstream", "ws://127.0.0.1:1"))
+	require.NoError(t, err)
+	require.NotNil(t, client)
+
+	for _, scheme := range []string{"grpc", "grpc+bds", "grpcs"} {
+		_, err = registry.GetOrCreateClient(ctx, newUps(scheme+"-upstream", scheme+"://rpc1.localhost"))
+		require.ErrorContains(t, err, "unsupported endpoint scheme for jsonrpc upstream", scheme)
+	}
+}

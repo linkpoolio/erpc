@@ -133,6 +133,33 @@ export interface EvmProbeEarliestInfo {
 }
 
 //////////
+// source: architecture_jsonrpc.go
+
+/**
+ * UpstreamTypeJsonRpc marks an upstream that speaks plain JSON-RPC and is
+ * served through the "jsonrpc" passthrough architecture. Such upstreams
+ * get no chain-specific detection, state polling or method hooks.
+ */
+export const UpstreamTypeJsonRpc: UpstreamType = "jsonrpc";
+/**
+ * JsonRpcNetworkConfig identifies a generic JSON-RPC network served by the
+ * "jsonrpc" passthrough architecture. It is meant for non-EVM, non-SVM nodes
+ * (for example Bitcoin-family or Stellar RPC servers) where eRPC should only
+ * provide routing, failover, rate limiting and metrics, and forward every
+ * method unchanged.
+ * The resulting network id is "jsonrpc:<id>". Upstreams join the network by
+ * setting the same value in jsonRpc.networkId.
+ */
+export interface JsonRpcNetworkConfig {
+  /**
+   * Id is the network slug, e.g. "bitcoin-mainnet". It may contain only
+   * alphanumeric characters, dash and underscore. When omitted it defaults
+   * to the network alias.
+   */
+  id?: string;
+}
+
+//////////
 // source: architecture_svm.go
 
 export const UpstreamTypeSvm: UpstreamType = "svm";
@@ -996,6 +1023,13 @@ export interface JsonRpcUpstreamConfig {
   enableGzip?: boolean;
   headers?: { [key: string]: string};
   proxyPool?: string;
+  /**
+   * NetworkId binds an upstream of type "jsonrpc" to the passthrough network
+   * "jsonrpc:<networkId>" (slug only, e.g. "bitcoin-mainnet"). Required for
+   * type jsonrpc; setting it on an upstream without an explicit type infers
+   * type jsonrpc. Ignored for other upstream types.
+   */
+  networkId?: string;
 }
 /**
  * GrpcUpstreamConfig tunes a gRPC (grpc:// / grpc+bds:// / grpcs://) upstream. It is the
@@ -1439,6 +1473,7 @@ export interface NetworkConfig {
   failsafe?: (FailsafeConfig | undefined)[];
   evm?: EvmNetworkConfig;
   svm?: SvmNetworkConfig;
+  jsonRpc?: JsonRpcNetworkConfig;
   selectionPolicy?: SelectionPolicyConfig;
   directiveDefaults?: DirectiveDefaultsConfig;
   alias?: string;
@@ -2621,6 +2656,11 @@ export interface ExecStateSnapshot {
 export type NetworkArchitecture = string;
 export const ArchitectureEvm: NetworkArchitecture = "evm";
 export const ArchitectureSvm: NetworkArchitecture = "svm";
+/**
+ * ArchitectureJsonRpc is a chain-agnostic passthrough for generic JSON-RPC
+ * upstreams: requests are forwarded as-is, with no architecture hooks.
+ */
+export const ArchitectureJsonRpc: NetworkArchitecture = "jsonrpc";
 export type Network = any;
 /**
  * EvmNetwork is the EVM-specific view of a Network. Callers that need

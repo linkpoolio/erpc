@@ -1944,8 +1944,14 @@ func (u *UpstreamConfig) SetDefaults(defaults *UpstreamConfig) error {
 		}
 	}
 	if u.Type == "" {
-		// TODO make actual calls to detect other types (solana, btc, etc)?
-		u.Type = UpstreamTypeEvm
+		if u.JsonRpc != nil && u.JsonRpc.NetworkId != "" {
+			// jsonRpc.networkId only has meaning for the jsonrpc passthrough
+			// architecture, so it is an unambiguous type signal.
+			u.Type = UpstreamTypeJsonRpc
+		} else {
+			// TODO make actual calls to detect other types (solana, btc, etc)?
+			u.Type = UpstreamTypeEvm
+		}
 	}
 
 	if len(u.Failsafe) > 0 {
@@ -2291,12 +2297,13 @@ func (n *NetworkConfig) SetDefaults(upstreams []*UpstreamConfig, defaults *Netwo
 			if n.Evm.StripSubscribeFromBlockZero == nil && defaults.Evm.StripSubscribeFromBlockZero != nil {
 				n.Evm.StripSubscribeFromBlockZero = defaults.Evm.StripSubscribeFromBlockZero
 			}
-		} else if n.Evm == nil && defaults.Evm != nil && n.Svm == nil && n.Architecture != ArchitectureSvm {
+		} else if n.Evm == nil && defaults.Evm != nil && n.Svm == nil && n.Architecture != ArchitectureSvm &&
+			n.JsonRpc == nil && n.Architecture != ArchitectureJsonRpc {
 			// Copy EVM defaults only onto networks that are (or can become) EVM.
-			// Without the SVM guard, a mixed project with networkDefaults.evm
-			// would inject an evm block into every svm network — and the
-			// architecture derivation below checks n.Evm BEFORE n.Svm, silently
-			// flipping an `svm:`-authored network to architecture=evm.
+			// Without the SVM/JSON-RPC guards, a mixed project with
+			// networkDefaults.evm would inject an evm block into every svm or
+			// jsonrpc network — and the architecture derivation below checks
+			// n.Evm first, silently flipping such a network to architecture=evm.
 			n.Evm = &EvmNetworkConfig{}
 			*n.Evm = *defaults.Evm
 		}
@@ -2322,6 +2329,8 @@ func (n *NetworkConfig) SetDefaults(upstreams []*UpstreamConfig, defaults *Netwo
 			n.Architecture = "evm"
 		} else if n.Svm != nil {
 			n.Architecture = ArchitectureSvm
+		} else if n.JsonRpc != nil {
+			n.Architecture = ArchitectureJsonRpc
 		}
 	}
 
@@ -2330,6 +2339,16 @@ func (n *NetworkConfig) SetDefaults(upstreams []*UpstreamConfig, defaults *Netwo
 	}
 	if n.Architecture == ArchitectureSvm && n.Svm == nil {
 		n.Svm = &SvmNetworkConfig{}
+	}
+	if n.Architecture == ArchitectureJsonRpc {
+		if n.JsonRpc == nil {
+			n.JsonRpc = &JsonRpcNetworkConfig{}
+		}
+		// The alias doubles as the network slug when no explicit id is given,
+		// so `architecture: jsonrpc` + `alias: foo` serves "jsonrpc:foo".
+		if n.JsonRpc.Id == "" {
+			n.JsonRpc.Id = n.Alias
+		}
 	}
 
 	// Apply methods defaults

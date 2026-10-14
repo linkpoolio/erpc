@@ -711,7 +711,7 @@ var (
 		Namespace: "erpc",
 		Name:      "network_request_received_total",
 		Help:      "Total number of requests received for a network.",
-	}, []string{"project", "network", "category", "finality", "user", "agent_name"})
+	}, []string{"project", "network", "category", "finality", "user", "agent_name", "transport"})
 
 	MetricNetworkMultiplexedRequests = DefineLabeledCounter(prometheus.CounterOpts{
 		Namespace: "erpc",

@@ -319,6 +319,7 @@ func (wsc *WsConnection) handleRequest(ctx context.Context, raw []byte, startedA
 	}()
 
 	nq := common.NewNormalizedRequest(raw)
+	nq.SetTransport("ws")
 	nq.ForwardHeaders = make(http.Header)
 	requestCtx := common.StartRequestSpan(ctx, nq)
 	nq.SetClientIP(wsc.server.resolveRealClientIP(wsc.httpReq))

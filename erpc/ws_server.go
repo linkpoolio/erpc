@@ -749,7 +749,9 @@ func (wsc *WsConnection) WriteSubscriptionNotification(sub wsclient.Subscription
 	if err != nil {
 		return err
 	}
-	telemetry.CounterHandle(telemetry.MetricWebsocketNotificationsSentTotal, labels...).Inc()
+	telemetry.CounterHandle(telemetry.MetricWebsocketNotificationsSentTotal,
+		wsc.project.Config.Id, wsc.networkLabel, sub.Kind.String(), sub.Labels.User, sub.Labels.AgentName,
+	).Inc()
 	telemetry.CounterHandle(telemetry.MetricWebsocketNotificationBytesTotal, labels...).Add(float64(body.n))
 	return nil
 }
@@ -771,7 +773,7 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 // diverging.
 func (wsc *WsConnection) NotificationDropped(sub wsclient.Subscription, lossy bool) {
 	telemetry.CounterHandle(telemetry.MetricWebsocketSubscriptionNotificationsDroppedTotal,
-		wsc.project.Config.Id, wsc.networkLabel, sub.Kind.String(),
+		wsc.project.Config.Id, wsc.networkLabel, sub.Kind.String(), sub.Labels.User, sub.Labels.AgentName,
 	).Inc()
 
 	now := time.Now().UnixNano()

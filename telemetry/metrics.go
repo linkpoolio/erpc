@@ -159,11 +159,11 @@ var (
 		Help:      "Total number of JSON-RPC requests received over client WebSocket connections, by outcome (ok, error, invalid, invalid_batch, method_not_allowed, unauthorized, rate_limited, network_unavailable).",
 	}, []string{"project", "network", "category", "user", "agent_name", "outcome"})
 
-	MetricWebsocketSubscriptionNotificationsDroppedTotal = DefineCounter(prometheus.CounterOpts{
+	MetricWebsocketSubscriptionNotificationsDroppedTotal = DefineLabeledCounter(prometheus.CounterOpts{
 		Namespace: "erpc",
 		Name:      "websocket_subscription_notifications_dropped_total",
 		Help:      "Subscription notifications dropped because a client's per-subscription buffer was full. For logs the client connection is closed with 1013.",
-	}, []string{"project", "network", "kind"})
+	}, []string{"project", "network", "kind", "user", "agent_name"})
 
 	MetricWebsocketConnectionsActive = DefineGauge(prometheus.GaugeOpts{
 		Namespace: "erpc",
@@ -177,11 +177,11 @@ var (
 		Help:      "Open client eth_subscribe subscriptions.",
 	}, []string{"project", "network", "kind"})
 
-	MetricWebsocketNotificationsSentTotal = DefineCounter(prometheus.CounterOpts{
+	MetricWebsocketNotificationsSentTotal = DefineLabeledCounter(prometheus.CounterOpts{
 		Namespace: "erpc",
 		Name:      "websocket_notifications_sent_total",
 		Help:      "Subscription notifications written to clients.",
-	}, []string{"project", "network", "kind"})
+	}, []string{"project", "network", "kind", "user", "agent_name"})
 
 	MetricWebsocketNotificationBytesTotal = DefineCounter(prometheus.CounterOpts{
 		Namespace: "erpc",

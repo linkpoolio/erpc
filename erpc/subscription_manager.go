@@ -133,7 +133,10 @@ func (sm *SubscriptionManager) Subscribe(
 	// Counted before it is visible, so a racing cleanup never takes the
 	// gauge below zero.
 	wsc.subscriptionsGauge(kind).Inc()
-	if err := conn.adapter.AddSubscription(clientSubID, key, kind, filterHash, maxSubs); err != nil {
+	if err := conn.adapter.AddSubscription(clientSubID, key, kind, filterHash, maxSubs, wsclient.SubscriptionLabels{
+		User:      nq.UserId(),
+		AgentName: nq.AgentName(),
+	}); err != nil {
 		wsc.subscriptionsGauge(kind).Dec()
 		sm.releaseFilter(ctx, key, kind, filterHash)
 		if errors.Is(err, wsclient.ErrLimitExceeded) {

@@ -339,6 +339,9 @@ func (nr *NetworksRegistry) prepareNetwork(nwCfg *common.NetworkConfig) (*Networ
 		if nr.svmJsonRpcCache != nil {
 			network.cacheDal = nr.svmJsonRpcCache.WithProjectId(nr.project.Config.Id)
 		}
+	case common.ArchitectureJsonRpc:
+		// No cache: without a chain model there is no way to tell which
+		// responses are safe to reuse.
 	}
 	// Register alias for lazy-created networks to support alias-based routing
 	if nwCfg.Alias != "" {
@@ -401,6 +404,11 @@ func (nr *NetworksRegistry) resolveNetworkConfig(networkId string) (*common.Netw
 				return nil, common.NewErrInvalidEvmChainId(networkId)
 			}
 			nwCfg.Svm = &common.SvmNetworkConfig{Chain: chain, Cluster: cluster}
+		case common.ArchitectureJsonRpc:
+			if !util.IsValidIdentifier(s[1]) {
+				return nil, common.NewErrInvalidRequest(fmt.Errorf("invalid jsonrpc network id: '%s'", networkId))
+			}
+			nwCfg.JsonRpc = &common.JsonRpcNetworkConfig{Id: s[1]}
 		default:
 			return nil, common.NewErrInvalidEvmChainId(networkId)
 		}

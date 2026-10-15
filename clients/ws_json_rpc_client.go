@@ -49,10 +49,11 @@ type WsJsonRpcClient struct {
 	Url     *url.URL
 	headers http.Header
 
-	projectId string
-	upstream  common.Upstream
-	appCtx    context.Context
-	logger    *zerolog.Logger
+	projectId       string
+	upstream        common.Upstream
+	appCtx          context.Context
+	logger          *zerolog.Logger
+	omitEmptyParams bool
 
 	pingInterval time.Duration
 	pongWait     time.Duration
@@ -184,6 +185,9 @@ func NewWsJsonRpcClient(
 		onReconnectCbs:  make(map[string]func()),
 		errorExtractor:  extractor,
 	}
+	if jsonRpcCfg != nil && jsonRpcCfg.OmitEmptyParams != nil {
+		client.omitEmptyParams = *jsonRpcCfg.OmitEmptyParams
+	}
 
 	if err := client.connect(); err != nil {
 		// readLoop keeps re-dialing in the background.
@@ -242,12 +246,15 @@ func (c *WsJsonRpcClient) SendRequest(ctx context.Context, req *common.Normalize
 	jrReq.RLock()
 	originalID := jrReq.ID
 	method := jrReq.Method
-	requestBody, err := common.SonicCfg.Marshal(map[string]interface{}{
+	envelope := map[string]interface{}{
 		"jsonrpc": jrReq.JSONRPC,
 		"id":      wireID,
 		"method":  method,
-		"params":  jrReq.Params,
-	})
+	}
+	if !c.omitEmptyParams || len(jrReq.Params) > 0 {
+		envelope["params"] = jrReq.Params
+	}
+	requestBody, err := common.SonicCfg.Marshal(envelope)
 	jrReq.RUnlock()
 	if err != nil {
 		common.SetTraceSpanError(span, err)

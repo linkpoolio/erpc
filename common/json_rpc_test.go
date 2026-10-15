@@ -210,6 +210,23 @@ func sortJSONReverse(v interface{}) ([]byte, error) {
 	}
 }
 
+func TestJsonRpcRequest_WireRequest(t *testing.T) {
+	r := &JsonRpcRequest{JSONRPC: "2.0", ID: 1, Method: "getHealth", Params: []interface{}{}}
+
+	raw, err := SonicCfg.Marshal(r.WireRequest(false))
+	require.NoError(t, err)
+	assert.Equal(t, `{"jsonrpc":"2.0","id":1,"method":"getHealth","params":[]}`, string(raw))
+
+	raw, err = SonicCfg.Marshal(r.WireRequest(true))
+	require.NoError(t, err)
+	assert.Equal(t, `{"jsonrpc":"2.0","id":1,"method":"getHealth"}`, string(raw))
+
+	r.Params = []interface{}{"0x1"}
+	raw, err = SonicCfg.Marshal(r.WireRequest(true))
+	require.NoError(t, err)
+	assert.Equal(t, `{"jsonrpc":"2.0","id":1,"method":"getHealth","params":["0x1"]}`, string(raw))
+}
+
 func TestJsonRpcRequest_MarshalParams(t *testing.T) {
 	t.Run("Empty", func(t *testing.T) {
 		rawReq, err := SonicCfg.Marshal(JsonRpcRequest{
@@ -235,6 +252,36 @@ func TestJsonRpcRequest_MarshalParams(t *testing.T) {
 
 		expectedRawReq := `{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":["0xcafecafecafecafecafecafecafecafecafecafe"]}`
 		assert.Equal(t, expectedRawReq, string(rawReq))
+	})
+}
+
+func TestJsonRpcResponse_ErrorNullIsSuccess(t *testing.T) {
+	t.Run("ParseFromStream", func(t *testing.T) {
+		raw := `{"result":67851510,"error":null,"id":1}`
+		r := &JsonRpcResponse{}
+		require.NoError(t, r.ParseFromStream(nil, bytes.NewReader([]byte(raw)), len(raw)))
+		assert.Nil(t, r.Error)
+		assert.Equal(t, "67851510", string(r.result))
+	})
+
+	t.Run("ParseError", func(t *testing.T) {
+		r := &JsonRpcResponse{}
+		require.NoError(t, r.ParseError("null"))
+		assert.Nil(t, r.Error)
+	})
+
+	t.Run("FromBytes", func(t *testing.T) {
+		r, err := NewJsonRpcResponseFromBytes([]byte("1"), []byte(`"ok"`), []byte("null"))
+		require.NoError(t, err)
+		assert.Nil(t, r.Error)
+	})
+
+	t.Run("NonNullErrorStillParsed", func(t *testing.T) {
+		raw := `{"result":null,"error":{"code":-32601,"message":"Method not found"},"id":1}`
+		r := &JsonRpcResponse{}
+		require.NoError(t, r.ParseFromStream(nil, bytes.NewReader([]byte(raw)), len(raw)))
+		require.NotNil(t, r.Error)
+		assert.Equal(t, -32601, r.Error.Code)
 	})
 }
 

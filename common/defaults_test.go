@@ -2083,3 +2083,20 @@ func TestUpstreamConfig_Copy_SvmBlockAvailabilityNotAliased(t *testing.T) {
 // but resolves no config (no gating, no caching, no block-ref extraction).
 // Canonicalization is lookup-only: the wire method string is forwarded
 // upstream verbatim (per JSON-RPC 2.0 the method member is case-sensitive).
+
+func TestUpstreamConfig_SetDefaults_OmitEmptyParams(t *testing.T) {
+	evm := &UpstreamConfig{Endpoint: "http://rpc1.localhost"}
+	require.NoError(t, evm.SetDefaults(nil))
+	require.NotNil(t, evm.JsonRpc.OmitEmptyParams)
+	assert.False(t, *evm.JsonRpc.OmitEmptyParams)
+
+	jr := &UpstreamConfig{Endpoint: "http://rpc1.localhost", JsonRpc: &JsonRpcUpstreamConfig{NetworkId: "chain-a"}}
+	require.NoError(t, jr.SetDefaults(nil))
+	assert.Equal(t, UpstreamTypeJsonRpc, jr.Type)
+	require.NotNil(t, jr.JsonRpc.OmitEmptyParams)
+	assert.True(t, *jr.JsonRpc.OmitEmptyParams)
+
+	optOut := &UpstreamConfig{Endpoint: "http://rpc1.localhost", JsonRpc: &JsonRpcUpstreamConfig{NetworkId: "chain-a", OmitEmptyParams: util.BoolPtr(false)}}
+	require.NoError(t, optOut.SetDefaults(nil))
+	assert.False(t, *optOut.JsonRpc.OmitEmptyParams)
+}

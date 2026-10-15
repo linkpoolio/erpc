@@ -1878,12 +1878,13 @@ func (u *UpstreamConfig) ApplyDefaults(defaults *UpstreamConfig) error {
 	}
 	if u.JsonRpc == nil && defaults.JsonRpc != nil {
 		u.JsonRpc = &JsonRpcUpstreamConfig{
-			SupportsBatch: defaults.JsonRpc.SupportsBatch,
-			BatchMaxSize:  defaults.JsonRpc.BatchMaxSize,
-			BatchMaxWait:  defaults.JsonRpc.BatchMaxWait,
-			EnableGzip:    defaults.JsonRpc.EnableGzip,
-			ProxyPool:     defaults.JsonRpc.ProxyPool,
-			Headers:       defaults.JsonRpc.Headers,
+			SupportsBatch:   defaults.JsonRpc.SupportsBatch,
+			BatchMaxSize:    defaults.JsonRpc.BatchMaxSize,
+			BatchMaxWait:    defaults.JsonRpc.BatchMaxWait,
+			EnableGzip:      defaults.JsonRpc.EnableGzip,
+			ProxyPool:       defaults.JsonRpc.ProxyPool,
+			Headers:         defaults.JsonRpc.Headers,
+			OmitEmptyParams: defaults.JsonRpc.OmitEmptyParams,
 		}
 	}
 	if u.Grpc == nil && defaults.Grpc != nil {
@@ -2038,6 +2039,9 @@ func (u *UpstreamConfig) SetDefaults(defaults *UpstreamConfig) error {
 	}
 	if err := u.JsonRpc.SetDefaults(); err != nil {
 		return fmt.Errorf("failed to set defaults for json rpc: %w", err)
+	}
+	if u.JsonRpc.OmitEmptyParams == nil {
+		u.JsonRpc.OmitEmptyParams = util.BoolPtr(u.Type == UpstreamTypeJsonRpc)
 	}
 	// By default if any allowed methods are specified, all other methods are ignored (unless ignoreMethods is explicitly defined by user)
 	// Similar to how common network security policies work.

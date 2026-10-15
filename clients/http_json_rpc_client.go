@@ -40,10 +40,11 @@ type GenericHttpJsonRpcClient struct {
 	httpClient      *http.Client
 	isLogLevelTrace bool
 
-	enableGzip    bool
-	supportsBatch bool
-	batchMaxSize  int
-	batchMaxWait  time.Duration
+	enableGzip      bool
+	omitEmptyParams bool
+	supportsBatch   bool
+	batchMaxSize    int
+	batchMaxWait    time.Duration
 
 	batchMu       sync.Mutex
 	batchRequests map[interface{}]*batchRequest
@@ -130,6 +131,10 @@ func NewGenericHttpJsonRpcClient(
 
 		if jsonRpcCfg.EnableGzip != nil {
 			client.enableGzip = *jsonRpcCfg.EnableGzip
+		}
+
+		if jsonRpcCfg.OmitEmptyParams != nil {
+			client.omitEmptyParams = *jsonRpcCfg.OmitEmptyParams
 		}
 
 		if jsonRpcCfg.Headers != nil {
@@ -371,7 +376,7 @@ func (c *GenericHttpJsonRpcClient) processBatch(alreadyLocked bool) {
 		return
 	}
 
-	batchReq := make([]common.JsonRpcRequest, 0, ln)
+	batchReq := make([]interface{}, 0, ln)
 	for _, req := range requests {
 		jrReq, err := req.request.JsonRpcRequest()
 		c.logger.Trace().Interface("id", req.request.ID()).Str("method", jrReq.Method).Msgf("preparing batch request")
@@ -387,12 +392,7 @@ func (c *GenericHttpJsonRpcClient) processBatch(alreadyLocked bool) {
 		}
 		req.request.RLock()
 		jrReq.RLock()
-		batchReq = append(batchReq, common.JsonRpcRequest{
-			JSONRPC: jrReq.JSONRPC,
-			Method:  jrReq.Method,
-			Params:  jrReq.Params,
-			ID:      jrReq.ID,
-		})
+		batchReq = append(batchReq, jrReq.WireRequest(c.omitEmptyParams))
 	}
 
 	requestBody, err := common.SonicCfg.Marshal(batchReq)
@@ -699,12 +699,7 @@ func (c *GenericHttpJsonRpcClient) sendSingleRequest(ctx context.Context, req *c
 
 	jrReq.RLock()
 	span.SetAttributes(attribute.String("request.method", jrReq.Method))
-	requestBody, err := common.SonicCfg.Marshal(common.JsonRpcRequest{
-		JSONRPC: jrReq.JSONRPC,
-		Method:  jrReq.Method,
-		Params:  jrReq.Params,
-		ID:      jrReq.ID,
-	})
+	requestBody, err := common.SonicCfg.Marshal(jrReq.WireRequest(c.omitEmptyParams))
 	jrReq.RUnlock()
 	if err != nil {
 		common.SetTraceSpanError(span, err)

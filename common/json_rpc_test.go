@@ -210,6 +210,23 @@ func sortJSONReverse(v interface{}) ([]byte, error) {
 	}
 }
 
+func TestJsonRpcRequest_WireRequest(t *testing.T) {
+	r := &JsonRpcRequest{JSONRPC: "2.0", ID: 1, Method: "getHealth", Params: []interface{}{}}
+
+	raw, err := SonicCfg.Marshal(r.WireRequest(false))
+	require.NoError(t, err)
+	assert.Equal(t, `{"jsonrpc":"2.0","id":1,"method":"getHealth","params":[]}`, string(raw))
+
+	raw, err = SonicCfg.Marshal(r.WireRequest(true))
+	require.NoError(t, err)
+	assert.Equal(t, `{"jsonrpc":"2.0","id":1,"method":"getHealth"}`, string(raw))
+
+	r.Params = []interface{}{"0x1"}
+	raw, err = SonicCfg.Marshal(r.WireRequest(true))
+	require.NoError(t, err)
+	assert.Equal(t, `{"jsonrpc":"2.0","id":1,"method":"getHealth","params":["0x1"]}`, string(raw))
+}
+
 func TestJsonRpcRequest_MarshalParams(t *testing.T) {
 	t.Run("Empty", func(t *testing.T) {
 		rawReq, err := SonicCfg.Marshal(JsonRpcRequest{

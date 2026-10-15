@@ -1332,6 +1332,12 @@ type JsonRpcUpstreamConfig struct {
 	// type jsonrpc; setting it on an upstream without an explicit type infers
 	// type jsonrpc. Ignored for other upstream types.
 	NetworkId string `yaml:"networkId,omitempty" json:"networkId,omitempty"`
+	// OmitEmptyParams leaves the "params" member out of outbound requests
+	// whose params are empty instead of sending "params":[]. "params" is
+	// optional in JSON-RPC 2.0 and some servers reject an empty positional
+	// array for methods without parameters. Defaults to true for upstreams of
+	// type jsonrpc and false otherwise.
+	OmitEmptyParams *bool `yaml:"omitEmptyParams,omitempty" json:"omitEmptyParams,omitempty"`
 }
 
 func (c *JsonRpcUpstreamConfig) Copy() *JsonRpcUpstreamConfig {

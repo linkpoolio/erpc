@@ -1212,6 +1212,25 @@ func isEmptyishValue(v interface{}) bool {
 // JSON-RPC Request
 //
 
+// jsonRpcRequestOmitEmptyParams is the wire shape of a request whose empty
+// params are left out (see JsonRpcUpstreamConfig.OmitEmptyParams).
+type jsonRpcRequestOmitEmptyParams struct {
+	JSONRPC string        `json:"jsonrpc,omitempty"`
+	ID      interface{}   `json:"id,omitempty"`
+	Method  string        `json:"method"`
+	Params  []interface{} `json:"params,omitempty"`
+}
+
+// WireRequest returns the value to serialize when sending r to an upstream.
+// With omitEmptyParams, empty params are left out instead of sent as
+// "params":[]. The caller must hold r's read lock.
+func (r *JsonRpcRequest) WireRequest(omitEmptyParams bool) interface{} {
+	if omitEmptyParams && len(r.Params) == 0 {
+		return &jsonRpcRequestOmitEmptyParams{JSONRPC: r.JSONRPC, ID: r.ID, Method: r.Method}
+	}
+	return &JsonRpcRequest{JSONRPC: r.JSONRPC, ID: r.ID, Method: r.Method, Params: r.Params}
+}
+
 type JsonRpcRequest struct {
 	sync.RWMutex
 

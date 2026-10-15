@@ -1030,6 +1030,14 @@ export interface JsonRpcUpstreamConfig {
    * type jsonrpc. Ignored for other upstream types.
    */
   networkId?: string;
+  /**
+   * OmitEmptyParams leaves the "params" member out of outbound requests
+   * whose params are empty instead of sending "params":[]. "params" is
+   * optional in JSON-RPC 2.0 and some servers reject an empty positional
+   * array for methods without parameters. Defaults to true for upstreams of
+   * type jsonrpc and false otherwise.
+   */
+  omitEmptyParams?: boolean;
 }
 /**
  * GrpcUpstreamConfig tunes a gRPC (grpc:// / grpc+bds:// / grpcs://) upstream. It is the

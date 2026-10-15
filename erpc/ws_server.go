@@ -47,6 +47,9 @@ type WsConnection struct {
 	costFrames bool
 	// notifyCostBlocks caches each subscription kind's notification block.
 	notifyCostBlocks [indexer.KindPendingTx + 1]atomic.Pointer[[]byte]
+	// credentialPath is the upgrade request's path when it may carry a
+	// secret (see auth.NewPayloadFromHttp), "" otherwise.
+	credentialPath string
 
 	// Write synchronization (gorilla/websocket requires synchronized writes)
 	writeMu sync.Mutex
@@ -82,6 +85,7 @@ func (s *HttpServer) handleWebSocket(
 	project *PreparedProject,
 	architecture string,
 	chainId string,
+	credentialPath string,
 ) {
 	wsCfg := s.serverCfg.WebSocket
 
@@ -103,20 +107,21 @@ func (s *HttpServer) handleWebSocket(
 	// so in-flight requests still get their response.
 	connCtx, connCancel := context.WithCancel(context.Background())
 	wsc := &WsConnection{
-		id:           fmt.Sprintf("ws-%d", atomic.AddInt64(&wsConnCounter, 1)),
-		conn:         wsConn,
-		ctx:          connCtx,
-		cancel:       connCancel,
-		logger:       lg,
-		server:       s,
-		project:      project,
-		networkId:    fmt.Sprintf("%s:%s", architecture, chainId),
-		architecture: common.NetworkArchitecture(architecture),
-		httpReq:      r,
-		costFrames:   s.costHeadersEnabled() && r.Header.Get(headerCostFrames) == "1",
-		sem:          make(chan struct{}, wsCfg.MaxConcurrentRequestsPerConnection),
-		stopped:      make(chan struct{}),
-		done:         make(chan struct{}),
+		id:             fmt.Sprintf("ws-%d", atomic.AddInt64(&wsConnCounter, 1)),
+		conn:           wsConn,
+		ctx:            connCtx,
+		cancel:         connCancel,
+		logger:         lg,
+		server:         s,
+		project:        project,
+		networkId:      fmt.Sprintf("%s:%s", architecture, chainId),
+		architecture:   common.NetworkArchitecture(architecture),
+		httpReq:        r,
+		credentialPath: credentialPath,
+		costFrames:     s.costHeadersEnabled() && r.Header.Get(headerCostFrames) == "1",
+		sem:            make(chan struct{}, wsCfg.MaxConcurrentRequestsPerConnection),
+		stopped:        make(chan struct{}),
+		done:           make(chan struct{}),
 	}
 
 	lg.Info().Str("connId", wsc.id).Str("remoteAddr", r.RemoteAddr).Msg("websocket connection established")
@@ -360,7 +365,7 @@ func (wsc *WsConnection) handleRequest(ctx context.Context, raw []byte, startedA
 		return unsupported("subscription methods (eth_subscribe, eth_unsubscribe) are not supported in batch requests"), notification
 	}
 
-	ap, err := auth.NewPayloadFromHttp(method, wsc.httpReq.RemoteAddr, headers, queryArgs)
+	ap, err := auth.NewPayloadFromHttp(method, wsc.httpReq.RemoteAddr, headers, queryArgs, wsc.credentialPath)
 	if err != nil {
 		return fail(err, &common.TRUE), notification
 	}

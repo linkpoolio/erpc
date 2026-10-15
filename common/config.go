@@ -3043,11 +3043,12 @@ func (s *SelectionPolicyConfig) UnmarshalYAML(unmarshal func(interface{}) error)
 type AuthType string
 
 const (
-	AuthTypeSecret   AuthType = "secret"
-	AuthTypeDatabase AuthType = "database"
-	AuthTypeJwt      AuthType = "jwt"
-	AuthTypeSiwe     AuthType = "siwe"
-	AuthTypeNetwork  AuthType = "network"
+	AuthTypeSecret            AuthType = "secret"
+	AuthTypeDatabase          AuthType = "database"
+	AuthTypeJwt               AuthType = "jwt"
+	AuthTypeSiwe              AuthType = "siwe"
+	AuthTypeNetwork           AuthType = "network"
+	AuthTypeForwardedClientId AuthType = "forwardedClientId"
 )
 
 type AuthConfig struct {
@@ -3084,13 +3085,33 @@ type AuthStrategyConfig struct {
 	Database *DatabaseStrategyConfig `yaml:"database,omitempty" json:"database,omitempty"`
 	Jwt      *JwtStrategyConfig      `yaml:"jwt,omitempty" json:"jwt,omitempty"`
 	Siwe     *SiweStrategyConfig     `yaml:"siwe,omitempty" json:"siwe,omitempty"`
+
+	ForwardedClientId *ForwardedClientIdStrategyConfig `yaml:"forwardedClientId,omitempty" json:"forwardedClientId,omitempty"`
 }
+
+// SecretLocation is a request location a secret can be read from besides the
+// standard ones (?secret=, ?token=, X-ERPC-Secret-Token, Authorization: Basic).
+type SecretLocation string
+
+const (
+	// SecretLocationApikeyQuery is the ?apikey= query parameter.
+	SecretLocationApikeyQuery SecretLocation = "apikeyQuery"
+	// SecretLocationApikeyHeader is the X-Api-Key or apikey header.
+	SecretLocationApikeyHeader SecretLocation = "apikeyHeader"
+	// SecretLocationPath is the URL path as a single segment
+	// (https://host/<secret>), only when a domain alias preselects project,
+	// architecture and chain so the path is not used for routing.
+	SecretLocationPath SecretLocation = "path"
+)
 
 type SecretStrategyConfig struct {
 	Id    string `yaml:"id" json:"id"`
 	Value string `yaml:"value" json:"value"`
 	// RateLimitBudget, if set, is applied to the authenticated user from this strategy
 	RateLimitBudget string `yaml:"rateLimitBudget,omitempty" json:"rateLimitBudget,omitempty"`
+	// AdditionalLocations also accepts the secret from these locations. Empty
+	// (the default) accepts only the standard ones.
+	AdditionalLocations []SecretLocation `yaml:"additionalLocations,omitempty" json:"additionalLocations,omitempty" tstype:"SecretLocation[]"`
 }
 
 // custom json marshaller to redact the secret value
@@ -3101,11 +3122,15 @@ func (s *SecretStrategyConfig) MarshalJSON() ([]byte, error) {
 }
 
 func (s *SecretStrategyConfig) MarshalYAML() (interface{}, error) {
-	return map[string]string{
+	out := map[string]interface{}{
 		"id":              s.Id,
 		"value":           "REDACTED",
 		"rateLimitBudget": s.RateLimitBudget,
-	}, nil
+	}
+	if len(s.AdditionalLocations) > 0 {
+		out["additionalLocations"] = s.AdditionalLocations
+	}
+	return out, nil
 }
 
 type DatabaseStrategyConfig struct {
@@ -3114,6 +3139,9 @@ type DatabaseStrategyConfig struct {
 	Retry     *DatabaseRetryConfig         `yaml:"retry,omitempty" json:"retry,omitempty"`
 	FailOpen  *DatabaseFailOpenConfig      `yaml:"failOpen,omitempty" json:"failOpen,omitempty"`
 	MaxWait   Duration                     `yaml:"maxWait,omitempty" json:"maxWait" tstype:"Duration"`
+	// AdditionalLocations also accepts the secret from these locations. Empty
+	// (the default) accepts only the standard ones.
+	AdditionalLocations []SecretLocation `yaml:"additionalLocations,omitempty" json:"additionalLocations,omitempty" tstype:"SecretLocation[]"`
 }
 
 type DatabaseStrategyCacheConfig struct {
@@ -3151,6 +3179,32 @@ type JwtStrategyConfig struct {
 	// will be used to set the per-user RateLimitBudget override.
 	// Defaults to "rlm".
 	RateLimitBudgetClaimName string `yaml:"rateLimitBudgetClaimName,omitempty" json:"rateLimitBudgetClaimName,omitempty"`
+}
+
+// DefaultForwardedClientIdHeader is the request header the forwardedClientId
+// auth strategy reads when no header is configured.
+const DefaultForwardedClientIdHeader = "X-Client-Id"
+
+// ForwardedClientIdStrategyConfig authenticates callers by a client id that a
+// trusted reverse proxy / API gateway has already authenticated and forwarded
+// in a request header. eRPC does not verify any credential itself: anyone who
+// can reach eRPC directly and set this header can claim any id. Only enable it
+// when every request reaches eRPC through a proxy that strips or overwrites
+// the header on incoming client requests, and prefer pinning that proxy with
+// AllowedProxies.
+type ForwardedClientIdStrategyConfig struct {
+	// Header is the request header carrying the client id.
+	// Defaults to "X-Client-Id".
+	Header string `yaml:"header,omitempty" json:"header,omitempty"`
+	// AllowedIds, if set, restricts accepted client ids to this list. Any
+	// other id is rejected. Also bounds the cardinality of the `user` label.
+	AllowedIds []string `yaml:"allowedIds,omitempty" json:"allowedIds,omitempty"`
+	// AllowedProxies, if set, only trusts the header when the direct TCP peer
+	// (not the X-Forwarded-For resolved client IP) matches one of these IPs or
+	// CIDRs, so callers that bypass the proxy cannot set the header.
+	AllowedProxies []string `yaml:"allowedProxies,omitempty" json:"allowedProxies,omitempty"`
+	// RateLimitBudget, if set, is applied to the authenticated user.
+	RateLimitBudget string `yaml:"rateLimitBudget,omitempty" json:"rateLimitBudget,omitempty"`
 }
 
 type SiweStrategyConfig struct {

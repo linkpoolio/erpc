@@ -3273,6 +3273,23 @@ func (s *AuthStrategyConfig) SetDefaults() error {
 		}
 	}
 
+	if s.Type == AuthTypeForwardedClientId && s.ForwardedClientId == nil {
+		s.ForwardedClientId = &ForwardedClientIdStrategyConfig{}
+	}
+	if s.ForwardedClientId != nil {
+		s.Type = AuthTypeForwardedClientId
+		if err := s.ForwardedClientId.SetDefaults(); err != nil {
+			return fmt.Errorf("failed to set defaults for forwardedClientId strategy: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (s *ForwardedClientIdStrategyConfig) SetDefaults() error {
+	if s.Header == "" {
+		s.Header = DefaultForwardedClientIdHeader
+	}
 	return nil
 }
 

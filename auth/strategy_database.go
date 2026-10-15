@@ -116,13 +116,17 @@ func NewDatabaseStrategy(appCtx context.Context, logger *zerolog.Logger, cfg *co
 }
 
 func (s *DatabaseStrategy) Supports(ap *AuthPayload) bool {
-	return ap.Type == common.AuthTypeSecret || ap.Type == common.AuthTypeDatabase
+	return ap.Type == common.AuthTypeSecret || ap.Type == common.AuthTypeDatabase || secretAccepted(ap, s.cfg.AdditionalLocations)
 }
 
 func (s *DatabaseStrategy) Authenticate(ctx context.Context, req *common.NormalizedRequest, ap *AuthPayload) (*common.User, error) {
 	if ap.Secret == nil {
 		s.recordAuthFailureMetric(req, "missing_secret")
 		return nil, common.NewErrAuthUnauthorized("database", "no secret provided")
+	}
+	if !secretAccepted(ap, s.cfg.AdditionalLocations) {
+		s.recordAuthFailureMetric(req, "secret_location_not_enabled")
+		return nil, common.NewErrAuthUnauthorized("database", "secret location not enabled")
 	}
 
 	apiKey := ap.Secret.Value

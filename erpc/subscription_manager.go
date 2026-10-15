@@ -88,7 +88,7 @@ func (sm *SubscriptionManager) Subscribe(
 		return nil, err
 	}
 
-	conn := sm.getOrCreateConn(wsc, nw.Label())
+	conn := sm.getOrCreateConn(wsc)
 	if conn == nil {
 		return nil, wsclient.ErrClosed
 	}
@@ -106,7 +106,7 @@ func (sm *SubscriptionManager) Subscribe(
 	reqFinality := nq.Finality(ctx)
 	telemetry.CounterHandle(telemetry.MetricNetworkRequestsReceived,
 		project.Config.Id, nw.Label(), method,
-		reqFinality.String(), nq.UserId(), nq.AgentName(),
+		reqFinality.String(), nq.UserId(), nq.AgentName(), nq.Transport(),
 	).Inc()
 
 	jrReq, err := nq.JsonRpcRequest()
@@ -133,7 +133,10 @@ func (sm *SubscriptionManager) Subscribe(
 	// Counted before it is visible, so a racing cleanup never takes the
 	// gauge below zero.
 	wsc.subscriptionsGauge(kind).Inc()
-	if err := conn.adapter.AddSubscription(clientSubID, key, kind, filterHash, maxSubs); err != nil {
+	if err := conn.adapter.AddSubscription(clientSubID, key, kind, filterHash, maxSubs, wsclient.SubscriptionLabels{
+		User:      nq.UserId(),
+		AgentName: nq.AgentName(),
+	}); err != nil {
 		wsc.subscriptionsGauge(kind).Dec()
 		sm.releaseFilter(ctx, key, kind, filterHash)
 		if errors.Is(err, wsclient.ErrLimitExceeded) {
@@ -177,7 +180,7 @@ func (sm *SubscriptionManager) Unsubscribe(
 	reqFinality := nq.Finality(ctx)
 	telemetry.CounterHandle(telemetry.MetricNetworkRequestsReceived,
 		project.Config.Id, nw.Label(), method,
-		reqFinality.String(), nq.UserId(), nq.AgentName(),
+		reqFinality.String(), nq.UserId(), nq.AgentName(), nq.Transport(),
 	).Inc()
 
 	jrReq, err := nq.JsonRpcRequest()
@@ -365,7 +368,7 @@ func (sm *SubscriptionManager) resolveSubscription(ctx context.Context, networkI
 
 // getOrCreateConn returns the connection's entry, attaching a new egress
 // on first use, or nil once the connection was cleaned up.
-func (sm *SubscriptionManager) getOrCreateConn(wsc *WsConnection, networkLabel string) *connEntry {
+func (sm *SubscriptionManager) getOrCreateConn(wsc *WsConnection) *connEntry {
 	sm.connMu.Lock()
 	defer sm.connMu.Unlock()
 	if wsc.subsClosed {
@@ -374,7 +377,6 @@ func (sm *SubscriptionManager) getOrCreateConn(wsc *WsConnection, networkLabel s
 	if existing, ok := sm.conns[wsc.id]; ok {
 		return existing
 	}
-	wsc.networkLabel = networkLabel
 	adapter := wsclient.New(wsc.id, wsc, sm.logger, wsc.server.serverCfg.WebSocket.SubscriptionBufferSize)
 	entry := &connEntry{adapter: adapter, detach: sm.idx.Attach(adapter)}
 	sm.conns[wsc.id] = entry

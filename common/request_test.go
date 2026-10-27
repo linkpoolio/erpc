@@ -678,3 +678,22 @@ func TestSetUserFromTrustedHeader(t *testing.T) {
 		}
 	})
 }
+
+func TestNormalizedRequest_TransportDefaultsToHttp(t *testing.T) {
+	var nilReq *NormalizedRequest
+	if got := nilReq.Transport(); got != "http" {
+		t.Fatalf("nil request transport = %q, want http", got)
+	}
+	r := NewNormalizedRequest(nil)
+	if got := r.Transport(); got != "http" {
+		t.Fatalf("default transport = %q, want http", got)
+	}
+	r.SetTransport("")
+	if got := r.Transport(); got != "http" {
+		t.Fatalf("transport after empty set = %q, want http", got)
+	}
+	r.SetTransport("ws")
+	if got := r.Transport(); got != "ws" {
+		t.Fatalf("transport = %q, want ws", got)
+	}
+}

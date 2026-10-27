@@ -58,11 +58,20 @@ type routeKey struct {
 	filterHash string
 }
 
+// SubscriptionLabels identify the client of a subscription on its metrics.
+// They are captured at subscribe time so recording a notification needs no
+// per-notification lookup.
+type SubscriptionLabels struct {
+	User      string
+	AgentName string
+}
+
 type clientSub struct {
 	id         string
 	kind       indexer.EventKind
 	networkID  string
 	filterHash string // "" for newHeads
+	labels     SubscriptionLabels
 
 	notify chan json.RawMessage
 	done   chan struct{} // closed by whoever removes the sub from Adapter.subs
@@ -126,12 +135,13 @@ func (a *Adapter) deliverTo(sub *clientSub, payload json.RawMessage) {
 // AddSubscription registers a subscription and starts its writer. It fails
 // with ErrLimitExceeded when the connection already holds maxSubs, and with
 // ErrClosed once the adapter was drained.
-func (a *Adapter) AddSubscription(clientSubID, networkID string, kind indexer.EventKind, filterHash string, maxSubs int) error {
+func (a *Adapter) AddSubscription(clientSubID, networkID string, kind indexer.EventKind, filterHash string, maxSubs int, labels SubscriptionLabels) error {
 	sub := &clientSub{
 		id:         clientSubID,
 		kind:       kind,
 		networkID:  networkID,
 		filterHash: filterHash,
+		labels:     labels,
 		notify:     make(chan json.RawMessage, a.bufferSize),
 		done:       make(chan struct{}),
 	}
@@ -207,6 +217,7 @@ func (sub *clientSub) snapshot() Subscription {
 		Kind:        sub.kind,
 		NetworkID:   sub.networkID,
 		FilterHash:  sub.filterHash,
+		Labels:      sub.labels,
 	}
 }
 
@@ -216,6 +227,7 @@ type Subscription struct {
 	Kind        indexer.EventKind
 	NetworkID   string
 	FilterHash  string
+	Labels      SubscriptionLabels
 }
 
 // Count returns the number of active subscriptions.

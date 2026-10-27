@@ -1706,7 +1706,7 @@ func TestWebSocket_LogsSubscribeOnAllUpstreamsAndDedupe(t *testing.T) {
 	}
 	ingressBefore := ingress()
 	dedupBefore := counter(telemetry.MetricSubscriptionDedupDroppedTotal, "test_ws", "evm:123", "logs")
-	sentBefore := counter(telemetry.MetricWebsocketNotificationsSentTotal, "test_ws", "evm:123", "logs")
+	sentBefore := testutil.ToFloat64(telemetry.CounterHandle(telemetry.MetricWebsocketNotificationsSentTotal, "test_ws", "evm:123", "logs", "n/a", "go"))
 	bytesBefore := counter(telemetry.MetricWebsocketNotificationBytesTotal, "test_ws", "evm:123", "logs")
 
 	conn := dialWs(t, addr)
@@ -1737,7 +1737,7 @@ func TestWebSocket_LogsSubscribeOnAllUpstreamsAndDedupe(t *testing.T) {
 	in := float64(atomic.LoadInt64(&subscribeCount))
 	assert.Equal(t, in, ingress()-ingressBefore)
 	assert.Equal(t, in-1, counter(telemetry.MetricSubscriptionDedupDroppedTotal, "test_ws", "evm:123", "logs")-dedupBefore)
-	assert.Equal(t, 1.0, counter(telemetry.MetricWebsocketNotificationsSentTotal, "test_ws", "evm:123", "logs")-sentBefore)
+	assert.Equal(t, 1.0, testutil.ToFloat64(telemetry.CounterHandle(telemetry.MetricWebsocketNotificationsSentTotal, "test_ws", "evm:123", "logs", "n/a", "go"))-sentBefore)
 	assert.Equal(t, float64(len(msg)), counter(telemetry.MetricWebsocketNotificationBytesTotal, "test_ws", "evm:123", "logs")-bytesBefore)
 	assert.GreaterOrEqual(t, testutil.ToFloat64(telemetry.MetricSubscriptionDedupEntries.WithLabelValues("test_ws", "evm:123")), 1.0)
 }

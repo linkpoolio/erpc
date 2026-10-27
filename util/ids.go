@@ -24,6 +24,12 @@ func SvmNetworkId(chain, cluster string) string {
 	return "svm:" + chain + ":" + cluster
 }
 
+// JsonRpcNetworkId derives the canonical "jsonrpc:<id>" network ID used by
+// the generic JSON-RPC passthrough architecture.
+func JsonRpcNetworkId(id string) string {
+	return "jsonrpc:" + id
+}
+
 var validIdentifierRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 func IsValidIdentifier(s string) bool {
@@ -62,6 +68,9 @@ func IsValidNetworkId(s string) bool {
 			return false
 		}
 		return true
+	}
+	if strings.HasPrefix(s, "jsonrpc:") {
+		return IsValidIdentifier(s[len("jsonrpc:"):])
 	}
 	return false
 }

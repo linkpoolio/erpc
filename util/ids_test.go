@@ -57,3 +57,26 @@ func TestIsValidNetworkId_SvmWithChain(t *testing.T) {
 		})
 	}
 }
+
+func TestJsonRpcNetworkId(t *testing.T) {
+	if got := JsonRpcNetworkId("bitcoin-mainnet"); got != "jsonrpc:bitcoin-mainnet" {
+		t.Fatalf("JsonRpcNetworkId = %q", got)
+	}
+
+	cases := []struct {
+		id   string
+		want bool
+	}{
+		{"jsonrpc:bitcoin-mainnet", true},
+		{"jsonrpc:stellar_testnet", true},
+		{"jsonrpc:", false},
+		{"jsonrpc:a:b", false},
+		{"jsonrpc:a.b", false},
+		{"jsonrpc:a b", false},
+	}
+	for _, tc := range cases {
+		if got := IsValidNetworkId(tc.id); got != tc.want {
+			t.Errorf("IsValidNetworkId(%q) = %v, want %v", tc.id, got, tc.want)
+		}
+	}
+}

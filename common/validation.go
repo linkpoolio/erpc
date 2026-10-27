@@ -1096,6 +1096,14 @@ func (u *UpstreamConfig) Validate(c *Config, skipEndpointCheck bool) error {
 			return err
 		}
 	}
+	if u.Type == UpstreamTypeJsonRpc {
+		if u.JsonRpc == nil || u.JsonRpc.NetworkId == "" {
+			return fmt.Errorf("upstream.*.jsonRpc.networkId is required for jsonrpc upstreams")
+		}
+		if !util.IsValidIdentifier(u.JsonRpc.NetworkId) {
+			return fmt.Errorf("upstream.*.jsonRpc.networkId '%s' is invalid, must contain only alphanumeric characters, dash, or underscore", u.JsonRpc.NetworkId)
+		}
+	}
 	if u.Failsafe != nil {
 		for _, fs := range u.Failsafe {
 			if err := fs.Validate(); err != nil {
@@ -1567,6 +1575,14 @@ func (n *NetworkConfig) Validate(c *Config) error {
 	}
 	if n.Architecture == ArchitectureSvm && n.Svm == nil {
 		return fmt.Errorf("network.*.svm is required for svm networks")
+	}
+	if n.Architecture == ArchitectureJsonRpc {
+		if n.JsonRpc == nil || n.JsonRpc.Id == "" {
+			return fmt.Errorf("network.*.jsonRpc.id (or network.*.alias) is required for jsonrpc networks")
+		}
+		if !util.IsValidIdentifier(n.JsonRpc.Id) {
+			return fmt.Errorf("network.*.jsonRpc.id '%s' is invalid, must contain only alphanumeric characters, dash, or underscore", n.JsonRpc.Id)
+		}
 	}
 	if n.Evm != nil {
 		if err := n.Evm.Validate(); err != nil {

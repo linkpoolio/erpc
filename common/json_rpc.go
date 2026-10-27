@@ -373,7 +373,10 @@ func (r *JsonRpcResponse) ParseFromStream(ctx []context.Context, reader io.Reade
 		}
 	}
 
-	if len(temp.Error) > 0 {
+	// JSON-RPC 1.0-style servers (e.g. Bitcoin Core and its forks) always emit
+	// the "error" member and set it to null on success. A null error is the
+	// absence of an error, not an error.
+	if len(temp.Error) > 0 && string(temp.Error) != "null" {
 		if err := r.ParseError(string(temp.Error)); err != nil {
 			return err
 		}
@@ -401,11 +404,19 @@ func (r *JsonRpcResponse) ParseError(raw string) error {
 
 	r.errBytes = nil
 
+	// `"error": null` means success (JSON-RPC 1.0-style servers always emit the
+	// member). Without this, the fallback below would turn the literal "null"
+	// into a server-side exception and fail an otherwise successful call.
+	if raw == "null" {
+		r.Error = nil
+		return nil
+	}
+
 	// First attempt to unmarshal the error as a typical JSON-RPC error
 	var rpcErr ErrJsonRpcExceptionExternal
 	if err := SonicCfg.UnmarshalFromString(raw, &rpcErr); err != nil {
 		// Special case: check for non-standard error structures in the raw data
-		if raw == "" || raw == "null" {
+		if raw == "" {
 			r.Error = NewErrJsonRpcExceptionExternal(
 				int(JsonRpcErrorServerSideException),
 				"unexpected empty response from upstream endpoint",
@@ -1200,6 +1211,25 @@ func isEmptyishValue(v interface{}) bool {
 //
 // JSON-RPC Request
 //
+
+// jsonRpcRequestOmitEmptyParams is the wire shape of a request whose empty
+// params are left out (see JsonRpcUpstreamConfig.OmitEmptyParams).
+type jsonRpcRequestOmitEmptyParams struct {
+	JSONRPC string        `json:"jsonrpc,omitempty"`
+	ID      interface{}   `json:"id,omitempty"`
+	Method  string        `json:"method"`
+	Params  []interface{} `json:"params,omitempty"`
+}
+
+// WireRequest returns the value to serialize when sending r to an upstream.
+// With omitEmptyParams, empty params are left out instead of sent as
+// "params":[]. The caller must hold r's read lock.
+func (r *JsonRpcRequest) WireRequest(omitEmptyParams bool) interface{} {
+	if omitEmptyParams && len(r.Params) == 0 {
+		return &jsonRpcRequestOmitEmptyParams{JSONRPC: r.JSONRPC, ID: r.ID, Method: r.Method}
+	}
+	return &JsonRpcRequest{JSONRPC: r.JSONRPC, ID: r.ID, Method: r.Method, Params: r.Params}
+}
 
 type JsonRpcRequest struct {
 	sync.RWMutex

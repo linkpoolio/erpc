@@ -1,0 +1,73 @@
+---
+title: Circuit breaker
+description: How eRPC trips a failing upstream out of rotation — via the Selection Policy's excludeIf chain.
+---
+
+import { Callout } from "nextra/components";
+
+# Circuit breaker
+
+In eRPC, *"trip a bad upstream out of rotation"* is the [Selection Policy](/config/projects/selection-policies)'s job — not a separate failsafe policy. One unified mechanism covers every kind of "bad": failing, slow, throttled, lagging. Exclusion lives at the network level; the per-upstream-state-machine model has no separate home.
+
+## How it works
+
+The selection policy runs on a tick (default every `1s`) and returns the ordered list of upstreams eligible to serve requests on that network. **Order is law; missing means excluded.** Each tick the policy can drop an upstream based on any signal in its rolling-window health metrics:
+
+```js
+upstreams
+  .excludeIf(all(samplesAbove(10), errorRateAbove(0.7)))                     // failing
+  .excludeIf(all(samplesAbove(10), throttleRateAbove(0.4)))                  // throttled
+  .excludeIf(any(all(samplesAbove(20), latencyDeviationAbove(3)),            // slow
+                 latencyAbove(30_000)))
+  .excludeIf(any(blockNumberLagAbove(16), blockSecondsLagAbove(30)))         // lagging
+  ...
+  .probeExcluded({ sampleRate: 0.1, minSamples: 10 })                        // shadow-mirror real traffic at excluded upstreams
+```
+
+An excluded upstream stays out until its tracker metrics improve below the same `excludeIf` thresholds — there is **no separate readmit timer**. The `probeExcluded` step subscribes the network's probe subsystem to the request feed; the prober shadow-mirrors a sampled stream of real requests against any currently-excluded upstream, feeding the same tracker counters as real traffic. Once those counters cross back below the threshold, the upstream falls out of the excluded set on the next tick and re-enters rotation.
+
+This is the **default policy** — you get it by omitting `selectionPolicy` entirely. The thresholds (70 % error rate / 40 % throttle rate, each gated on ≥ 10 samples; p70 > 30 s OR 3× the fastest peer gated on ≥ 20 samples; head lag > 16 blocks OR 30 s) are tuned for production from day one. The `samplesAbove(N)` guards on the error / throttle / relative-latency predicates exist so a single failing call on a fresh-pod tracker (errorRate = 1/1 = 1.0) cannot cascade-evict every upstream before the rolling window has meaningful denominator.
+
+## State, mapped to selection-policy concepts
+
+| Concept | Surfaced as |
+|---|---|
+| **Closed** (upstream healthy) | Present in the eval's returned ordered list. `erpc_selection_position{upstream}` is `0` (primary) or `1+` (runner-up). |
+| **Open** (upstream excluded) | Missing from the returned list. `erpc_selection_position{upstream}` is `-1`. The reason ("errorRate>0.7", "p70>30000ms", "p70>3xFastest", ...) appears on the per-tick `Decision.Output.Excluded[]` entry (as `Reason` for display + `LeafReasons[]` slugs that drive `selection_exclusion_total{reason}`) and in DEBUG logs. |
+| **Half-open** (probing recovery) | `probeExcluded` shadow-mirrors sampled real traffic to currently-excluded upstreams in the background. The mirrored calls feed the same tracker counters as real traffic; once they cross back below the `excludeIf` thresholds, the upstream falls out of the excluded set on the next tick. No real user traffic is served by an excluded upstream during this — the probing is entirely behind the scenes. Per-upstream opt-out via `routing.probe: 'off'`. |
+
+## Tuning the thresholds
+
+Loosen, tighten, or add signals by overriding `selectionPolicy.evalFunc` on the network. Example — strict latency rule (p95 > 10 s on any sample count) for a workload that ALWAYS needs sub-10s responses:
+
+```js
+(upstreams, ctx) =>
+  upstreams
+    .removeCordoned()
+    .excludeIf(all(samplesAbove(10), errorRateAbove(0.5)))   // stricter error ceiling
+    .excludeIf(all(samplesAbove(10), throttleRateAbove(0.3)))
+    .excludeIf(latencyAbove(10_000, 95))                     // hard p95 floor, no guard
+    .whenEmpty(() => upstreams)
+    .sortByScore(PREFER_FASTEST)
+    .stickyPrimary({ hysteresis: 0.3, minSwitchInterval: '30s' })
+    .probeExcluded({ sampleRate: 0.5, maxConcurrent: 2, timeout: '10s' })
+```
+
+See [Selection policies](/config/projects/selection-policies) for the full chainable vocabulary + every predicate factory.
+
+## Manual exclusion
+
+For operator-driven exclusion that doesn't depend on metrics — *"this vendor's status page just went red, take it out now"*, planned maintenance windows, forced failover testing — use the [admin cordon RPC](/operation/cordoning). Cordon is independent of the metric-driven `excludeIf` chain: it sets a sticky flag the policy's `.removeCordoned()` step honors, and it stays until you uncordon.
+
+## Observability
+
+| Where | Signal |
+|---|---|
+| Prometheus | `erpc_selection_position{project,network,method,upstream}` — `0` = primary, `1+` = runner-up, `-1` = excluded. `erpc_selection_rejection_total{...,step}` — per-step rejection counter. `erpc_selection_primary_switch_total{...,from,to}` — primary changes. |
+| OTLP | Per-tick eval span on the network with selected upstream + tick id. |
+| Logs (DEBUG) | One line per `excludeIf` rejection with the upstream id and the predicate's `policyReason` (e.g. `errorRate>0.5`, `p70>30000ms`, `p70>3xFastest`, `blockHeadLag>16`). |
+| Simulator | The policy-history pane shows the per-step trail (every chainable method's input → output → dropped/added/reordered) with timestamps. |
+
+<Callout type="info">
+  The cordon admin endpoint (`erpc_cordonUpstream`) is the ONLY way to manually exclude an upstream. Everything else — health-based exclusion, recovery probing, primary changes — lives in the selection policy and is driven by live metrics. See [Selection policies](/config/projects/selection-policies) for the full picture and [Cordoning](/operation/cordoning) for the operator runbook.
+</Callout>

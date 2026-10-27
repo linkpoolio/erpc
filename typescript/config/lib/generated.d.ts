@@ -1,0 +1,1668 @@
+import type { LogLevel, Duration, ByteSize, ConnectorDriverType as TsConnectorDriverType, ConnectorConfig as TsConnectorConfig, UpstreamType as TsUpstreamType, NetworkArchitecture as TsNetworkArchitecture, AuthType as TsAuthType, AuthStrategyConfig as TsAuthStrategyConfig, EvmNetworkConfigForDefaults as TsEvmNetworkConfigForDefaults, SelectionPolicyEvalFunction } from "./types";
+/**
+ * AdaptiveDuration describes a duration that may be static, derived from a
+ * per-method latency quantile, or both. It's the reusable building block
+ * for any failsafe knob that wants "fixed base + adaptive component
+ * clamped between min/max" semantics — currently consensus wait caps,
+ * with timeout/hedge supporting it as an alternative entry-point.
+ * Resolution rules:
+ *   final = Base + adaptive
+ * where `adaptive` is:
+ *   - `qt.GetQuantile(Quantile)` when Quantile > 0 and quantile data exists
+ *   - `Min` (the floor) when Quantile > 0 but quantile data is cold (no
+ *     observations yet) — this gives a sensible non-zero cap immediately
+ *     after boot
+ *   - `0` when Quantile is unset
+ * After `Base + adaptive`, the result is clamped to [Min, Max] when those
+ * are set. A nil or all-zero AdaptiveDuration returns 0 (the caller treats
+ * that as "no cap" / "disabled").
+ * Wire format accepts both shorthand and object form:
+ * 	caps: 500ms                                   # shorthand: Base only
+ * 	caps: { base: 500ms }                         # explicit Base
+ * 	caps: { quantile: 0.5, min: 5ms, max: 1s }    # quantile with bounds
+ * 	caps: { base: 100ms, quantile: 0.9, max: 2s } # combined
+ */
+export interface AdaptiveDuration {
+    base?: Duration;
+    quantile?: number;
+    min?: Duration;
+    max?: Duration;
+}
+export declare const UpstreamTypeEvm: UpstreamType;
+export type EvmUpstream = Upstream;
+export type AvailbilityConfidence = number;
+export declare const AvailbilityConfidenceBlockHead: AvailbilityConfidence;
+export declare const AvailbilityConfidenceFinalized: AvailbilityConfidence;
+export type EvmNodeType = string;
+export declare const EvmNodeTypeUnknown: EvmNodeType;
+export declare const EvmNodeTypeFull: EvmNodeType;
+export declare const EvmNodeTypeArchive: EvmNodeType;
+export type EvmSyncingState = number;
+export declare const EvmSyncingStateUnknown: EvmSyncingState;
+export declare const EvmSyncingStateSyncing: EvmSyncingState;
+export declare const EvmSyncingStateNotSyncing: EvmSyncingState;
+export type EvmStatePoller = any;
+/**
+ * EvmStatePollerDiagnostics contains diagnostic information about the state poller
+ * including block bounds, probe status, and any detection issues.
+ */
+export interface EvmStatePollerDiagnostics {
+    enabled: boolean;
+    /**
+     * Block head information
+     */
+    latestBlock: number;
+    finalizedBlock: number;
+    /**
+     * Syncing state
+     */
+    syncingState: string;
+    skipSyncingCheck?: boolean;
+    syncingCheckError?: string;
+    /**
+     * Latest block detection status
+     */
+    skipLatestBlockCheck?: boolean;
+    latestBlockFailureCount?: number;
+    latestBlockSuccessfulOnce?: boolean;
+    latestBlockDetectionIssue?: string;
+    /**
+     * Finalized block detection status
+     */
+    skipFinalizedCheck?: boolean;
+    finalizedBlockFailureCount?: number;
+    finalizedBlockSuccessfulOnce?: boolean;
+    finalizedBlockDetectionIssue?: string;
+    /**
+     * Earliest block bounds per probe type
+     */
+    earliestByProbe?: {
+        [key: EvmAvailabilityProbeType]: EvmProbeEarliestInfo | undefined;
+    };
+}
+/**
+ * EvmProbeEarliestInfo contains information about earliest block detection for a specific probe type
+ */
+export interface EvmProbeEarliestInfo {
+    probeType: EvmAvailabilityProbeType;
+    earliestBlock: number;
+    schedulerRunning?: boolean;
+}
+export type CacheDAL = any;
+export interface MockCacheDal {
+    mock: any;
+}
+/**
+ * Config represents the configuration of the application.
+ */
+export interface Config {
+    logLevel?: LogLevel;
+    clusterKey?: string;
+    server?: ServerConfig;
+    healthCheck?: HealthCheckConfig;
+    admin?: AdminConfig;
+    database?: DatabaseConfig;
+    projects?: (ProjectConfig | undefined)[];
+    rateLimiters?: RateLimiterConfig;
+    metrics?: MetricsConfig;
+    proxyPools?: (ProxyPoolConfig | undefined)[];
+    tracing?: TracingConfig;
+}
+export interface ServerConfig {
+    listenV4?: boolean;
+    httpHostV4?: string;
+    listenV6?: boolean;
+    httpHostV6?: string;
+    httpPort?: number;
+    httpPortV4?: number;
+    httpPortV6?: number;
+    grpcEnabled?: boolean;
+    grpcHostV4?: string;
+    grpcPortV4?: number;
+    grpcHostV6?: string;
+    grpcPortV6?: number;
+    grpcMaxRecvMsgSize?: number;
+    grpcMaxSendMsgSize?: number;
+    maxTimeout?: Duration;
+    readTimeout?: Duration;
+    writeTimeout?: Duration;
+    enableGzip?: boolean;
+    tls?: TLSConfig;
+    aliasing?: AliasingConfig;
+    waitBeforeShutdown?: Duration;
+    waitAfterShutdown?: Duration;
+    includeErrorDetails?: boolean;
+    trustedIPForwarders?: string[];
+    trustedIPHeaders?: string[];
+    responseHeaders?: {
+        [key: string]: string;
+    };
+    /**
+     * ExecutionHeaders controls the per-request diagnostic headers
+     * (X-ERPC-Attempts, X-ERPC-Upstreams-Tried, etc.) that expose how
+     * eRPC routed and resolved each request. Defaults to "all" — set
+     * "summary" to keep only counters, or "off" to disable entirely
+     * (useful for low-latency / bandwidth-constrained clients).
+     */
+    executionHeaders?: ExecutionHeadersMode;
+}
+/**
+ * ExecutionHeadersMode controls how much per-request execution detail is
+ * exposed in HTTP response headers.
+ */
+export type ExecutionHeadersMode = string;
+/**
+ * ExecutionHeadersAll emits the full set: counters + per-upstream
+ * trace (upstream IDs, outcomes, reasons, durations). Default.
+ */
+export declare const ExecutionHeadersAll: ExecutionHeadersMode;
+/**
+ * ExecutionHeadersSummary emits only the counter triplet
+ * (X-ERPC-Attempts/Retries/Hedges) + the cache-hit / final-upstream
+ * markers. Skips the (potentially large) per-attempt slice headers.
+ */
+export declare const ExecutionHeadersSummary: ExecutionHeadersMode;
+/**
+ * ExecutionHeadersOff disables all X-ERPC-* diagnostic headers.
+ */
+export declare const ExecutionHeadersOff: ExecutionHeadersMode;
+export interface HealthCheckConfig {
+    mode?: HealthCheckMode;
+    auth?: AuthConfig;
+    defaultEval?: string;
+}
+export type HealthCheckMode = string;
+export declare const HealthCheckModeSimple: HealthCheckMode;
+export declare const HealthCheckModeNetworks: HealthCheckMode;
+export declare const HealthCheckModeVerbose: HealthCheckMode;
+export declare const EvalAnyInitializedUpstreams = "any:initializedUpstreams";
+export declare const EvalAnyErrorRateBelow90 = "any:errorRateBelow90";
+export declare const EvalAllErrorRateBelow90 = "all:errorRateBelow90";
+export declare const EvalAnyErrorRateBelow100 = "any:errorRateBelow100";
+export declare const EvalAllErrorRateBelow100 = "all:errorRateBelow100";
+export declare const EvalEvmAnyChainId = "any:evm:eth_chainId";
+export declare const EvalEvmAllChainId = "all:evm:eth_chainId";
+export declare const EvalAllActiveUpstreams = "all:activeUpstreams";
+export type TracingProtocol = string;
+export declare const TracingProtocolHttp: TracingProtocol;
+export declare const TracingProtocolGrpc: TracingProtocol;
+export interface TracingConfig {
+    enabled?: boolean;
+    endpoint?: string;
+    protocol?: TracingProtocol;
+    sampleRate?: number;
+    detailed?: boolean;
+    serviceName?: string;
+    headers?: {
+        [key: string]: string;
+    };
+    tls?: TLSConfig;
+    resourceAttributes?: {
+        [key: string]: string;
+    };
+    /**
+     * ForceTraceMatchers defines conditions for force-tracing requests.
+     * Each matcher can specify network and/or method patterns.
+     * Multiple patterns can be separated by "|" (OR within field).
+     * Both network and method must match if both are specified (AND between fields).
+     * If only one field is specified, only that field is checked.
+     */
+    forceTraceMatchers?: (ForceTraceMatcher | undefined)[];
+}
+/**
+ * ForceTraceMatcher defines a condition for force-tracing requests.
+ */
+export interface ForceTraceMatcher {
+    /**
+     * Network patterns to match (e.g., "evm:1", "evm:1|evm:42161", "evm:*")
+     * Multiple patterns separated by "|" act as OR conditions.
+     */
+    network?: string;
+    /**
+     * Method patterns to match (e.g., "eth_call", "debug_*|trace_*")
+     * Multiple patterns separated by "|" act as OR conditions.
+     */
+    method?: string;
+}
+export interface AdminConfig {
+    auth?: AuthConfig;
+    cors?: CORSConfig;
+}
+export interface AliasingConfig {
+    rules: (AliasingRuleConfig | undefined)[];
+}
+export interface AliasingRuleConfig {
+    matchDomain: string;
+    serveProject: string;
+    serveArchitecture: string;
+    serveChain: string;
+}
+export interface DatabaseConfig {
+    evmJsonRpcCache?: CacheConfig;
+    sharedState?: SharedStateConfig;
+}
+export interface SharedStateConfig {
+    /**
+     * ClusterKey identifies the logical group for shared counters across replicas (multi-tenant friendly)
+     */
+    clusterKey?: string;
+    /**
+     * Connector contains the storage driver configuration (redis, postgresql, dynamodb, memory)
+     */
+    connector?: ConnectorConfig;
+    /**
+     * FallbackTimeout is the timeout for remote storage operations (get/set/publish).
+     * It is a seconds-scale network timeout and NOT a foreground latency budget.
+     */
+    fallbackTimeout?: Duration;
+    /**
+     * LockTtl is the expiration for the distributed lock key in the backing store.
+     * Should comfortably exceed the expected duration of remote writes.
+     */
+    lockTtl?: Duration;
+    /**
+     * LockMaxWait caps how long the foreground path will wait to acquire the lock
+     * before proceeding locally and deferring the remote write to background.
+     */
+    lockMaxWait?: Duration;
+    /**
+     * UpdateMaxWait caps how long the foreground path will spend computing a new value
+     * (e.g., polling latest block) before returning the current local value.
+     */
+    updateMaxWait?: Duration;
+}
+export interface CacheConfig {
+    connectors?: TsConnectorConfig[];
+    policies?: (CachePolicyConfig | undefined)[];
+    compression?: CompressionConfig;
+}
+export interface CompressionConfig {
+    enabled?: boolean;
+    algorithm?: string;
+    zstdLevel?: string;
+    threshold?: number;
+}
+export interface CacheMethodConfig {
+    reqRefs: any[][];
+    respRefs: any[][];
+    finalized: boolean;
+    realtime: boolean;
+    stateful?: boolean;
+    /**
+     * TranslateLatestTag controls whether the method-level tag translation should convert "latest" to a concrete hex block number.
+     * When nil or true, translation is enabled by default.
+     */
+    translateLatestTag?: boolean;
+    /**
+     * TranslateFinalizedTag controls whether the method-level tag translation should convert "finalized" to a concrete hex block number.
+     * When nil or true, translation is enabled by default.
+     */
+    translateFinalizedTag?: boolean;
+    /**
+     * EnforceBlockAvailability controls whether per-upstream block availability bounds (upper/lower)
+     * are enforced for this method at the network level. When nil or true, enforcement is enabled.
+     */
+    enforceBlockAvailability?: boolean;
+}
+export interface CachePolicyConfig {
+    connector: string;
+    network?: string;
+    method?: string;
+    params?: any[];
+    finality?: DataFinalityState;
+    empty?: CacheEmptyBehavior;
+    appliesTo?: 'get' | 'set' | 'both';
+    minItemSize?: ByteSize;
+    maxItemSize?: ByteSize;
+    ttl?: Duration;
+}
+export type ConnectorDriverType = string;
+export declare const DriverMemory: ConnectorDriverType;
+export declare const DriverRedis: ConnectorDriverType;
+export declare const DriverPostgreSQL: ConnectorDriverType;
+export declare const DriverDynamoDB: ConnectorDriverType;
+export declare const DriverGrpc: ConnectorDriverType;
+export interface ConnectorConfig {
+    id?: string;
+    driver: TsConnectorDriverType;
+    memory?: MemoryConnectorConfig;
+    redis?: RedisConnectorConfig;
+    dynamodb?: DynamoDBConnectorConfig;
+    postgresql?: PostgreSQLConnectorConfig;
+    grpc?: GrpcConnectorConfig;
+    failsafeForGets?: (FailsafeConfig | undefined)[];
+    failsafeForSets?: (FailsafeConfig | undefined)[];
+}
+export interface GrpcConnectorConfig {
+    bootstrap?: string;
+    servers?: string[];
+    headers?: {
+        [key: string]: string;
+    };
+    getTimeout?: Duration;
+}
+export interface MemoryConnectorConfig {
+    maxItems: number;
+    maxTotalSize: string;
+    emitMetrics?: boolean;
+}
+export interface MockConnectorConfig {
+    memoryconnectorconfig: MemoryConnectorConfig;
+    getdelay: number;
+    setdelay: number;
+    geterrorrate: number;
+    seterrorrate: number;
+}
+export interface TLSConfig {
+    enabled: boolean;
+    certFile: string;
+    keyFile: string;
+    caFile?: string;
+    insecureSkipVerify?: boolean;
+}
+export interface RedisConnectorConfig {
+    addr?: string;
+    username?: string;
+    db?: number;
+    tls?: TLSConfig;
+    connPoolSize?: number;
+    uri: string;
+    initTimeout?: Duration;
+    getTimeout?: Duration;
+    setTimeout?: Duration;
+    lockRetryInterval?: Duration;
+}
+export interface DynamoDBConnectorConfig {
+    table?: string;
+    region?: string;
+    endpoint?: string;
+    auth?: AwsAuthConfig;
+    partitionKeyName?: string;
+    rangeKeyName?: string;
+    reverseIndexName?: string;
+    ttlAttributeName?: string;
+    initTimeout?: Duration;
+    getTimeout?: Duration;
+    setTimeout?: Duration;
+    maxRetries?: number;
+    statePollInterval?: Duration;
+    lockRetryInterval?: Duration;
+}
+export interface PostgreSQLConnectorConfig {
+    connectionUri: string;
+    table: string;
+    minConns?: number;
+    maxConns?: number;
+    initTimeout?: Duration;
+    getTimeout?: Duration;
+    setTimeout?: Duration;
+}
+export interface AwsAuthConfig {
+    mode: 'file' | 'env' | 'secret';
+    credentialsFile: string;
+    profile: string;
+    accessKeyID: string;
+    secretAccessKey: string;
+}
+export interface ProjectConfig {
+    id: string;
+    auth?: AuthConfig;
+    cors?: CORSConfig;
+    providers?: (ProviderConfig | undefined)[];
+    upstreamDefaults?: UpstreamConfig;
+    upstreams?: (UpstreamConfig | undefined)[];
+    networkDefaults?: NetworkDefaults;
+    networks?: (NetworkConfig | undefined)[];
+    rateLimitBudget?: string;
+    /**
+     * Configure user agent tracking at the project level
+     */
+    userAgentMode?: UserAgentTrackingMode;
+    forwardHeaders?: string[];
+    ignoreMethods?: string[];
+    allowMethods?: string[];
+    /**
+     * ScoreMetricsWindowSize is the tumbling window the per-upstream
+     * health tracker uses for its rolling counters (errorRate, p50/p70/
+     * p95 latency, throttledRate, misbehaviorRate). At each tick the
+     * counters reset and start re-accumulating, so this knob effectively
+     * controls how fast a degraded upstream's metrics start reflecting
+     * the new reality. Short windows (e.g. 30s) react quickly but give
+     * noisier ranking; long windows (5–10m) give stable averages but
+     * hide spikes for longer. Defaults to 10m when zero — production
+     * systems typically leave it default; the eRPC simulator overrides
+     * to 30s so knob changes show up in the UI within seconds.
+     */
+    scoreMetricsWindowSize?: Duration;
+}
+/**
+ * LegacyProjectFields collects the deprecated project-level scoring +
+ * routing keys. The translator inspects these to synthesize a
+ * `selectionPolicy.eval` for each network and to emit deprecation
+ * warnings. All fields are zero-valued for a clean modern config.
+ * `scoreMetricsWindowSize` was previously listed here as inert; it is
+ * now a first-class field on ProjectConfig (above) — operators
+ * control the health tracker window directly.
+ */
+export interface LegacyProjectFields {
+    routingStrategy?: string;
+    scoreGranularity?: string;
+    scorePenaltyDecayRate?: number;
+    scoreSwitchHysteresis?: number;
+    scoreMinSwitchInterval?: Duration;
+    scoreMetricsMode?: string;
+    scoreRefreshInterval?: Duration;
+}
+/**
+ * UserAgentTrackingMode controls how user agents are recorded for metrics/labels
+ */
+export type UserAgentTrackingMode = string;
+/**
+ * UserAgentTrackingModeSimplified lowers cardinality by bucketing common user agents
+ */
+export declare const UserAgentTrackingModeSimplified: UserAgentTrackingMode;
+/**
+ * UserAgentTrackingModeRaw records the user agent string as-is (high cardinality)
+ */
+export declare const UserAgentTrackingModeRaw: UserAgentTrackingMode;
+export interface NetworkDefaults {
+    rateLimitBudget?: string;
+    failsafe?: (FailsafeConfig | undefined)[];
+    selectionPolicy?: SelectionPolicyConfig;
+    directiveDefaults?: DirectiveDefaultsConfig;
+    evm?: TsEvmNetworkConfigForDefaults;
+    multiplexing?: boolean;
+}
+/**
+ * Define a type alias to avoid recursion
+ */
+/**
+ * If that fails, try the old format with single failsafe object
+ */
+export interface CORSConfig {
+    allowedOrigins: string[];
+    allowedMethods: string[];
+    allowedHeaders: string[];
+    exposedHeaders: string[];
+    allowCredentials?: boolean;
+    maxAge: number;
+}
+export type VendorSettings = {
+    [key: string]: any;
+};
+export interface ProviderConfig {
+    id?: string;
+    vendor: string;
+    settings?: VendorSettings;
+    onlyNetworks?: string[];
+    ignoreNetworks?: string[];
+    upstreamIdTemplate?: string;
+    overrides?: {
+        [key: string]: UpstreamConfig | undefined;
+    };
+}
+export interface UpstreamConfig {
+    id?: string;
+    type?: TsUpstreamType;
+    /**
+     * Tags is the single canonical user-applied label set. Convention is
+     * `<dimension>:<value>` so a single upstream can carry orthogonal labels:
+     *   tags:
+     *     - tier:main               # used by .preferTag for tiering
+     *     - region:us-east          # used by .spreadAcrossTags('region:')
+     *     - sequencer:op-base       # shared-fate label
+     * Bare strings (no prefix) work too. Patterns supported by every
+     * stdlib tag method: glob (`*`, `?`) and `!negation`.
+     * Tier convention: `tier:fallback` declares a fallback-tier upstream
+     * (matches the long-standing eRPC convention; the default policy
+     * looks for `!tier:fallback` as the primary tier).
+     * The legacy `group: X` / `cohort: Y` YAML keys are accepted at
+     * load time only — UnmarshalYAML rewrites them as `tier:X` /
+     * `cohort:Y` tags and forgets them. There is no Go-level Group or
+     * Cohort field; programmatic code uses Tags directly.
+     */
+    tags?: string[];
+    vendorName?: string;
+    endpoint?: string;
+    evm?: EvmUpstreamConfig;
+    jsonRpc?: JsonRpcUpstreamConfig;
+    ignoreMethods?: string[];
+    allowMethods?: string[];
+    autoIgnoreUnsupportedMethods?: boolean;
+    failsafe?: (FailsafeConfig | undefined)[];
+    rateLimitBudget?: string;
+    rateLimitAutoTune?: RateLimitAutoTuneConfig;
+    shadow?: ShadowUpstreamConfig;
+    /**
+     * Routing holds per-upstream routing hints consumed by the selection
+     * policy. `scoreMultipliers` bias this upstream's rank inside
+     * `sortByScore` (see SelectionPolicyConfig): the engine resolves the
+     * matching entry for each (network, method, finality) tick and exposes
+     * the resulting weight map to the eval function as `u.scoreMultipliers`.
+     * When the upstream omits its own `routing` block, `ApplyDefaults`
+     * inherits the project-level `upstreamDefaults.routing` (all-or-nothing,
+     * matching the Tags inheritance pattern).
+     */
+    routing?: UpstreamRoutingConfig;
+}
+/**
+ * UpstreamRoutingConfig holds per-upstream routing hints. Today this is
+ * the home of `scoreMultipliers` (per-upstream weight overrides folded
+ * into `sortByScore`) and `probe` (per-upstream opt-out for the
+ * selection policy's `probeExcluded` shadow-mirror traffic).
+ */
+export interface UpstreamRoutingConfig {
+    /**
+     * ScoreMultipliers biases this upstream's rank. Each entry is a
+     * matcher (network/method/finality) plus weight overrides; the engine
+     * resolves the first matching entry per tick and hands it to the eval
+     * function as `u.scoreMultipliers`. `sortByScore` merges it over the
+     * base weights by default (see its `multipliers` option).
+     */
+    scoreMultipliers?: (ScoreMultiplierConfig | undefined)[];
+    /**
+     * ScoreLatencyQuantile selects which response-time quantile feeds the
+     * score (e.g. 0.9 → p90). When unset, the policy's own
+     * `sortByScore({ latencyQuantile })` (default p70) applies.
+     */
+    scoreLatencyQuantile?: number;
+    /**
+     * Probe gates whether the selection policy's `probeExcluded` step
+     * may shadow-mirror real requests to THIS upstream when it's
+     * currently in the excluded set. `"on"` (default) opts in; `"off"`
+     * disables probing entirely — the upstream stays excluded
+     * permanently once predicates trip until an operator intervenes
+     * (manual cordon/uncordon, or until the predicate stops matching
+     * via state-poller-driven structural metrics like head lag). Use
+     * `"off"` for pay-per-call vendors where shadow traffic eats quota.
+     */
+    probe?: ProbeMode | "on" | "off";
+}
+/**
+ * ProbeMode is the per-upstream `routing.probe` enum.
+ */
+export type ProbeMode = string;
+/**
+ * ProbeModeOn — default. The selection policy may mirror sampled
+ * real requests to this upstream while it's excluded so it
+ * accumulates fresh tracker samples for natural re-admission.
+ */
+export declare const ProbeModeOn: ProbeMode;
+/**
+ * ProbeModeOff — never mirror. Upstream stays excluded after
+ * predicates trip; only structural signals (head lag, etc.) can
+ * drive re-admission.
+ */
+export declare const ProbeModeOff: ProbeMode;
+/**
+ * ScoreMultiplierConfig is one per-upstream weight override. The matcher
+ * fields (network/method/finality) scope the entry — leave them empty (or
+ * `"*"`) for an entry that applies to every request. Weight fields are
+ * pointers so "unset" is distinct from "zero": an unset weight inherits
+ * from the policy's base weights (merge mode), a zero weight removes that
+ * metric's contribution. `overall` scales the upstream's FINAL score — a
+ * preference dial where >1 prefers this upstream and <1 avoids it.
+ */
+export interface ScoreMultiplierConfig {
+    network?: string;
+    method?: string;
+    finality?: DataFinalityState[];
+    overall?: number;
+    errorRate?: number;
+    respLatency?: number;
+    throttledRate?: number;
+    blockHeadLag?: number;
+    finalizationLag?: number;
+    misbehaviors?: number;
+    /**
+     * TotalRequests is accepted for backward compatibility but no longer
+     * influences scoring (the score is computed from rolling-window rates,
+     * not absolute request counts).
+     */
+    totalRequests?: number;
+}
+/**
+ * Strict-schema shadow: inlines the canonical config and adds the
+ * deprecated yaml-only keys. yaml v3 ignores `json:"-"` so this is safe.
+ */
+/**
+ * Legacy shape: `failsafe:` as a single object instead of a list.
+ */
+export interface ShadowUpstreamConfig {
+    enabled: boolean;
+    sampleRate?: number;
+    ignoreFields?: {
+        [key: string]: string[];
+    };
+}
+export interface UpstreamIntegrityConfig {
+    eth_getBlockReceipts?: UpstreamIntegrityEthGetBlockReceiptsConfig;
+}
+export interface UpstreamIntegrityEthGetBlockReceiptsConfig {
+    enabled?: boolean;
+    checkLogIndexStrictIncrements?: boolean;
+    checkLogsBloom?: boolean;
+}
+export type UJAlias = UpstreamConfig;
+export type UYAlias = UpstreamConfig;
+export interface RateLimitAutoTuneConfig {
+    enabled?: boolean;
+    adjustmentPeriod: Duration;
+    errorRateThreshold: number;
+    increaseFactor: number;
+    decreaseFactor: number;
+    minBudget: number;
+    maxBudget: number;
+}
+export interface JsonRpcUpstreamConfig {
+    supportsBatch?: boolean;
+    batchMaxSize?: number;
+    batchMaxWait?: Duration;
+    enableGzip?: boolean;
+    headers?: {
+        [key: string]: string;
+    };
+    proxyPool?: string;
+}
+export interface EvmUpstreamConfig {
+    chainId: number;
+    statePollerInterval?: Duration;
+    /**
+     * StatePollerDebounce overrides the debounce interval for the state poller.
+     * When 0 (default), the interval is dynamically inferred from the chain's
+     * observed block time, falling back to the network-level
+     * FallbackStatePollerDebounce, then to a 1s floor.
+     */
+    statePollerDebounce?: Duration;
+    blockAvailability?: EvmBlockAvailabilityConfig;
+    getLogsAutoSplittingRangeThreshold?: number;
+    /**
+     * TraceFilterAutoSplittingRangeThreshold proactively splits trace_filter and
+     * arbtrace_filter requests whose block range exceeds this value into contiguous
+     * sub-requests executed concurrently and merged before returning. Zero disables
+     * the feature.
+     */
+    traceFilterAutoSplittingRangeThreshold?: number;
+    skipWhenSyncing?: boolean;
+    integrity?: UpstreamIntegrityConfig;
+    /**
+     * @deprecated: use blockAvailability bounds instead; kept for config back-compat only
+     */
+    nodeType?: EvmNodeType;
+    /**
+     * @deprecated: should be removed in a future release
+     */
+    maxAvailableRecentBlocks?: number;
+    queryShim?: EvmQueryShimConfig;
+}
+export interface EvmQueryShimConfig {
+    enabled?: boolean;
+    allowedMethods?: string[];
+    concurrency?: number;
+    maxBlockRange?: number;
+    maxLimit?: number;
+    defaultLimit?: number;
+}
+/**
+ * EvmBlockAvailability defines optional lower/upper block availability expressions for an upstream.
+ * Presence of lower/upper implies the feature is active. When both are nil, it's effectively off
+ */
+export interface EvmBlockAvailabilityConfig {
+    lower?: EvmAvailabilityBoundConfig;
+    upper?: EvmAvailabilityBoundConfig;
+}
+/**
+ * EvmBound represents a single bound definition.
+ * Exactly one of ExactBlock, LatestMinus, EarliestPlus should be set.
+ * UpdateRate only applies to earliestBlockPlus bounds: 0 means freeze at first evaluation; >0 means recompute on that cadence.
+ * For latestBlockMinus, updateRate is ignored: bounds are computed on-demand using the continuously-updated latest block from evmStatePoller.
+ */
+export type EvmAvailabilityProbeType = string;
+export declare const EvmProbeBlockHeader: EvmAvailabilityProbeType;
+export declare const EvmProbeEventLogs: EvmAvailabilityProbeType;
+export declare const EvmProbeCallState: EvmAvailabilityProbeType;
+export declare const EvmProbeTraceData: EvmAvailabilityProbeType;
+export interface EvmAvailabilityBoundConfig {
+    exactBlock?: number;
+    latestBlockMinus?: number;
+    earliestBlockPlus?: number;
+    probe?: EvmAvailabilityProbeType;
+    updateRate?: Duration;
+}
+export interface FailsafeConfig {
+    matchMethod?: string;
+    matchFinality?: DataFinalityState[];
+    retry?: RetryPolicyConfig;
+    circuitBreaker?: CircuitBreakerPolicyConfig;
+    timeout?: TimeoutPolicyConfig;
+    hedge?: HedgePolicyConfig;
+    consensus?: ConsensusPolicyConfig;
+}
+/**
+ * NetworkFailsafeConfig is the scope-specific alias for network-level
+ * failsafe policies. By convention, CircuitBreaker is not used at this
+ * scope (use upstream-scope breakers instead); validation enforces this.
+ */
+export type NetworkFailsafeConfig = FailsafeConfig;
+/**
+ * UpstreamFailsafeConfig is the scope-specific alias for per-upstream
+ * failsafe policies. By convention, Consensus is not used at this
+ * scope (consensus is a network-scope concern only); validation
+ * enforces this.
+ */
+export type UpstreamFailsafeConfig = FailsafeConfig;
+/**
+ * CacheFailsafeConfig is the scope-specific alias for cache-connector
+ * failsafe policies. Hedge.Quantile is not allowed here (no per-method
+ * quantile data on cache reads); validation enforces this.
+ */
+export type CacheFailsafeConfig = FailsafeConfig;
+export interface RetryPolicyConfig {
+    maxAttempts: number;
+    delay?: Duration;
+    backoffMaxDelay?: Duration;
+    backoffFactor?: number;
+    jitter?: Duration;
+    emptyResultConfidence?: AvailbilityConfidence;
+    /**
+     * EmptyResultAccept lists methods for which an empty/null result is considered valid
+     * and should NOT be retried (e.g. eth_getLogs, eth_call where empty is a legitimate response).
+     */
+    emptyResultAccept?: string[];
+    /**
+     * @deprecated: use EmptyResultAccept instead.
+     */
+    emptyResultIgnore?: string[];
+    /**
+     * EmptyResultMaxAttempts limits total attempts when retries are triggered due to empty responses.
+     */
+    emptyResultMaxAttempts?: number;
+    /**
+     * EmptyResultDelay is the fixed delay between retry attempts triggered by empty results.
+     * When set, empty result retries wait this long instead of using the normal error delay/backoff.
+     */
+    emptyResultDelay?: Duration;
+    /**
+     * BlockUnavailableDelay is the fixed delay before retrying when all upstreams failed because the
+     * requested block is not yet available (ErrUpstreamBlockUnavailable). This gives upstream nodes
+     * time to receive and index the block before the retry. Typical values: 500ms-2s for fast chains.
+     */
+    blockUnavailableDelay?: Duration;
+}
+export interface CircuitBreakerPolicyConfig {
+    failureThresholdCount: number;
+    failureThresholdCapacity: number;
+    halfOpenAfter?: Duration;
+    successThresholdCount: number;
+    successThresholdCapacity: number;
+}
+/**
+ * TimeoutPolicyConfig is the timeout policy. Duration is the unified
+ * AdaptiveDuration — a scalar shorthand ("5s") or an object form
+ * ({base, quantile, min, max}) for adaptive caps driven by per-method
+ * latency quantiles.
+ * Wire format also accepts the legacy flat form
+ * (`duration: 5s, quantile: 0.99, minDuration: 200ms, maxDuration: 10s`)
+ * — siblings get folded into Duration at YAML/JSON unmarshal time.
+ */
+export interface TimeoutPolicyConfig {
+    duration?: Duration | AdaptiveDuration;
+}
+/**
+ * HedgePolicyConfig is the hedge policy. Delay is the unified
+ * AdaptiveDuration — scalar shorthand ("100ms") or object form
+ * ({base, quantile, min, max}) for quantile-driven hedge timing.
+ * Wire format also accepts the legacy flat form
+ * (`delay: 100ms, quantile: 0.95, minDelay: 50ms, maxDelay: 2s`) —
+ * siblings get folded into Delay at YAML/JSON unmarshal time.
+ */
+export interface HedgePolicyConfig {
+    delay?: Duration | AdaptiveDuration;
+    maxCount: number;
+}
+export type ConsensusLowParticipantsBehavior = string;
+export declare const ConsensusLowParticipantsBehaviorReturnError: ConsensusLowParticipantsBehavior;
+export declare const ConsensusLowParticipantsBehaviorAcceptMostCommonValidResult: ConsensusLowParticipantsBehavior;
+export declare const ConsensusLowParticipantsBehaviorPreferBlockHeadLeader: ConsensusLowParticipantsBehavior;
+export declare const ConsensusLowParticipantsBehaviorOnlyBlockHeadLeader: ConsensusLowParticipantsBehavior;
+export type ConsensusDisputeBehavior = string;
+export declare const ConsensusDisputeBehaviorReturnError: ConsensusDisputeBehavior;
+export declare const ConsensusDisputeBehaviorAcceptMostCommonValidResult: ConsensusDisputeBehavior;
+export declare const ConsensusDisputeBehaviorPreferBlockHeadLeader: ConsensusDisputeBehavior;
+export declare const ConsensusDisputeBehaviorOnlyBlockHeadLeader: ConsensusDisputeBehavior;
+export interface ConsensusPolicyConfig {
+    maxParticipants: number;
+    agreementThreshold?: number;
+    disputeBehavior?: ConsensusDisputeBehavior;
+    lowParticipantsBehavior?: ConsensusLowParticipantsBehavior;
+    punishMisbehavior?: PunishMisbehaviorConfig;
+    disputeLogLevel?: string;
+    ignoreFields?: {
+        [key: string]: string[];
+    };
+    preferNonEmpty?: boolean;
+    preferLargerResponses?: boolean;
+    misbehaviorsDestination?: MisbehaviorsDestinationConfig;
+    /**
+     * PreferHighestValueFor specifies methods that should use highest-value comparison
+     * instead of hash-based consensus. Map key is method name, value is array of field paths.
+     * Field paths: "result" for direct result value (e.g., eth_getTransactionCount returns hex),
+     * or field name for nested result objects (e.g., "nonce" for result.nonce).
+     * When multiple fields are specified, they act as tie-breakers in order.
+     */
+    preferHighestValueFor?: {
+        [key: string]: string[];
+    };
+    /**
+     * FireAndForget when true, allows consensus to return a response to the client immediately
+     * upon short-circuit, but does NOT cancel in-flight requests to other upstreams.
+     * This is useful for write operations like eth_sendRawTransaction where you want to
+     * broadcast the transaction to as many nodes as possible while still returning quickly.
+     * Default is false (normal behavior - cancel remaining requests on short-circuit).
+     */
+    fireAndForget?: boolean;
+    /**
+     * MaxWaitOnResult caps how long consensus waits for additional participants
+     * AFTER at least one non-empty response has arrived. Use this to bound
+     * p99 latency when most upstreams are fast but one is a slow straggler:
+     * once a real answer is in hand, give the rest at most this long to
+     * confirm or dispute, then resolve with what we have.
+     * Accepts a duration scalar ("200ms") or an AdaptiveDuration object
+     * ({base, quantile, min, max}) for adaptive caps driven by per-method
+     * latency quantiles. Defaults are applied when consensus is configured
+     * but this field is omitted — see common/defaults.go.
+     */
+    maxWaitOnResult?: Duration | AdaptiveDuration;
+    /**
+     * MaxWaitOnEmpty caps how long consensus waits for additional participants
+     * AFTER the first response (of any kind — empty, error, or non-empty)
+     * has arrived. Typically set larger than MaxWaitOnResult because an
+     * operator is more patient when no useful data is in hand yet.
+     * Same shape as MaxWaitOnResult; defaults applied when consensus is set.
+     */
+    maxWaitOnEmpty?: Duration | AdaptiveDuration;
+    /**
+     * RequiredParticipants enforces a minimum number of consensus
+     * participants carrying a given tag. Each entry says "at least
+     * `minParticipants` of the upstreams that participate must match
+     * `tag`". The engine front-loads enough tag-matching upstreams into
+     * the participant set so the first `maxParticipants` drawn satisfy
+     * every entry — without changing `maxParticipants` itself.
+     * Best-effort and governed by the EXISTING consensus behaviors: if a
+     * required group has fewer healthy upstreams than requested (or the
+     * quotas can't all fit within `maxParticipants`), consensus simply
+     * runs with what it can promote and the resulting participation is
+     * handled by `lowParticipantsBehavior` / `agreementThreshold` exactly
+     * like any other low-participation tick. Empty (default) = disabled.
+     */
+    requiredParticipants?: (ConsensusRequiredParticipant | undefined)[];
+}
+/**
+ * ConsensusRequiredParticipant is one tag-quota entry for
+ * `consensus.requiredParticipants`. `Tag` is a glob pattern (`*`, `?`)
+ * matched against each upstream's `tags`; `MinParticipants` is the minimum
+ * number of matching upstreams that must be in the consensus participant
+ * set. A single upstream can satisfy multiple entries it matches.
+ */
+export interface ConsensusRequiredParticipant {
+    tag: string;
+    minParticipants: number;
+}
+export type MisbehaviorsDestinationType = string;
+export declare const MisbehaviorsDestinationTypeFile: MisbehaviorsDestinationType;
+export declare const MisbehaviorsDestinationTypeS3: MisbehaviorsDestinationType;
+export interface MisbehaviorsDestinationConfig {
+    /**
+     * Type of destination: "file" or "s3"
+     */
+    type: 'file' | 's3';
+    /**
+     * Path for file destination, or S3 URI (s3://bucket/prefix/) for S3 destination
+     */
+    path: string;
+    /**
+     * Pattern for generating file names. Supports placeholders:
+     * {dateByHour} - formatted as 2006-01-02-15
+     * {dateByDay} - formatted as 2006-01-02
+     * {method} - the RPC method name
+     * {networkId} - the network ID with : replaced by _
+     * {instanceId} - unique instance identifier
+     */
+    filePattern?: string;
+    /**
+     * S3-specific settings for bulk flushing
+     */
+    s3?: S3FlushConfig;
+}
+export interface S3FlushConfig {
+    /**
+     * Maximum number of records to buffer before flushing (default: 100)
+     */
+    maxRecords?: number;
+    /**
+     * Maximum size in bytes to buffer before flushing (default: 1MB)
+     */
+    maxSize?: number;
+    /**
+     * Maximum time to wait before flushing buffered records (default: 60s)
+     */
+    flushInterval?: Duration;
+    /**
+     * AWS region for S3 bucket (defaults to AWS_REGION env var)
+     */
+    region?: string;
+    /**
+     * AWS credentials config (optional). If not specified, uses standard AWS credential chain:
+     * 1. Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+     * 2. IAM role (for EC2/ECS/EKS)
+     * 3. Shared credentials file (~/.aws/credentials)
+     * Supported modes: "env", "file", "secret"
+     */
+    credentials?: AwsAuthConfig;
+    /**
+     * Content type for uploaded files (default: "application/jsonl")
+     */
+    contentType?: string;
+}
+export interface PunishMisbehaviorConfig {
+    disputeThreshold: number;
+    disputeWindow?: Duration;
+    sitOutPenalty?: Duration;
+}
+export interface RateLimiterConfig {
+    store?: RateLimitStoreConfig;
+    budgets: RateLimitBudgetConfig[];
+}
+export interface RateLimitBudgetConfig {
+    id: string;
+    rules: RateLimitRuleConfig[];
+}
+export interface RateLimitRuleConfig {
+    method: string;
+    maxCount: number;
+    /**
+     * Period is the canonical period selector. Supported: second, minute, hour, day, week, month, year
+     */
+    period: RateLimitPeriod;
+    waitTime?: Duration;
+    perIP?: boolean;
+    perUser?: boolean;
+    perNetwork?: boolean;
+}
+/**
+ * RateLimitPeriod enumerates supported periods for rate limiting.
+ * It is an int enum to enable strong typing in TypeScript generation, while
+ * marshaling to JSON/YAML as human-readable strings like "second", "minute", etc.
+ */
+export type RateLimitPeriod = number;
+export declare const RateLimitPeriodSecond: RateLimitPeriod;
+export declare const RateLimitPeriodMinute: RateLimitPeriod;
+export declare const RateLimitPeriodHour: RateLimitPeriod;
+export declare const RateLimitPeriodDay: RateLimitPeriod;
+export declare const RateLimitPeriodWeek: RateLimitPeriod;
+export declare const RateLimitPeriodMonth: RateLimitPeriod;
+export declare const RateLimitPeriodYear: RateLimitPeriod;
+export interface ProxyPoolConfig {
+    id: string;
+    urls: string[];
+}
+export interface MethodsConfig {
+    preserveDefaultMethods?: boolean;
+    definitions?: {
+        [key: string]: CacheMethodConfig | undefined;
+    };
+}
+export interface NetworkConfig {
+    architecture: TsNetworkArchitecture;
+    rateLimitBudget?: string;
+    failsafe?: (FailsafeConfig | undefined)[];
+    evm?: EvmNetworkConfig;
+    selectionPolicy?: SelectionPolicyConfig;
+    directiveDefaults?: DirectiveDefaultsConfig;
+    alias?: string;
+    methods?: MethodsConfig;
+    multiplexing?: boolean;
+    staticResponses?: (StaticResponseConfig | undefined)[];
+}
+/**
+ * StaticResponseConfig declares a canned JSON-RPC response for a specific
+ * (method, params) pair on a network. When an inbound request matches, the
+ * configured response is returned immediately and no upstream is contacted.
+ * Useful for chains that deviate from client assumptions (for example, chains
+ * whose genesis block is not 0) where probing upstreams would yield errors
+ * or inconsistent data.
+ */
+export interface StaticResponseConfig {
+    method: string;
+    params?: any[];
+    response?: StaticResponseBodyConfig;
+}
+/**
+ * StaticResponseBodyConfig holds the JSON-RPC payload to serve. Exactly one
+ * of Result or Error must be set.
+ */
+export interface StaticResponseBodyConfig {
+    result?: any;
+    error?: StaticResponseErrorConfig;
+}
+/**
+ * StaticResponseErrorConfig mirrors a JSON-RPC error object.
+ */
+export interface StaticResponseErrorConfig {
+    code: number;
+    message: string;
+    data?: any;
+}
+/**
+ * Define a type alias to avoid recursion
+ */
+/**
+ * If that fails, try the old format with single failsafe object
+ */
+export interface DirectiveDefaultsConfig {
+    retryEmpty?: boolean;
+    retryPending?: boolean;
+    skipCacheRead?: any;
+    useUpstream?: string;
+    skipInterpolation?: boolean;
+    skipConsensus?: boolean;
+    /**
+     * Validation: Block Integrity
+     */
+    enforceHighestBlock?: boolean;
+    enforceGetLogsBlockRange?: boolean;
+    enforceNonNullTaggedBlocks?: boolean;
+    /**
+     * ValidateTransactionsRoot: checks transactionsRoot vs transaction count consistency.
+     * Defaults to true. Disable for non-standard chains that use unusual trie roots.
+     */
+    validateTransactionsRoot?: boolean;
+    /**
+     * Validation: Header Field Lengths
+     */
+    validateHeaderFieldLengths?: boolean;
+    /**
+     * Validation: Transactions (for eth_getBlockByNumber/Hash with full txs)
+     */
+    validateTransactionFields?: boolean;
+    validateTransactionBlockInfo?: boolean;
+    /**
+     * Validation: Receipts & Logs
+     */
+    enforceLogIndexStrictIncrements?: boolean;
+    validateTxHashUniqueness?: boolean;
+    validateTransactionIndex?: boolean;
+    validateLogFields?: boolean;
+    /**
+     * Validation: Bloom Filter (simplified to 2 checks)
+     * ValidateLogsBloomEmptiness: if logs exist, bloom must not be zero; if bloom is non-zero, logs must exist
+     */
+    validateLogsBloomEmptiness?: boolean;
+    /**
+     * ValidateLogsBloomMatch: recalculate bloom from logs and verify it matches the provided bloom
+     */
+    validateLogsBloomMatch?: boolean;
+    /**
+     * Validation: Receipt-to-Transaction Cross-Validation (requires GroundTruthTransactions in library-mode)
+     */
+    validateReceiptTransactionMatch?: boolean;
+    validateContractCreation?: boolean;
+    /**
+     * Validation: numeric checks
+     */
+    receiptsCountExact?: number;
+    receiptsCountAtLeast?: number;
+    /**
+     * Validation: Expected Ground Truths
+     */
+    validationExpectedBlockHash?: string;
+    validationExpectedBlockNumber?: number;
+}
+export interface EvmNetworkConfig {
+    chainId: number;
+    fallbackFinalityDepth?: number;
+    fallbackStatePollerDebounce?: Duration;
+    integrity?: EvmIntegrityConfig;
+    getLogsMaxAllowedRange?: number;
+    getLogsMaxAllowedAddresses?: number;
+    getLogsMaxAllowedTopics?: number;
+    getLogsSplitOnError?: boolean;
+    getLogsSplitConcurrency?: number;
+    /**
+     * TraceFilterSplitOnError controls reactive splitting for trace_filter and
+     * arbtrace_filter requests when the upstream returns a range-too-large error.
+     * Nil disables the feature.
+     */
+    traceFilterSplitOnError?: boolean;
+    /**
+     * TraceFilterSplitConcurrency caps in-flight sub-requests when a trace_filter
+     * or arbtrace_filter request is split. Zero falls back to 10.
+     */
+    traceFilterSplitConcurrency?: number;
+    /**
+     * EnforceBlockAvailability controls whether the network should enforce per-upstream
+     * block availability bounds (upper/lower) for methods by default. Method-level config may override.
+     * When nil or true, enforcement is enabled.
+     */
+    enforceBlockAvailability?: boolean;
+    /**
+     * MaxRetryableBlockDistance controls the maximum block distance for which an upstream
+     * block unavailability error is considered retryable. If the requested block is within
+     * this distance from the upstream's latest block, the error is retryable (upstream may catch up).
+     * If the distance is larger, the error is not retryable (upstream is too far behind).
+     * Default: 128 blocks.
+     */
+    maxRetryableBlockDistance?: number;
+    /**
+     * MarkEmptyAsErrorMethods lists methods for which an empty/null result from an upstream
+     * should be treated as a "missing data" error, triggering retry on other upstreams.
+     * This is useful for point-lookups (blocks, transactions, receipts, traces) where an
+     * empty result likely means the upstream hasn't indexed that data yet.
+     * Default includes common point-lookup methods like eth_getBlockByNumber, eth_getTransactionByHash, etc.
+     */
+    markEmptyAsErrorMethods?: string[];
+    /**
+     * DynamicBlockTimeDebounceMultiplier scales the EMA-estimated block time to derive
+     * the debounce interval for block polling. A value of 0.7 means debounce = 70% of
+     * the estimated block time, preferring fresher data at the cost of slightly more
+     * polling. Lower values reduce staleness risk; higher values reduce RPC calls.
+     * Default: 0.7 (30% under the estimated block time).
+     */
+    dynamicBlockTimeDebounceMultiplier?: number;
+    /**
+     * BlockUnavailableDelayMultiplier scales the EMA-estimated block time to derive
+     * the retry delay when all upstreams return ErrUpstreamBlockUnavailable. When the
+     * dynamic block time is known, the delay is blockTime * this multiplier.
+     * Falls back to the static RetryPolicyConfig.BlockUnavailableDelay when block time
+     * is not yet available. Default: 0.8.
+     */
+    blockUnavailableDelayMultiplier?: number;
+    /**
+     * IdempotentTransactionBroadcast enables idempotency handling for eth_sendRawTransaction.
+     * When enabled (default), "already known" and verified "nonce too low" errors are converted
+     * to success responses with the transaction hash. This allows failsafe policies (retry/hedge)
+     * to work safely with transaction broadcasting.
+     * Set to false to disable this behavior and return raw upstream errors.
+     */
+    idempotentTransactionBroadcast?: boolean;
+}
+/**
+ * EvmIntegrityConfig is deprecated. Use DirectiveDefaultsConfig for validation settings.
+ */
+export interface EvmIntegrityConfig {
+    /**
+     * @deprecated: use DirectiveDefaults.EnforceHighestBlock
+     */
+    enforceHighestBlock?: boolean;
+    /**
+     * @deprecated: use DirectiveDefaults.EnforceGetLogsBlockRange
+     */
+    enforceGetLogsBlockRange?: boolean;
+    /**
+     * @deprecated: use DirectiveDefaults.EnforceNonNullTaggedBlocks
+     */
+    enforceNonNullTaggedBlocks?: boolean;
+}
+/**
+ * EvalScope picks the grain at which the selection policy evaluates AND
+ * at which the health tracker stores per-upstream metrics. One knob
+ * covers what `evalPerMethod` + `evalPerFinality` used to cover as two
+ * bools — and pulls the tracker's metric grain in lockstep so a
+ * predicate like `errorRateAbove(0.5)` in a (method, finality)-grained
+ * slot sees genuinely (method, finality)-specific error rate, not the
+ * per-method aggregate.
+ * Values are kebab-case strings so they round-trip through YAML / JSON
+ * / Go enum literals cleanly. The TS SDK exports the same names in
+ * CAPITAL_SNAKE_CASE with these same string values, so `evalScope:
+ * NETWORK` in a TS config and `evalScope: network` in a YAML config
+ * produce identical Go state.
+ */
+export type EvalScope = string;
+/**
+ * EvalScopeNetwork — single slot per network. Methods + finalities
+ * share. Default. Lowest cardinality + lowest tracker memory.
+ */
+export declare const EvalScopeNetwork: EvalScope;
+/**
+ * EvalScopeNetworkMethod — slot per (network, method). Finalities
+ * share. Useful when one upstream is fast on `eth_call` but slow on
+ * `trace_filter`.
+ */
+export declare const EvalScopeNetworkMethod: EvalScope;
+/**
+ * EvalScopeNetworkFinality — slot per (network, finality). Methods
+ * share. Useful when realtime reads weight freshness differently
+ * from finalized reads.
+ */
+export declare const EvalScopeNetworkFinality: EvalScope;
+/**
+ * EvalScopeNetworkMethodFinality — slot per (network, method,
+ * finality). Most granular routing. Cardinality scales linearly;
+ * each slot's ticker only spins up after the first request for
+ * that bucket lands.
+ */
+export declare const EvalScopeNetworkMethodFinality: EvalScope;
+/**
+ * SelectionPolicyConfig declares the per-network upstream selection policy.
+ * The eval function is JavaScript that receives `upstreams` and `ctx` and
+ * returns the ordered list of upstreams that should serve traffic for the
+ * network/method scope. The chainable std-lib (see internal/policy/stdlib)
+ * provides the building blocks (sortByScore, removeByLag, stickyPrimary,
+ * probeExcluded, etc.) — see specs/selection-policy/feature.md.
+ */
+export interface SelectionPolicyConfig {
+    evalInterval?: Duration;
+    /**
+     * EvalScope picks the slot grain — and the matching tracker grain
+     * (see `EvalScope` doc). Default `network` (one slot per network).
+     * Tighter scopes let predicates like `errorRateAbove(0.5)` see
+     * genuinely (method, finality)-specific health.
+     */
+    evalScope?: EvalScope | "network" | "network-method" | "network-finality" | "network-method-finality";
+    evalTimeout?: Duration;
+    /**
+     * EvalFunc is the per-tick evaluation function. In YAML it's a JS
+     * source string; in TS configs it's a real arrow function compiled
+     * into `CompiledProgram` at config load.
+     * Signature: `(upstreams, ctx) => Upstream[]`.
+     * See specs/selection-policy/feature.md for the stdlib reference.
+     */
+    evalFunc?: SelectionPolicyEvalFunction | string;
+}
+/**
+ * LegacySelectionPolicyFields mirrors the deprecated keys that used to
+ * live on SelectionPolicyConfig. None survive translation.
+ */
+export interface LegacySelectionPolicyFields {
+    evalFunction?: string;
+    resampleExcluded?: boolean;
+    resampleInterval?: Duration;
+    resampleCount?: number;
+}
+export type AuthType = string;
+export declare const AuthTypeSecret: AuthType;
+export declare const AuthTypeDatabase: AuthType;
+export declare const AuthTypeJwt: AuthType;
+export declare const AuthTypeSiwe: AuthType;
+export declare const AuthTypeNetwork: AuthType;
+export interface AuthConfig {
+    strategies: TsAuthStrategyConfig[];
+}
+export interface AuthStrategyConfig {
+    ignoreMethods?: string[];
+    allowMethods?: string[];
+    rateLimitBudget?: string;
+    type: TsAuthType;
+    network?: NetworkStrategyConfig;
+    secret?: SecretStrategyConfig;
+    database?: DatabaseStrategyConfig;
+    jwt?: JwtStrategyConfig;
+    siwe?: SiweStrategyConfig;
+}
+export interface SecretStrategyConfig {
+    id: string;
+    value: string;
+    /**
+     * RateLimitBudget, if set, is applied to the authenticated user from this strategy
+     */
+    rateLimitBudget?: string;
+}
+export interface DatabaseStrategyConfig {
+    connector?: ConnectorConfig;
+    cache?: DatabaseStrategyCacheConfig;
+    retry?: DatabaseRetryConfig;
+    failOpen?: DatabaseFailOpenConfig;
+    maxWait?: Duration;
+}
+export interface DatabaseStrategyCacheConfig {
+    ttl?: number;
+    maxSize?: number;
+    maxCost?: number;
+    numCounters?: number;
+}
+export interface DatabaseRetryConfig {
+    maxAttempts?: number;
+    baseBackoff?: Duration;
+}
+export interface DatabaseFailOpenConfig {
+    enabled: boolean;
+    userId?: string;
+    rateLimitBudget?: string;
+}
+export interface JwtStrategyConfig {
+    allowedIssuers: string[];
+    allowedAudiences: string[];
+    allowedAlgorithms: string[];
+    requiredClaims: string[];
+    verificationKeys: {
+        [key: string]: string;
+    };
+    /**
+     * RateLimitBudgetClaimName is the JWT claim name that, if present,
+     * will be used to set the per-user RateLimitBudget override.
+     * Defaults to "rlm".
+     */
+    rateLimitBudgetClaimName?: string;
+}
+export interface SiweStrategyConfig {
+    allowedDomains: string[];
+    /**
+     * RateLimitBudget, if set, is applied to the authenticated user
+     */
+    rateLimitBudget?: string;
+}
+export interface NetworkStrategyConfig {
+    allowedIPs: string[];
+    allowedCIDRs: string[];
+    allowLocalhost: boolean;
+    trustedProxies: string[];
+    /**
+     * RateLimitBudget, if set, is applied to the authenticated user (client IP)
+     */
+    rateLimitBudget?: string;
+    ipAsUser?: boolean;
+}
+export type LabelMode = string;
+export declare const ErrorLabelModeVerbose: LabelMode;
+export declare const ErrorLabelModeCompact: LabelMode;
+export interface MetricsConfig {
+    enabled?: boolean;
+    listenV4?: boolean;
+    hostV4?: string;
+    listenV6?: boolean;
+    hostV6?: string;
+    port?: number;
+    errorLabelMode?: LabelMode;
+    histogramBuckets?: string;
+    /**
+     * HistogramDropLabels removes these labels from every histogram. Counters
+     * and gauges are unaffected. Useful to cap per-instance /metrics response
+     * size when high-cardinality labels (e.g. "user") push a scrape past the
+     * managed scraper's sample/body limits.
+     */
+    histogramDropLabels?: string[];
+    /**
+     * HistogramLabelOverrides re-adds labels for specific histograms even if
+     * they appear in HistogramDropLabels. Key is the metric Name (without the
+     * "erpc_" namespace prefix), e.g. "network_request_duration_seconds".
+     * Value is the list of label names to keep for that metric.
+     */
+    histogramLabelOverrides?: {
+        [key: string]: string[];
+    };
+}
+/**
+ * RateLimitStoreConfig defines where rate limit counters are stored
+ */
+export interface RateLimitStoreConfig {
+    driver: string;
+    redis?: RedisConnectorConfig;
+    cacheKeyPrefix?: string;
+    nearLimitRatio?: number;
+}
+/**
+ * tsFunctionSentinelPrefix marks a SelectionPolicy.EvalFunc whose actual
+ * implementation lives as a real sobek function in `globalThis.__erpcFns`
+ * (populated by running `Config.UserScript` inside the policy-engine pool
+ * runtime). The suffix is the function's lookup id. Sentinels NEVER hit
+ * `sobek.Compile` and the function is never stringified — when the engine
+ * needs to evaluate, it pulls the runtime-native function out of the
+ * registry and calls it directly. This preserves closures + module-level
+ * helpers that the user wrote in the TS config alongside the function.
+ */
+/**
+ * tsLoaderWalker is JS that runs INSIDE the user script. After the user's
+ * `createConfig(...)` builds the default export, the walker:
+ *   - assigns a stable sequential id to each function-typed leaf
+ *     in the default export's object tree;
+ *   - registers that function on `globalThis.__erpcFns[id]` so the
+ *     engine can look it up natively in this runtime;
+ *   - stamps `fn.__erpcFnId = id` on the function value so the
+ *     LOAD-time JSON.stringify replacer can substitute the sentinel
+ *     string `"__ts_fn__:<id>"` into the serialized form (which then
+ *     becomes the value of `SelectionPolicyConfig.EvalFunc` in Go).
+ * The walk is order-deterministic, so the same user script produces the
+ * same ids in every pool runtime that subsequently runs it. That's what
+ * keeps the load-time sentinel ids and the pool-runtime registry ids in
+ * lockstep without sharing state across runtimes.
+ */
+export type DataFinalityState = number;
+/**
+ * Finalized gets 0 intentionally so that when user has not specified finality,
+ * it defaults to finalized, which is safest sane default for caching.
+ * This attribute will be calculated based on extracted block number (from request and/or response)
+ * and comparing to the upstream (one that returned the response) 'finalized' block (fetch via evm state poller).
+ */
+export declare const DataFinalityStateFinalized: DataFinalityState;
+/**
+ * When we CAN determine the block number, and it's after the upstream 'finalized' block, we consider the data unfinalized.
+ */
+export declare const DataFinalityStateUnfinalized: DataFinalityState;
+/**
+ * Certain methods points are meant to be realtime and updated with every new block (e.g. eth_gasPrice).
+ * These can be cached with short TTLs to improve performance.
+ */
+export declare const DataFinalityStateRealtime: DataFinalityState;
+/**
+ * When we CANNOT determine the block number (e.g some trace by hash calls), we consider the data unknown.
+ * Most often it is safe to cache this data for longer as they're access when block hash is provided directly.
+ */
+export declare const DataFinalityStateUnknown: DataFinalityState;
+/**
+ * DataFinalityStateAll is the internal wildcard sentinel used by the
+ * health tracker to key its cross-finality aggregate rollups. NOT a
+ * valid user-facing finality — never set on a request, never returned
+ * from `Finality()`. Lives here so the tracker (health/) and the
+ * policy engine (internal/policy/) can both reference it without a
+ * cycle. Negative-valued so it sorts before any real finality bucket
+ * and doesn't collide with the iota-based enum values.
+ */
+export declare const DataFinalityStateAll: DataFinalityState;
+export type CacheEmptyBehavior = number;
+export declare const CacheEmptyBehaviorIgnore: CacheEmptyBehavior;
+export declare const CacheEmptyBehaviorAllow: CacheEmptyBehavior;
+export declare const CacheEmptyBehaviorOnly: CacheEmptyBehavior;
+/**
+ * CachePolicyAppliesTo controls whether a cache policy applies to get, set, or both operations.
+ */
+export type CachePolicyAppliesTo = string;
+export declare const CachePolicyAppliesToBoth: CachePolicyAppliesTo;
+export declare const CachePolicyAppliesToGet: CachePolicyAppliesTo;
+export declare const CachePolicyAppliesToSet: CachePolicyAppliesTo;
+/**
+ * JsonRpcErrorExtractor allows callers to inject architecture-specific
+ * JSON-RPC error normalization logic into HTTP clients without creating
+ * package import cycles.
+ */
+export type JsonRpcErrorExtractor = any;
+/**
+ * JsonRpcErrorExtractorFunc is an adapter to allow normal functions to be used
+ * as JsonRpcErrorExtractor implementations.
+ * Similar to http.HandlerFunc style adapters.
+ */
+export type JsonRpcErrorExtractorFunc = any;
+/**
+ * UpstreamAttemptOutcome enumerates the possible per-attempt outcomes
+ * recorded against an upstream. The set is closed: every attempt ends
+ * in exactly one of these.
+ */
+export type UpstreamAttemptOutcome = string;
+export declare const UpstreamOutcomeSuccess: UpstreamAttemptOutcome;
+export declare const UpstreamOutcomeEmpty: UpstreamAttemptOutcome;
+export declare const UpstreamOutcomeTransportError: UpstreamAttemptOutcome;
+export declare const UpstreamOutcomeServerError: UpstreamAttemptOutcome;
+export declare const UpstreamOutcomeClientError: UpstreamAttemptOutcome;
+export declare const UpstreamOutcomeRateLimited: UpstreamAttemptOutcome;
+export declare const UpstreamOutcomeMissingData: UpstreamAttemptOutcome;
+export declare const UpstreamOutcomeExecRevert: UpstreamAttemptOutcome;
+export declare const UpstreamOutcomeBlockUnavailable: UpstreamAttemptOutcome;
+export declare const UpstreamOutcomeBreakerOpen: UpstreamAttemptOutcome;
+export declare const UpstreamOutcomeCancelled: UpstreamAttemptOutcome;
+export declare const UpstreamOutcomeTimeout: UpstreamAttemptOutcome;
+export declare const UpstreamOutcomeSkipped: UpstreamAttemptOutcome;
+/**
+ * UpstreamSelectionReason describes WHY a particular upstream was
+ * selected for a given attempt. Operators use this to debug skew in
+ * upstream-pick distribution (e.g. why is one upstream getting all
+ * the hedge fan-out?).
+ */
+export type UpstreamSelectionReason = string;
+export declare const SelectionReasonPrimary: UpstreamSelectionReason;
+export declare const SelectionReasonRetry: UpstreamSelectionReason;
+export declare const SelectionReasonHedge: UpstreamSelectionReason;
+export declare const SelectionReasonConsensusSlot: UpstreamSelectionReason;
+export declare const SelectionReasonSweep: UpstreamSelectionReason;
+/**
+ * UpstreamAttempt is one (upstream, attempt) record. The executors
+ * append these as participants come and go so operators can answer
+ * "which upstreams were involved in this request, why were they
+ * chosen, and what happened to them?" without parsing trace data.
+ * Won is flipped to true by the executor when this attempt's response
+ * contributed to the final response returned to the client. For a
+ * non-consensus request that's exactly one attempt (the winning one);
+ * for consensus it's every participant whose vote landed in the
+ * winning agreement group.
+ */
+export interface UpstreamAttempt {
+    upstreamid: string;
+    vendorname: string;
+    startedat: any;
+    duration: number;
+    outcome: UpstreamAttemptOutcome;
+    reason: UpstreamSelectionReason;
+    ishedge: boolean;
+    isretry: boolean;
+    won: boolean;
+    attemptidx: number;
+    errorcode: string;
+    errordetail: string;
+}
+/**
+ * ExecState centralizes the per-request execution counters and the
+ * per-upstream attempt log. Created lazily on first access via
+ * (*NormalizedRequest).ExecState().
+ * All counters are atomic; the struct itself is safe for concurrent use.
+ * Counter model — every executor increments its OWN scope only.
+ * Snapshot derives the totals so "forgot to increment the total" is
+ * impossible by construction. The derivation is NOT a flat sum because
+ * the scopes are nested: each network rotation triggers exactly one
+ * upstream invocation chain, so summing both would double-count
+ * physical attempts.
+ * 	total Attempts = UpstreamAttempts + CacheAttempts
+ * 	    (every physical call is counted at the deepest scope that
+ * 	    actually performed it — upstreams for HTTP, cache for connector
+ * 	    reads. NetworkAttempts is a separate rotation-count signal,
+ * 	    exposed as its own counter but NOT summed into the total.)
+ * 	total Retries = sum of UpstreamRetries + NetworkRetries + CacheRetries
+ * 	total Hedges  = sum of UpstreamHedges  + NetworkHedges  + CacheHedges
+ * 	    (retries and hedges ARE different events at each scope — an
+ * 	    upstream-scope retry retries the SAME upstream, a network-scope
+ * 	    retry rotates to a NEW upstream. Summing is correct.)
+ * Scope semantics:
+ *   - UpstreamAttempts: physical Forward calls to a single upstream's
+ *     transport (primary + retries + hedges within one upstream).
+ *   - NetworkAttempts: rotations across upstreams driven by the
+ *     network executor's retry / hedge / consensus loop. Each rotation
+ *     triggers one upstream invocation chain. Not summed into total.
+ *   - CacheAttempts: cache-connector reads/writes including
+ *     within-connector retries and hedges.
+ */
+export interface ExecState {
+    /**
+     * Per-scope counters. Each executor owns its OWN counter set and
+     * MUST NOT touch another scope's counters.
+     */
+    upstreamattempts: any;
+    upstreamretries: any;
+    upstreamhedges: any;
+    networkattempts: any;
+    networkretries: any;
+    networkhedges: any;
+    cacheattempts: any;
+    cacheretries: any;
+    cachehedges: any;
+    /**
+     * ConsensusSlots counts how many consensus participants ran.
+     */
+    consensusslots: any;
+    /**
+     * ConsensusDisputes counts dispute events.
+     */
+    consensusdisputes: any;
+    /**
+     * ConsensusLowParticipants counts low-participant events.
+     */
+    consensuslowparticipants: any;
+    startedat: any;
+}
+/**
+ * ExecStateSnapshot is a plain-int view of ExecState for log/span
+ * labeling — captured at a point in time. Total Attempts/Retries/Hedges
+ * are derived as the sum of per-scope counters at snapshot time.
+ */
+export interface ExecStateSnapshot {
+    /**
+     * Totals (derived: Upstream + Network + Cache).
+     */
+    attempts: number;
+    retries: number;
+    hedges: number;
+    /**
+     * Per-scope counters (each executor's own bookkeeping).
+     */
+    upstreamattempts: number;
+    upstreamretries: number;
+    upstreamhedges: number;
+    networkattempts: number;
+    networkretries: number;
+    networkhedges: number;
+    cacheattempts: number;
+    cacheretries: number;
+    cachehedges: number;
+    consensusslots: number;
+    consensusdisputes: number;
+    consensuslowparticipants: number;
+    startedat: any;
+}
+/**
+ * execStateOnce is embedded on NormalizedRequest to lazy-init the
+ * ExecState struct without making every request pay the allocation when
+ * the field is never accessed.
+ */
+export type NetworkArchitecture = string;
+export declare const ArchitectureEvm: NetworkArchitecture;
+export type Network = any;
+export type QuantileTracker = any;
+export type TrackedMetrics = any;
+/**
+ * TimeoutFunc computes the timeout for a request. Returns nil when no
+ * timeout applies (caller skips context.WithTimeout).
+ */
+export type TimeoutFunc = any;
+export type Scope = string;
+/**
+ * Policies must be created with a "network" in mind,
+ * assuming there will be many upstreams e.g. Retry might endup using a different upstream
+ */
+export declare const ScopeNetwork: Scope;
+/**
+ * Policies must be created with one only "upstream" in mind
+ * e.g. Retry with be towards the same upstream
+ */
+export declare const ScopeUpstream: Scope;
+export type UpstreamType = string;
+/**
+ * HealthTracker is an interface for tracking upstream health metrics.
+ * `finality` is the DataFinalityState the request resolved to —
+ * `DataFinalityStateAll` when the caller can't determine finality
+ * (legacy call sites, internal probes, batch retries). Cordon/Uncordon
+ * stay finality-agnostic because cordoning is an admin-level decision
+ * about an entire (upstream, method) pair, not a per-finality bucket.
+ */
+export type HealthTracker = any;
+export type Upstream = any;
+export interface User {
+    id: string;
+    ratelimitbudget: string;
+}
+//# sourceMappingURL=generated.d.ts.map

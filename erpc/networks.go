@@ -1,0 +1,2292 @@
+package erpc
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"runtime/debug"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/erpc/erpc/architecture/evm"
+	"github.com/erpc/erpc/common"
+	"github.com/erpc/erpc/data"
+	"github.com/erpc/erpc/health"
+	"github.com/erpc/erpc/internal/policy"
+	"github.com/erpc/erpc/telemetry"
+	"github.com/erpc/erpc/upstream"
+	"github.com/erpc/erpc/util"
+	"github.com/rs/zerolog"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+)
+
+type Network struct {
+	networkId            string
+	networkLabel         string
+	projectId            string
+	logger               *zerolog.Logger
+	bootstrapOnce        sync.Once
+	appCtx               context.Context
+	cfg                  *common.NetworkConfig
+	inFlightRequests     *sync.Map
+	failsafeExecutors    []*networkExecutor // main: failsafe rename FailsafeExecutor → networkExecutor
+	rateLimitersRegistry *upstream.RateLimitersRegistry
+	cacheDal             common.CacheDAL
+	metricsTracker       *health.Tracker
+	upstreamsRegistry    *upstream.UpstreamsRegistry
+	// policyEngine replaces the legacy `selectionPolicyEvaluator *PolicyEvaluator` field
+	// (and the `erpc/policy_evaluator.go` per-request `AcquirePermit` gating it owned).
+	// The engine pre-computes the ordered upstream list per (network, method) tick;
+	// the request path consumes the head via `policyEngine.GetOrdered`, so per-attempt
+	// permit-acquisition is no longer needed.
+	policyEngine *policy.Engine
+	initializer  *util.Initializer
+
+	// latestBlockShared / finalizedBlockShared make the network's block tags
+	// cross-pod monotonic. Without them, different eRPC instances could return
+	// regressing values (e.g. 100 then 97) when their local upstream state
+	// pollers are briefly out of step — a client polling through a load
+	// balancer would see the regression and treat it as a data-integrity
+	// failure. May be nil in tests or when shared state is unavailable.
+	latestBlockShared    data.CounterInt64SharedVariable
+	finalizedBlockShared data.CounterInt64SharedVariable
+
+	// Last value this Network has ever returned from evmHighestBlockNumber
+	// for each of the monotonic tags. If a subsequent call computes a lower
+	// value we WARN with the local/shared inputs so we can see whether the
+	// regression originated in the per-upstream poller max, the cross-cluster
+	// shared counter, or a race between them.
+	//
+	// lastReturnedLatestBlock is ALSO advanced by NoteObservedLatestBlock when
+	// a WS newHeads tip is about to be fan-out to clients — so HTTP "latest"
+	// cannot regress below a head we have already delivered on the same pod.
+	lastReturnedLatestBlock    atomic.Int64
+	lastReturnedFinalizedBlock atomic.Int64
+}
+
+// NoteObservedLatestBlock records that this Network has observed head
+// blockNumber and is about to (or has) delivered it to clients via WS
+// newHeads fan-out. It advances the cross-pod network latest counter and the
+// process-local high-water mark used by EvmHighestLatestBlockNumber.
+//
+// Callers MUST invoke this before delivering the corresponding newHeads
+// notification to any client. Otherwise a concurrent HTTP
+// eth_getBlockByNumber("latest") / eth_blockNumber can race and return a
+// lower tip than a head already (or about to be) served on WS.
+//
+// TipHW is published to Redis synchronously (bounded timeout) so sibling
+// pods can refresh TipHW before serving HTTP latest — closing the
+// cross-pod race that silently demotes MultiNode via FOOS.
+func (n *Network) NoteObservedLatestBlock(ctx context.Context, blockNumber int64) {
+	if n == nil || blockNumber <= 0 {
+		return
+	}
+	if ctx == nil {
+		ctx = n.appCtx
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if n.latestBlockShared != nil {
+		n.latestBlockShared.TryUpdateAndPublish(ctx, blockNumber)
+	}
+	for {
+		cur := n.lastReturnedLatestBlock.Load()
+		if blockNumber <= cur {
+			return
+		}
+		if n.lastReturnedLatestBlock.CompareAndSwap(cur, blockNumber) {
+			return
+		}
+	}
+}
+
+// EvmRefreshHighestLatestBlockNumber pulls TipHW from Redis once and returns
+// the network tip after adopting any higher remote value. Used when the local
+// TipHW cache would otherwise skip EnforceHighestBlock (false-negative under
+// async TipHW pubsub lag).
+func (n *Network) EvmRefreshHighestLatestBlockNumber(ctx context.Context) int64 {
+	ctx, span := common.StartDetailSpan(ctx, "Network.EvmRefreshHighestLatestBlockNumber")
+	defer span.End()
+
+	if n.latestBlockShared != nil {
+		n.latestBlockShared.RefreshFromRemote(ctx)
+	}
+	result := n.EvmHighestLatestBlockNumber(ctx)
+	span.SetAttributes(attribute.Int64("highest_latest_block", result))
+	return result
+}
+
+// Bootstrap registers this network with the policy engine. The engine kicks
+// off the slot's ticker and runs an initial synchronous eval so request-path
+// reads through `policyEngine.GetOrdered` always see a populated cache.
+//
+// The upstream list is supplied as a closure so newly-bootstrapped upstreams
+// become visible to the engine each tick without a re-register.
+func (n *Network) Bootstrap(ctx context.Context) error {
+	if n.policyEngine == nil {
+		return nil
+	}
+	cfg := n.cfg.SelectionPolicy
+	if cfg == nil {
+		cfg = &common.SelectionPolicyConfig{}
+		n.cfg.SelectionPolicy = cfg
+	}
+	// Defensive: callers may have set Eval but skipped SetDefaults (common
+	// in tests that build Config as Go struct literals). Compile here so
+	// the engine never sees a nil program.
+	if cfg.CompiledProgram == nil {
+		if err := cfg.SetDefaults(); err != nil {
+			return fmt.Errorf("selectionPolicy SetDefaults: %w", err)
+		}
+	}
+	upstreamsFn := func() []common.Upstream {
+		ptrs := n.upstreamsRegistry.GetNetworkUpstreams(ctx, n.networkId)
+		out := make([]common.Upstream, len(ptrs))
+		for i, u := range ptrs {
+			out[i] = u
+		}
+		return out
+	}
+	return n.policyEngine.RegisterNetwork(n.networkId, n.Label(), upstreamsFn, cfg)
+}
+
+// PinUpstreamOrderForTest pins the upstream ordering for this network to
+// the given IDs (or alphabetical-by-id if `ids` is empty). Affects both
+// the underlying registry (so cold-start reads see the pinned order) and
+// the policy engine's cache when one is wired up. Test-only.
+func (n *Network) PinUpstreamOrderForTest(ids ...string) {
+	if n.upstreamsRegistry != nil {
+		n.upstreamsRegistry.OverrideOrderForTest(n.networkId, ids...)
+	}
+	if n.policyEngine != nil {
+		policy.OverrideOrderForTest(n.policyEngine, n.networkId, ids...)
+	}
+}
+
+func (n *Network) Id() string {
+	return n.networkId
+}
+
+// MetricsTracker returns the network's shared health tracker. Exposed
+// so diagnostic tooling (the erpc-simulator, admin readouts) can read
+// per-upstream observed metrics — the same numbers the selection
+// policy's `keepHealthy` / `sortByScore` filters consume.
+func (n *Network) MetricsTracker() *health.Tracker {
+	return n.metricsTracker
+}
+
+// AllUpstreams returns every upstream configured on the network, in
+// no particular order. Diagnostic tooling uses this to walk upstreams
+// for tracker lookups without needing to know the routing order.
+func (n *Network) AllUpstreams() []*upstream.Upstream {
+	if n.upstreamsRegistry == nil {
+		return nil
+	}
+	return n.upstreamsRegistry.GetNetworkUpstreams(context.Background(), n.networkId)
+}
+
+// PolicyScores returns the per-upstream `score` map produced by the
+// selection-policy engine's most recent tick for `(networkID, method)`,
+// or nil if the engine isn't wired up. Source of truth for "what does
+// the policy rank this upstream at?" — never re-implement the PREFER_FASTEST
+// weight formula client-side; read from here.
+func (n *Network) PolicyScores(method string) map[string]float64 {
+	if n.policyEngine == nil {
+		return nil
+	}
+	if method == "" {
+		method = "*"
+	}
+	return n.policyEngine.GetScores(n.networkId, method, "*")
+}
+
+// RecentPolicyDecisions returns up to `limit` most-recent policy
+// engine Decisions for `(networkID, method)`, OLDEST-first. Diagnostic
+// tooling uses this to render a tick-by-tick replay panel. Returns nil
+// if no engine is wired up.
+func (n *Network) RecentPolicyDecisions(method string, limit int) []*policy.Decision {
+	if n.policyEngine == nil {
+		return nil
+	}
+	if method == "" {
+		method = "*"
+	}
+	return n.policyEngine.RecentDecisions(n.networkId, method, "*", limit)
+}
+
+// PolicyLastSwitchAt returns when the primary upstream last changed
+// for `(networkID, method)`. Used by diagnostics to render the
+// `stickyPrimary` cooldown countdown ("primary held for Xs").
+func (n *Network) PolicyLastSwitchAt(method string) time.Time {
+	if n.policyEngine == nil {
+		return time.Time{}
+	}
+	if method == "" {
+		method = "*"
+	}
+	return n.policyEngine.LastSwitchAt(n.networkId, method, "*")
+}
+
+// PolicyOrderedUpstreams returns the IDs of upstreams in the order the
+// selection-policy engine currently has them ordered for the given
+// method. The slot's cache is read lock-free — this is the same source
+// of truth `Forward` uses to pick attempts. Returns nil if no policy
+// engine is wired up or the slot hasn't ticked yet.
+//
+// Diagnostics tooling (the simulator, admin endpoints) uses this to
+// render "position pills" that reflect the policy's real verdict —
+// NOT a guess derived from per-second selection counts.
+func (n *Network) PolicyOrderedUpstreams(method string) []string {
+	if n.policyEngine == nil {
+		return nil
+	}
+	if method == "" {
+		method = "*"
+	}
+	ups := n.policyEngine.GetOrdered(n.networkId, method, "*")
+	if len(ups) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(ups))
+	for _, u := range ups {
+		out = append(out, u.Id())
+	}
+	return out
+}
+
+// SetPolicyEnginePaused gates the per-slot ticker on this network's
+// selection-policy engine. While paused every slot still wakes on each
+// tick but skips `tickOnce`, so the cached ordering — what `Forward`
+// reads via `policyEngine.GetOrdered` — stays frozen at the last
+// verdict. No-op if no policy engine is wired up (test-only networks,
+// or YAML without a `selectionPolicy` block).
+//
+// Wired up so the eRPC simulator's pause button can stop the policy
+// engine churning while traffic generation is halted. Production
+// callers shouldn't need this — leave the engine running.
+func (n *Network) SetPolicyEnginePaused(paused bool) {
+	if n.policyEngine == nil {
+		return
+	}
+	n.policyEngine.SetPaused(paused)
+}
+
+// SetPolicyStepLogEnabled toggles per-tick capture of the selection
+// policy's chain trail. While enabled the engine's `Decision` carries
+// `Output.StepLog` (the chain timeline) and DEBUG-level logs print one
+// line per step + one per excluded upstream.
+//
+// Off by default in production (zero overhead beyond a function-call
+// indirection per stdlib step). Flipped on by the simulator at boot so
+// the policy-history drawer has data; production callers running with
+// DEBUG-level logs may also want to enable it for incident triage.
+func (n *Network) SetPolicyStepLogEnabled(enabled bool) {
+	if n.policyEngine == nil {
+		return
+	}
+	n.policyEngine.SetStepLogEnabled(enabled)
+}
+
+func (n *Network) Label() string {
+	if n == nil {
+		return ""
+	}
+	if n.networkLabel != "" {
+		return n.networkLabel
+	}
+	return n.networkId
+}
+
+func (n *Network) ProjectId() string {
+	return n.projectId
+}
+
+func (n *Network) Architecture() common.NetworkArchitecture {
+	if n.cfg.Architecture == "" {
+		if n.cfg.Evm != nil {
+			n.cfg.Architecture = common.ArchitectureEvm
+		}
+	}
+
+	return n.cfg.Architecture
+}
+
+func (n *Network) ShadowUpstreams() []*upstream.Upstream {
+	return n.upstreamsRegistry.GetNetworkShadowUpstreams(n.networkId)
+}
+
+func (n *Network) Logger() *zerolog.Logger {
+	return n.logger
+}
+
+func (n *Network) EvmHighestLatestBlockNumber(ctx context.Context) int64 {
+	ctx, span := common.StartDetailSpan(ctx, "Network.EvmHighestLatestBlockNumber")
+	defer span.End()
+
+	result := n.evmHighestBlockNumber(
+		ctx,
+		"eth_blockNumber",
+		(*upstream.Upstream).EvmEffectiveLatestBlock,
+		n.latestBlockShared,
+		&n.lastReturnedLatestBlock,
+		"latest",
+	)
+	span.SetAttributes(attribute.Int64("highest_latest_block", result))
+	return result
+}
+
+func (n *Network) EvmHighestFinalizedBlockNumber(ctx context.Context) int64 {
+	ctx, span := common.StartDetailSpan(ctx, "Network.EvmHighestFinalizedBlockNumber", trace.WithAttributes(
+		attribute.String("network.id", n.networkId),
+	))
+	defer span.End()
+
+	result := n.evmHighestBlockNumber(
+		ctx,
+		"eth_getBlockByNumber",
+		(*upstream.Upstream).EvmEffectiveFinalizedBlock,
+		n.finalizedBlockShared,
+		&n.lastReturnedFinalizedBlock,
+		"finalized",
+	)
+	span.SetAttributes(attribute.Int64("highest_finalized_block", result))
+	return result
+}
+
+// evmHighestBlockNumber aggregates a per-upstream block number across a
+// network and reconciles it with the cross-pod shared counter.
+//
+// Primary vs. fallback: fallback-group upstreams may run ahead of primaries
+// (e.g. 3rd-party providers vs. our own nodes). Feeding their values into
+// the shared counter causes tag translation to ask for blocks primaries
+// cannot yet serve. We therefore only use the fallback max when no primary
+// is up — "up" meaning circuit breaker closed, i.e. not a heuristic.
+//
+// Shared counter: we only ever publish forward progress. If our local max
+// exceeds the high-water mark we advance it; otherwise we return the shared
+// value unchanged. Publishing a lower value is not safe even though the
+// counter has a rollback tolerance — a large-enough drop crosses that
+// threshold and would wrongly clobber the high-water mark, producing the
+// exact cross-pod regression we want to prevent.
+func (n *Network) evmHighestBlockNumber(
+	ctx context.Context,
+	selectionMethod string,
+	blockOf func(*upstream.Upstream) int64,
+	shared data.CounterInt64SharedVariable,
+	lastReturned *atomic.Int64,
+	tag string,
+) int64 {
+	var primaryMax, fallbackMax int64
+	anyPrimaryUp := false
+	for _, u := range n.upstreamsRegistry.GetNetworkUpstreams(ctx, n.networkId) {
+		if u.EvmStatePoller() == nil {
+			continue
+		}
+		if u.EvmSyncingState() == common.EvmSyncingStateSyncing {
+			n.logger.Debug().Str("upstreamId", u.Id()).Msg("skipping syncing upstream for highest block calculation")
+			continue
+		}
+		upBlock := blockOf(u)
+		if u.Config().HasTag(common.TagTierFallback) {
+			if upBlock > fallbackMax {
+				fallbackMax = upBlock
+			}
+			continue
+		}
+		if !u.IsDown() {
+			anyPrimaryUp = true
+		}
+		if upBlock > primaryMax {
+			primaryMax = upBlock
+		}
+	}
+
+	localMax := primaryMax
+	if fallbackMax > 0 && !anyPrimaryUp {
+		localMax = fallbackMax
+	}
+
+	var result int64
+	var sharedVal int64
+	if shared == nil {
+		result = localMax
+	} else {
+		sharedVal = shared.GetValue()
+		if localMax > sharedVal {
+			result = shared.TryUpdate(ctx, localMax)
+		} else {
+			result = sharedVal
+		}
+	}
+
+	return n.applyMonotonicityGuard(result, lastReturned, tag, monoGuardInputs{
+		localMax:     localMax,
+		primaryMax:   primaryMax,
+		fallbackMax:  fallbackMax,
+		anyPrimaryUp: anyPrimaryUp,
+		sharedVal:    sharedVal,
+		sharedNil:    shared == nil,
+	})
+}
+
+// monoGuardInputs carries the diagnostic inputs the monotonicity guard logs
+// when it has to clamp. They're never used to compute the clamp itself —
+// it's purely "here's the aggregator state at the moment of the regression"
+// so future investigations can tell whether the regression came from the
+// per-upstream poller max, the shared counter, or a race between them.
+type monoGuardInputs struct {
+	localMax     int64
+	primaryMax   int64
+	fallbackMax  int64
+	anyPrimaryUp bool
+	sharedVal    int64
+	sharedNil    bool
+}
+
+// applyMonotonicityGuard clamps result to the per-tag high-water mark held
+// in lastReturned. On forward progress it CAS-bumps the high-water mark; on
+// regression it logs the inputs and returns the previously-returned value.
+// Clamping is safe because we never invent a number — the floor is always
+// something this Network has already returned upstream.
+//
+// Strict downstream consumers treat any backwards step in
+// `latest`/`finalized` as a data-integrity violation, so the guard exists to
+// keep returns monotonic across transient mid-rollout effects (e.g. mixed
+// versions reading different shared-state slots) and aggregator races.
+func (n *Network) applyMonotonicityGuard(result int64, lastReturned *atomic.Int64, tag string, in monoGuardInputs) int64 {
+	if lastReturned == nil {
+		return result
+	}
+	prev := lastReturned.Load()
+	if result < prev {
+		n.logger.Warn().
+			Str("networkId", n.networkId).
+			Str("tag", tag).
+			Int64("previouslyReturned", prev).
+			Int64("nowReturning", result).
+			Int64("delta", result-prev).
+			Int64("localMax", in.localMax).
+			Int64("primaryMax", in.primaryMax).
+			Int64("fallbackMax", in.fallbackMax).
+			Bool("anyPrimaryUp", in.anyPrimaryUp).
+			Int64("sharedVal", in.sharedVal).
+			Bool("sharedNil", in.sharedNil).
+			Msg("evmHighestBlockNumber would have regressed; clamping to previously returned value")
+		return prev
+	}
+	if result > prev {
+		for {
+			cur := lastReturned.Load()
+			if result <= cur {
+				break
+			}
+			if lastReturned.CompareAndSwap(cur, result) {
+				break
+			}
+		}
+	}
+	return result
+}
+
+func (n *Network) EvmLowestFinalizedBlockNumber(ctx context.Context) int64 {
+	ctx, span := common.StartDetailSpan(ctx, "Network.EvmLowestFinalizedBlockNumber", trace.WithAttributes(
+		attribute.String("network.id", n.networkId),
+	))
+	defer span.End()
+
+	upstreams := n.upstreamsRegistry.GetNetworkUpstreams(ctx, n.networkId)
+	var minBlock int64 = 0
+	var initialized bool = false
+
+	for _, u := range upstreams {
+		statePoller := u.EvmStatePoller()
+		if statePoller == nil {
+			continue
+		}
+
+		// Check if the node is syncing - skip syncing nodes as their block numbers may be unreliable
+		if u.EvmSyncingState() == common.EvmSyncingStateSyncing {
+			n.logger.Debug().Str("upstreamId", u.Id()).Msg("skipping syncing upstream for lowest finalized block calculation")
+			continue
+		}
+
+		// Use effective finalized block which considers blockAvailability.upper config
+		upBlock := u.EvmEffectiveFinalizedBlock()
+		// Skip upstreams that haven't determined finalized block yet (returning 0)
+		if upBlock > 0 {
+			if !initialized || upBlock < minBlock {
+				minBlock = upBlock
+				initialized = true
+			}
+		}
+	}
+
+	span.SetAttributes(attribute.Int64("lowest_finalized_block", minBlock))
+	return minBlock
+}
+
+// EvmLeaderUpstream returns the upstream whose state poller has the highest
+// latest tip. Fallback-tier upstreams are ignored while any primary is up —
+// otherwise tip re-fetch pins UseUpstream to a cordoned fallback that is not
+// in the ordered primary list. TipHW may still advance from fallback WS
+// (fan-out invariant); unconstrained tip re-fetch + emptyish escape reaches
+// those fallbacks when primaries miss.
+func (n *Network) EvmLeaderUpstream(ctx context.Context) common.Upstream {
+	var leader, fallbackLeader common.Upstream
+	var leaderLastBlock, fallbackLastBlock int64
+	anyPrimaryUp := false
+	upsList := n.upstreamsRegistry.GetNetworkUpstreams(ctx, n.networkId)
+	for _, u := range upsList {
+		statePoller := u.EvmStatePoller()
+		if statePoller == nil {
+			continue
+		}
+		lastBlock := statePoller.LatestBlock()
+		if u.Config() != nil && u.Config().HasTag(common.TagTierFallback) {
+			if lastBlock > fallbackLastBlock {
+				fallbackLeader = u
+				fallbackLastBlock = lastBlock
+			}
+			continue
+		}
+		if !u.IsDown() {
+			anyPrimaryUp = true
+		}
+		if lastBlock > leaderLastBlock {
+			leader = u
+			leaderLastBlock = lastBlock
+		}
+	}
+	if anyPrimaryUp || fallbackLeader == nil {
+		return leader
+	}
+	return fallbackLeader
+}
+
+func (n *Network) getFailsafeExecutor(ctx context.Context, req *common.NormalizedRequest) *networkExecutor {
+	method, _ := req.Method()
+	finality := req.Finality(ctx)
+
+	// Iterate through executors in config order and return the first match.
+	// This respects the user-defined priority order in the config file.
+	for _, fe := range n.failsafeExecutors {
+		mp := fe.MatchMethod()
+		methodMatches := mp == "*"
+		if !methodMatches {
+			methodMatches, _ = common.WildcardMatch(mp, method)
+		}
+
+		fl := fe.MatchFinality()
+		finalityMatches := len(fl) == 0 || slices.Contains(fl, finality)
+
+		if methodMatches && finalityMatches {
+			return fe
+		}
+	}
+
+	return nil
+}
+
+func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*common.NormalizedResponse, error) {
+	startTime := time.Now()
+	req.SetNetwork(n)
+	req.SetCacheDal(n.cacheDal)
+
+	// Apply default directives from config
+	req.ApplyDirectiveDefaults(n.cfg.DirectiveDefaults)
+
+	method, _ := req.Method()
+	lg := n.logger.With().Str("method", method).Interface("id", req.ID()).Str("ptr", fmt.Sprintf("%p", req)).Logger()
+
+	// Start a span for network forwarding
+	ctx, forwardSpan := common.StartSpan(ctx, "Network.Forward",
+		trace.WithAttributes(
+			attribute.String("network.id", n.networkId),
+			attribute.String("request.method", method),
+			attribute.String("request.finality", req.Finality(ctx).String()),
+		),
+	)
+	if common.IsTracingDetailed {
+		forwardSpan.SetAttributes(
+			attribute.String("request.id", fmt.Sprintf("%v", req.ID())),
+			attribute.String("user.id", req.UserId()),
+			attribute.String("agent.name", req.AgentName()),
+		)
+	}
+	defer forwardSpan.End()
+
+	if lg.GetLevel() == zerolog.TraceLevel {
+		lg.Debug().Object("request", req).Msgf("forwarding request for network")
+	} else {
+		lg.Debug().Msgf("forwarding request for network")
+	}
+
+	// Static response short-circuit. Checked after method extraction and before
+	// the multiplexer/cache/upstream-selection path so matching requests never
+	// touch any upstream. See StaticResponseConfig for match semantics.
+	if len(n.cfg.StaticResponses) > 0 {
+		if resp, ok := n.tryServeStaticResponse(ctx, &lg, req, method); ok {
+			forwardSpan.SetAttributes(attribute.Bool("static_response.hit", true))
+			return resp, nil
+		}
+	}
+
+	mlx, resp, err := n.handleMultiplexing(ctx, &lg, req, startTime)
+	if err != nil || resp != nil {
+		// When the original request is already fulfilled by multiplexer (follower path)
+		forwardSpan.SetAttributes(
+			attribute.Bool("multiplexed", true),
+			attribute.String("multiplexer.role", "follower"),
+		)
+		if err != nil {
+			common.SetTraceSpanError(forwardSpan, err)
+		}
+		return resp, err
+	}
+	if mlx != nil {
+		forwardSpan.SetAttributes(
+			attribute.String("multiplexer.hash", mlx.hash),
+			attribute.String("multiplexer.role", "leader"),
+		)
+		defer n.cleanupMultiplexer(mlx)
+	}
+
+	if n.cacheDal != nil && !req.ShouldSkipCacheRead("") {
+		lg.Debug().Msgf("checking cache for request")
+		resp, err := n.cacheDal.Get(ctx, req)
+		if err != nil {
+			lg.Debug().Err(err).Msgf("could not find response in cache")
+		} else if resp != nil && !resp.IsObjectNull(ctx) {
+			if lg.GetLevel() <= zerolog.DebugLevel {
+				lg.Debug().Object("response", resp).Msgf("response served from cache")
+			} else {
+				lg.Info().Msgf("response served from cache")
+			}
+			if mlx != nil {
+				mlx.Close(ctx, resp, err)
+			}
+			forwardSpan.SetAttributes(attribute.Bool("cache.hit", true))
+			return resp, err
+		}
+		forwardSpan.SetAttributes(attribute.Bool("cache.hit", false))
+	}
+
+	_, upstreamSpan := common.StartDetailSpan(ctx, "PolicyEngine.GetOrdered")
+	var upsList []common.Upstream
+	if n.policyEngine != nil {
+		// Pass the request's actual finality so per-finality slots
+		// (when EvalPerFinality is on) resolve to the bucket-specific
+		// ordering. Networks not configured per-finality see "*" and
+		// resolve to the wildcard slot regardless.
+		upsList = n.policyEngine.GetOrdered(n.networkId, method, req.Finality(ctx).String())
+	}
+	if len(upsList) == 0 {
+		// Cold-start fallback: serve the raw registration order until the
+		// engine's first tick completes for this slot.
+		for _, u := range n.upstreamsRegistry.GetNetworkUpstreams(ctx, n.networkId) {
+			upsList = append(upsList, u)
+		}
+	}
+	upstreamSpan.SetAttributes(attribute.Int("upstreams.count", len(upsList)))
+	if common.IsTracingDetailed {
+		ids := make([]string, len(upsList))
+		for i, u := range upsList {
+			ids[i] = u.Id()
+		}
+		upstreamSpan.SetAttributes(
+			attribute.String("upstreams.sorted", strings.Join(ids, ", ")),
+		)
+	}
+	upstreamSpan.End()
+
+	if len(upsList) == 0 {
+		err := common.NewErrNoUpstreamsFound(n.projectId, n.networkId)
+		common.SetTraceSpanError(forwardSpan, err)
+		if mlx != nil {
+			mlx.Close(ctx, nil, err)
+		}
+		return nil, err
+	}
+
+	// Block-availability-aware routing: when the request targets a specific
+	// block, prefer upstreams whose state poller has already observed it.
+	// Without this, requests for a block we just delivered to a client via
+	// WS would still get routed to an HTTP-only sibling whose own polling
+	// loop hasn't caught up — checkUpstreamBlockAvailability rejects with
+	// ErrUpstreamBlockUnavailable, retries cascade through the rest of the
+	// lagging siblings, and the request can fail entirely despite the WS
+	// upstream demonstrably having the block. partitionUpstreamsByLatestBlock
+	// is stable so it composes with the tier and score orderings layered
+	// on top.
+	//
+	// Near-tip eth_getBlockByNumber also pins UseUpstream to EvmLeaderUpstream
+	// (typically the WS ingress that SuggestLatestBlock advanced) so the
+	// first attempt hits the node that already has the head — same idea as
+	// EnforceHighestBlock's tip re-fetch pin, but for direct client tip reads.
+	if n.Architecture() == common.ArchitectureEvm {
+		if bn := requestBlockNumber(ctx, req); bn > 0 {
+			upsList = partitionUpstreamsByLatestBlock(upsList, bn)
+			n.pinNearTipGetBlockToLeader(ctx, req, method, bn)
+		}
+	}
+
+	// Failover tiering: when enabled, order default-group upstreams ahead of
+	// fallback-group ones while preserving score order within each tier. The
+	// network request loop then naturally tries defaults first and only
+	// advances to fallbacks once every default has returned a retryable
+	// error within this request.
+	if n.cfg.Failover.Enabled() {
+		upsList = tierUpstreamsByGroup(upsList)
+	}
+
+	// Set upstreams on the request
+	req.SetUpstreams(upsList)
+
+	// Feed the per-network probe-bus AFTER we know the request is
+	// actually going to dispatch to an upstream (i.e. not a
+	// cache-hit / static-response / follower-multiplexer
+	// short-circuit, all of which returned earlier). The publish is
+	// non-blocking and drops on overflow — request latency is never
+	// affected. The Prober (if any) samples from this feed to mirror
+	// the request against currently-excluded upstreams so their
+	// tracker counters get refreshed without touching real traffic.
+	// No-op for networks whose policy chain doesn't include
+	// `probeExcluded`.
+	if n.policyEngine != nil {
+		n.policyEngine.PublishRequest(n.networkId, req)
+	}
+
+	// Network-level pre-forward (executed after upstream selection) for upstream-aware logic
+	if handled, resp, err := evm.HandleNetworkPreForward(ctx, n, upsList, req); handled {
+		if err != nil {
+			if mlx != nil {
+				mlx.Close(ctx, nil, err)
+			}
+			return nil, err
+		}
+		if mlx != nil {
+			mlx.Close(ctx, resp, nil)
+		}
+		return resp, nil
+	}
+
+	// 3) Check if we should handle this method on this network
+	if err := n.shouldHandleMethod(req, method, upsList); err != nil {
+		if mlx != nil {
+			mlx.Close(ctx, nil, err)
+		}
+		return nil, err
+	}
+
+	// 3) Apply rate limits
+	if err := n.acquireRateLimitPermit(ctx, req); err != nil {
+		if mlx != nil {
+			mlx.Close(ctx, nil, err)
+		}
+		return nil, err
+	}
+
+	// 4) Prepare the request
+	if err := n.prepareRequest(ctx, req); err != nil {
+		if mlx != nil {
+			mlx.Close(ctx, nil, err)
+		}
+		return nil, err
+	}
+
+	// 5) Iterate over upstreams and forward the request until success or fatal failure
+	tryForward := func(
+		u common.Upstream,
+		req *common.NormalizedRequest,
+		execSpanCtx context.Context,
+		lg *zerolog.Logger,
+		hedge int,
+		attempt int,
+		retry int,
+	) (resp *common.NormalizedResponse, err error) {
+		ctx, span := common.StartDetailSpan(execSpanCtx, "Network.TryForward")
+		defer span.End()
+
+		// hedge > 0 means failsafe spawned this attempt as a hedge (not the
+		// primary). Threaded down explicitly into doForward → Upstream.Forward
+		// so the per-upstream rate counters stay clean. The hedge policy lives
+		// at this network layer, so this is where the signal originates.
+		isHedgeAttempt := hedge > 0
+
+		lg.Debug().Int("hedge", hedge).Int("attempt", attempt).Int("retry", retry).Msgf("trying to forward request to upstream")
+
+		// Selection-policy permit acquisition (legacy `acquireSelectionPolicyPermit`)
+		// is gone — the new policy engine pre-computes the ordered upstream list
+		// per (network, method) and the request path just consumes it. We still
+		// thread isHedgeAttempt down so per-upstream rate counters aren't
+		// inflated by hedge fan-out.
+		resp, err = n.doForward(ctx, u, req, false, isHedgeAttempt)
+
+		if err != nil && !common.IsNull(err) {
+			// If upstream complains that the method is not supported let's dynamically add it ignoreMethods config
+			if common.HasErrorCode(err, common.ErrCodeEndpointUnsupported) {
+				go u.IgnoreMethod(method)
+			}
+
+			lg.Debug().Object("response", resp).Err(err).Msgf("finished forwarding request to upstream with error")
+			return nil, err
+		}
+
+		lg.Debug().Object("response", resp).Msgf("finished forwarding request to upstream with success")
+
+		return resp, err
+	}
+	// This is the only way to pass additional values to failsafe policy executors context
+	ectx := context.WithValue(ctx, common.RequestContextKey, req)
+
+	failsafeExecutor := n.getFailsafeExecutor(ctx, req)
+	if failsafeExecutor == nil {
+		return nil, errors.New("no failsafe executor found for this request")
+	}
+
+	// Add tracing for which failsafe policy was selected
+	forwardSpan.SetAttributes(
+		attribute.String("failsafe.matched_method", failsafeExecutor.MatchMethod()),
+		attribute.String("failsafe.matched_finalities", fmt.Sprintf("%v", failsafeExecutor.MatchFinality())),
+	)
+
+	// Build the per-execution upstream-loop closure. This is what the new
+	// network executor invokes (potentially multiple times for retry/hedge,
+	// and per-slot for consensus).
+	sweepFn := func(execSpanCtx context.Context, effectiveReq *common.NormalizedRequest, oneUpstreamOnly bool) (*common.NormalizedResponse, error) {
+		snap := effectiveReq.ExecState().Snapshot()
+		_, execSpan := common.StartSpan(execSpanCtx, "Network.forwardAttempt",
+			trace.WithAttributes(
+				attribute.String("network.id", n.networkId),
+				attribute.String("request.method", method),
+				attribute.Int("execution.attempt", snap.Attempts),
+				attribute.Int("execution.retry", snap.Retries),
+				attribute.Int("execution.hedge", snap.Hedges),
+			),
+		)
+		defer execSpan.End()
+
+		if common.IsTracingDetailed {
+			execSpan.SetAttributes(
+				attribute.String("request.id", fmt.Sprintf("%v", effectiveReq.ID())),
+			)
+		}
+
+		if ctxErr := execSpanCtx.Err(); ctxErr != nil {
+			cause := context.Cause(execSpanCtx)
+			if cause != nil {
+				common.SetTraceSpanError(execSpan, cause)
+				return nil, cause
+			} else {
+				common.SetTraceSpanError(execSpan, ctxErr)
+				return nil, ctxErr
+			}
+		}
+		// Network-scope timeout is applied inside networkExecutor.Run.
+		// Per-attempt enforcement here would double-apply and break retry budgets.
+
+		var bestResp *common.NormalizedResponse
+		var lastErr error
+		maxLoopIterations := effectiveReq.UpstreamsCount()
+		if oneUpstreamOnly {
+			maxLoopIterations = 1
+		}
+		attempted := make(map[string]struct{}, maxLoopIterations)
+		// Capture the pre-escalation upsList size for the error reporting
+		// path below. If the per-request fallback escape hatch fires, we
+		// replace upsList with the appended fallback set, but the
+		// ErrUpstreamsExhausted.upstreams field is meant to describe the
+		// routable set the policy selected — not the escape-hatch override.
+		originalUpsListLen := len(upsList)
+
+	escalationLoop:
+		for {
+			for loopIteration := 0; loopIteration < maxLoopIterations; loopIteration++ {
+				loopCtx, loopSpan := common.StartDetailSpan(execSpanCtx, "Network.UpstreamLoop")
+				if ctxErr := loopCtx.Err(); ctxErr != nil {
+					cause := context.Cause(loopCtx)
+					if cause == nil {
+						cause = ctxErr
+					}
+					common.SetTraceSpanError(loopSpan, cause)
+					loopSpan.End()
+					return nil, cause
+				}
+
+				u, selErr := effectiveReq.NextUpstream()
+				if selErr != nil {
+					loopSpan.SetAttributes(
+						attribute.Bool("upstreams_exhausted", true),
+						attribute.String("error", selErr.Error()),
+					)
+					loopSpan.End()
+					break
+				}
+
+				if _, seen := attempted[u.Id()]; seen {
+					// Already tried in this execution — MarkUpstreamCompleted freed
+					// it from ConsumedUpstreams (retryable error or empty result) and
+					// UpstreamIdx wrapped around. Release the reservation so the
+					// upstream is available for the next failsafe retry round.
+					effectiveReq.ConsumedUpstreams.Delete(u)
+					loopSpan.SetAttributes(attribute.Bool("duplicate_selection", true))
+					loopSpan.End()
+					break
+				}
+				attempted[u.Id()] = struct{}{}
+
+				loopSpan.SetAttributes(attribute.String("upstream.id", u.Id()))
+				if eu, ok := u.(common.EvmUpstream); ok {
+					if sp := eu.EvmStatePoller(); sp != nil && !sp.IsObjectNull() {
+						loopSpan.SetAttributes(
+							attribute.Int64("upstream.latest_block", sp.LatestBlock()),
+							attribute.Int64("upstream.finalized_block", sp.FinalizedBlock()),
+						)
+					}
+				}
+
+				ulg := lg.With().Str("upstreamId", u.Id()).Logger()
+				ulg.Debug().
+					Interface("id", effectiveReq.ID()).
+					Str("ptr", fmt.Sprintf("%p", effectiveReq)).
+					Str("selectedUpstream", u.Id()).
+					Msg("selected upstream from list")
+
+				// Pre-forward: block availability gating → skip to next upstream
+				if skipErr, isRetryable := n.checkUpstreamBlockAvailability(loopCtx, u, effectiveReq, method); skipErr != nil {
+					n.handleBlockSkip(loopCtx, loopSpan, &ulg, u, effectiveReq, method, skipErr, isRetryable)
+					// Track the skip as the loop's last error so the per-request
+					// fallback escape hatch (after the loop) can see it. Record
+					// BOTH retryable and non-retryable skips: "non-retryable"
+					// means "don't retry the SAME upstream", not "don't try OTHER
+					// upstreams" — exactly what the escape hatch is for, and
+					// fallbacks ahead of a stalled primary need this path reachable.
+					lastErr = skipErr
+					loopSpan.End()
+					continue
+				}
+
+				hedges := snap.Hedges
+				attempts := snap.Attempts
+				if hedges > 0 {
+					finality := effectiveReq.Finality(loopCtx)
+					telemetry.CounterHandle(telemetry.MetricNetworkHedgedRequestTotal,
+						n.projectId, n.Label(), u.Id(), method, fmt.Sprintf("%d", hedges),
+						finality.String(), effectiveReq.UserId(), effectiveReq.AgentName(),
+					).Inc()
+				}
+
+				r, err := tryForward(u, effectiveReq, loopCtx, &ulg, hedges, attempts, snap.Retries)
+				if e := n.normalizeResponse(loopCtx, effectiveReq, r); e != nil {
+					ulg.Error().Err(e).Msgf("failed to normalize response")
+					err = e
+				}
+				effectiveReq.MarkUpstreamCompleted(loopCtx, u, r, err)
+
+				// Hedge cancelled → this execution lost the race, bail out
+				if hedges > 0 && common.HasErrorCode(err, common.ErrCodeEndpointRequestCanceled) {
+					n.recordHedgeDiscard(loopCtx, loopSpan, &ulg, u, effectiveReq, method, err, attempts, hedges)
+					loopSpan.End()
+					return nil, common.NewErrUpstreamHedgeCancelled(u.Id(), err)
+				}
+				_ = attempts // keep symbol live for future telemetry callsites
+
+				if r != nil {
+					r.SetUpstream(u)
+					r.WithRequest(effectiveReq)
+				}
+
+				// Return immediately when the result is usable:
+				//  - Non-empty success always qualifies.
+				//  - Emptyish success qualifies when the method is in
+				//    emptyResultAccept and consensus is not required,
+				//    because failsafe would accept the empty result anyway
+				//    so trying more upstreams just wastes time on slow ones.
+				//  - Otherwise emptyish results continue to the next upstream.
+				if err == nil && r != nil && !r.IsObjectNull() {
+					emptyish := r.IsResultEmptyish()
+					acceptEmpty := !emptyish ||
+						(!failsafeExecutor.HasConsensus() &&
+							slices.Contains(failsafeExecutor.EmptyResultAccept(), method))
+					if acceptEmpty {
+						st := effectiveReq.ExecState()
+						st.MarkUpstreamAttemptWon(r.UpstreamId())
+						s := st.Snapshot()
+						r.SetAttempts(s.Attempts)
+						r.SetRetries(s.Retries)
+						r.SetHedges(s.Hedges)
+						loopSpan.SetStatus(codes.Ok, "")
+						if emptyish {
+							loopSpan.SetAttributes(attribute.Bool("emptyish_accepted", true))
+						}
+						loopSpan.End()
+						return r, nil
+					}
+				}
+
+				// Deterministic errors: client faults and execution reverts are the
+				// same on every upstream — no point trying others.
+				if common.IsClientError(err) || common.HasErrorCode(err, common.ErrCodeEndpointExecutionException) {
+					common.SetTraceSpanError(loopSpan, err)
+					loopSpan.End()
+					return nil, err
+				}
+
+				// Track best result and continue to next upstream.
+				if err != nil {
+					lastErr = err
+					common.SetTraceSpanError(loopSpan, err)
+				} else if r != nil {
+					bestResp = r
+					if r.IsResultEmptyish() {
+						// Soft miss (e.g. eth_getBlockByNumber null): seed
+						// lastErr so the fallback escape hatch can fire after
+						// primaries are exhausted. Without this, emptyish
+						// responses leave lastErr nil and block escalation.
+						lastErr = common.NewErrEndpointMissingData(
+							fmt.Errorf("upstream responded emptyish"), u,
+						)
+					} else {
+						loopSpan.SetStatus(codes.Ok, "")
+					}
+				}
+				loopSpan.End()
+			}
+
+			// Check context after the loop — handles single-upstream case where
+			// the loop cap is reached before a new iteration can check ctx.
+			if ctxErr := execSpanCtx.Err(); ctxErr != nil {
+				cause := context.Cause(execSpanCtx)
+				if cause == nil {
+					cause = ctxErr
+				}
+				return nil, cause
+			}
+
+			// === Per-request fallback escape hatch ===
+			//
+			// If the inner loop exhausted upsList with a retryable error (the
+			// selectionPolicy has cordoned fallbacks while primaries are down)
+			// and failover is enabled, append the fallback-tier upstreams that
+			// are bootstrapped + CB-closed + method-allowed and re-enter the
+			// inner loop once. The client gets the fallback's response on the
+			// same call that would otherwise return ErrUpstreamsExhausted.
+			//
+			// Bounds:
+			//   - At most one escalation per request (MarkEscalatedToFallbacks).
+			//   - Emptyish bestResp still escapes: methods like
+			//     eth_getBlockByNumber return null for missing blocks without
+			//     setting err, and that soft miss must escalate to fallbacks
+			//     the same way a gate-reject does. Non-empty bestResp means we
+			//     already have a usable candidate — leave it for failsafe.
+			//   - Deterministic client errors return from the inner loop
+			//     immediately, so any non-nil lastErr here means "this upstream
+			//     couldn't serve; try a different one" — exactly the escape's job.
+			//   - Consensus requires strict per-upstream semantics; don't modify
+			//     the candidate set mid-execution.
+			bestRespEmptyish := bestResp != nil && bestResp.IsResultEmptyish()
+			if (bestResp == nil || bestRespEmptyish) &&
+				!effectiveReq.HasEscalatedToFallbacks() &&
+				lastErr != nil &&
+				n.cfg.Failover != nil && n.cfg.Failover.Enabled() &&
+				!failsafeExecutor.HasConsensus() {
+
+				fallbacks := n.upstreamsRegistry.GetFallbackEscapeUpstreams(
+					execSpanCtx, n.networkId, method,
+				)
+				if len(fallbacks) > 0 {
+					// Replace upsList with ALL eligible fallbacks. Clear their
+					// stored errors and consumed reservations so NextUpstream
+					// re-selects them; primaries are removed from upsList so they
+					// won't be picked again, but their state in attempted /
+					// ErrorsByUpstream is preserved for eventual error reporting.
+					if bestRespEmptyish {
+						bestResp.Release()
+						bestResp = nil
+					}
+					fbCommon := make([]common.Upstream, 0, len(fallbacks))
+					for _, fb := range fallbacks {
+						fbCommon = append(fbCommon, fb)
+						effectiveReq.ErrorsByUpstream.Delete(common.Upstream(fb))
+						effectiveReq.ConsumedUpstreams.Delete(common.Upstream(fb))
+					}
+					effectiveReq.SetUpstreams(fbCommon)
+					upsList = fbCommon
+					maxLoopIterations = len(fallbacks)
+					attempted = make(map[string]struct{}, len(fallbacks))
+					effectiveReq.MarkEscalatedToFallbacks()
+					// Reset lastErr so the next pass either replaces it (new
+					// failure) or leaves it nil (success).
+					lastErr = nil
+
+					telemetry.MetricNetworkFallbackEscapeTotal.WithLabelValues(
+						n.projectId, n.Label(), method,
+					).Inc()
+
+					lg.Debug().
+						Str("networkId", n.networkId).
+						Str("method", method).
+						Int("fallbacks", len(fallbacks)).
+						Msg("activated per-request fallback escape after primary set exhausted")
+
+					continue escalationLoop
+				}
+			}
+
+			// No further escalation possible; exit the outer loop.
+			break escalationLoop
+		}
+
+		// All upstreams (including any escaped-to fallbacks) tried. Return
+		// the best result for failsafe to evaluate delays and retries.
+		// Prefer a valid response over an error so the delay function can
+		// detect empty results and apply emptyResultDelay.
+		if bestResp != nil {
+			st := effectiveReq.ExecState()
+			st.MarkUpstreamAttemptWon(bestResp.UpstreamId())
+			s := st.Snapshot()
+			bestResp.SetAttempts(s.Attempts)
+			bestResp.SetRetries(s.Retries)
+			bestResp.SetHedges(s.Hedges)
+			return bestResp, nil
+		}
+
+		// For consensus, return the raw upstream error so the consensus
+		// policy receives the actual error type (e.g. server error, missing
+		// data) rather than a wrapped ErrUpstreamsExhausted.
+		if oneUpstreamOnly && lastErr != nil {
+			return nil, lastErr
+		}
+
+		s := effectiveReq.ExecState().Snapshot()
+		exhaustedErr := common.NewErrUpstreamsExhausted(
+			effectiveReq,
+			&effectiveReq.ErrorsByUpstream,
+			n.projectId,
+			n.networkId,
+			method,
+			time.Since(startTime),
+			s.Attempts,
+			s.Retries,
+			s.Hedges,
+			originalUpsListLen,
+		)
+		common.SetTraceSpanError(execSpan, exhaustedErr)
+		return nil, exhaustedErr
+	}
+
+	// Two entry points into sweepFn:
+	//   tryOneUpstream — single-upstream variant for consensus slots
+	//   runUpstreamSweep — multi-upstream variant for non-consensus path
+	tryOneUpstream := func(c context.Context, r *common.NormalizedRequest) (*common.NormalizedResponse, error) {
+		return sweepFn(c, r, true)
+	}
+	runUpstreamSweep := func(c context.Context, r *common.NormalizedRequest) (*common.NormalizedResponse, error) {
+		return sweepFn(c, r, false)
+	}
+
+	resp, execErr := failsafeExecutor.Run(ectx, req, tryOneUpstream, runUpstreamSweep)
+
+	req.RLockWithTrace(ctx)
+	defer req.RUnlock()
+
+	if execErr != nil {
+		// When the lifecycle ctx fires, the network executor may return plain
+		// context.DeadlineExceeded with no sentinel in the Unwrap chain.
+		// Substitute only when the ctx cause is OUR sentinel.
+		if _, ok := execErr.(common.StandardError); !ok && errors.Is(execErr, context.DeadlineExceeded) {
+			if cause := context.Cause(ectx); errors.Is(cause, common.ErrDynamicTimeoutExceeded) {
+				execErr = cause
+			}
+		}
+		// Timeout-attribution metric: emit only when this scope's policy
+		// fired the timeout and the error is not retry-exhausted.
+		if failsafeExecutor.HasTimeout() &&
+			!common.HasErrorCode(execErr, common.ErrCodeFailsafeRetryExceeded) &&
+			errors.Is(execErr, common.ErrDynamicTimeoutExceeded) &&
+			!common.HasErrorCode(execErr, common.ErrCodeFailsafeTimeoutExceeded) {
+			finality := req.Finality(ctx)
+			telemetry.MetricNetworkTimeoutFiredTotal.WithLabelValues(
+				n.projectId,
+				req.NetworkLabel(),
+				method,
+				finality.String(),
+				string(common.ScopeNetwork),
+			).Inc()
+		}
+		// Wrap bare timeout sentinel as a typed error for downstream callers.
+		translatedErr := execErr
+		if _, ok := translatedErr.(common.StandardError); !ok && errors.Is(translatedErr, common.ErrDynamicTimeoutExceeded) {
+			translatedErr = common.NewErrFailsafeTimeoutExceeded(common.ScopeNetwork, translatedErr, &startTime)
+		}
+		// Don't override consensus results with last valid response from individual upstreams
+		// For example if 1 upstream gives empty response another 3 give "reverted" error,
+		// we should still return reverted error, even though there was an empty response before.
+		if failsafeExecutor.HasConsensus() {
+			if mlx != nil {
+				mlx.Close(ctx, nil, translatedErr)
+			}
+			// LVR is a borrowed pointer — consensus executor owns releasing all participant
+			// responses (winners and losers). Just drop our reference to avoid dangling pointer.
+			req.ClearLastValidResponse()
+			return nil, translatedErr
+		}
+
+		lvr := req.LastValidResponse()
+		if lvr != nil && !lvr.IsObjectNull() {
+			// A valid response is a json-rpc response without "error" object.
+			// This mechanism is needed in these two scenarios:
+			//
+			// 1) If error is due to empty response be generous and accept it,
+			// because this means after many retries or exhausting all upstreams still no data is available.
+			// We don't need to worry about wrongly replying empty responses for unfinalized data
+			// because cache layer has mechanism to deal with empty and/or unfinalized data.
+			//
+			// 2) For pending txs we can accept the response, if after retries it is still pending.
+			// This avoids failing with "retry" error, when we actually do have a response but blockNumber is null since tx is pending.
+			resp = lvr
+			req.SetLastUpstream(resp.Upstream())
+		} else {
+			if mlx != nil {
+				mlx.Close(ctx, nil, translatedErr)
+			}
+			return nil, translatedErr
+		}
+	}
+
+	if resp != nil {
+		if n.cacheDal != nil {
+			// Force-materialize jrr so the goroutine reads only via atomic pointer (no locks needed).
+			// TODO For other architectures we might need a different approach
+			_, _ = resp.JsonRpcResponse(ctx)
+			resp.AddRef()
+
+			go (func(resp *common.NormalizedResponse, forwardSpan trace.Span) {
+				defer (func() {
+					if rec := recover(); rec != nil {
+						telemetry.MetricUnexpectedPanicTotal.WithLabelValues(
+							"cache-set",
+							fmt.Sprintf("network:%s method:%s", n.networkId, method),
+							common.ErrorFingerprint(rec),
+						).Inc()
+						lg.Error().
+							Interface("panic", rec).
+							Str("stack", string(debug.Stack())).
+							Msgf("unexpected panic on cache-set")
+					}
+				})()
+				defer resp.DoneRef()
+
+				timeoutCtx, timeoutCtxCancel := context.WithTimeoutCause(n.appCtx, 10*time.Second, errors.New("cache driver timeout during set"))
+				defer timeoutCtxCancel()
+				tracedCtx := trace.ContextWithSpanContext(timeoutCtx, forwardSpan.SpanContext())
+				err := n.cacheDal.Set(tracedCtx, req, resp)
+				if err != nil {
+					lg.Warn().Err(err).Msgf("could not store response in cache")
+				}
+			})(resp, forwardSpan)
+		}
+
+		// Per-request execution counters + full upstream-attempt trace.
+		// req.ExecState().Apply emits the standard execution.* attrs
+		// AND the upstreams.* slices (tried, outcomes, reasons,
+		// durations) so traces answer "who, what, why" without
+		// enumerating child spans.
+		req.ExecState().Apply(forwardSpan)
+	}
+
+	isEmpty := resp == nil || resp.IsObjectNull(ctx) || resp.IsResultEmptyish(ctx)
+	forwardSpan.SetAttributes(attribute.Bool("response.emptyish", isEmpty))
+	if isEmpty {
+		lg.Trace().Msgf("response is empty")
+	}
+
+	if execErr == nil && !isEmpty {
+		n.enrichStatePoller(ctx, method, req, resp)
+
+		// Extract block number from successful response for block availability bounds check below.
+		var respBlockNumber int64
+		if n.cfg.Architecture == common.ArchitectureEvm {
+			if _, bn, err := evm.ExtractBlockReferenceFromResponse(ctx, resp); err == nil && bn > 0 {
+				respBlockNumber = bn
+			}
+		}
+
+		// If response is not empty, but at least one upstream responded empty we track in a metric.
+		// Derived from ErrorsByUpstream entries with ErrEndpointMissingData code.
+		req.ErrorsByUpstream.Range(func(key, value any) bool {
+			upstreamErr, ok := value.(error)
+			if !ok || !common.HasErrorCode(upstreamErr, common.ErrCodeEndpointMissingData) {
+				return true
+			}
+			upstream := key.(*upstream.Upstream)
+			finality := req.Finality(ctx)
+			telemetry.MetricUpstreamWrongEmptyResponseTotal.WithLabelValues(
+				n.projectId,
+				upstream.VendorName(),
+				n.Label(),
+				upstream.Id(),
+				method,
+				finality.String(),
+				req.UserId(),
+				req.AgentName(),
+			).Inc()
+
+			// If the response block number is known, check if it falls outside
+			// this upstream's configured block availability range.
+			// If so, the empty response was expected — skip misbehavior recording.
+			if respBlockNumber > 0 {
+				minBound, maxBound := upstream.EvmBlockAvailabilityBounds()
+				if (minBound != math.MinInt64 && respBlockNumber < minBound) ||
+					(maxBound != math.MaxInt64 && respBlockNumber > maxBound) {
+					return true
+				}
+			}
+
+			// Wrong-empty is a misbehavior (data disagreement with other upstreams),
+			// not an error. The upstream responded correctly, it just lacked data
+			// that others had. Only record misbehavior, not failure. `finality` was
+			// resolved a few lines up for the wrong-empty telemetry metric — reuse it
+			// here so per-(method, finality) misbehavior counters stratify
+			// consistently with the rest of the tracker writes.
+			if upstream != nil {
+				if mt := upstream.MetricsTracker(); mt != nil {
+					mt.RecordUpstreamMisbehavior(upstream, method, finality)
+				}
+			}
+			return true
+		})
+	}
+
+	if mlx != nil {
+		mlx.Close(ctx, resp, nil)
+	}
+
+	// LVR is a borrowed pointer — consensus executor owns releasing non-winner responses.
+	// Just drop our reference so it doesn't outlive the response lifecycle.
+	if failsafeExecutor.HasConsensus() {
+		req.ClearLastValidResponse()
+	}
+
+	return resp, nil
+}
+
+func (n *Network) prepareRequest(ctx context.Context, nr *common.NormalizedRequest) error {
+	switch n.Architecture() {
+	case common.ArchitectureEvm:
+		jsonRpcReq, err := nr.JsonRpcRequest(ctx)
+		if err != nil {
+			return common.NewErrJsonRpcExceptionInternal(
+				0,
+				common.JsonRpcErrorParseException,
+				"failed to unmarshal json-rpc request",
+				err,
+				nil,
+			)
+		}
+		evm.NormalizeHttpJsonRpc(ctx, nr, jsonRpcReq)
+	default:
+		return common.NewErrJsonRpcExceptionInternal(
+			0,
+			common.JsonRpcErrorServerSideException,
+			fmt.Sprintf("unsupported architecture: %s for network: %s", n.Architecture(), n.Id()),
+			nil,
+			nil,
+		)
+	}
+
+	return nil
+}
+
+func (n *Network) GetMethodMetrics(method string) common.TrackedMetrics {
+	if method == "" {
+		return nil
+	}
+
+	mt := n.metricsTracker.GetNetworkMethodMetrics(n.networkId, method)
+	return mt
+}
+
+func (n *Network) Config() *common.NetworkConfig {
+	return n.cfg
+}
+
+func (n *Network) GetFinality(ctx context.Context, req *common.NormalizedRequest, resp *common.NormalizedResponse) common.DataFinalityState {
+	ctx, span := common.StartDetailSpan(ctx, "Network.GetFinality")
+	defer span.End()
+
+	finality := common.DataFinalityStateUnknown
+
+	if req == nil && resp == nil {
+		return finality
+	}
+
+	method, _ := req.Method()
+	if n.cfg.Methods != nil && n.cfg.Methods.Definitions != nil {
+		if cfg, ok := n.cfg.Methods.Definitions[method]; ok {
+			if cfg.Finalized {
+				finality = common.DataFinalityStateFinalized
+				return finality
+			} else if cfg.Realtime {
+				finality = common.DataFinalityStateRealtime
+				return finality
+			}
+		}
+	}
+
+	blockRef, blockNumber, _ := evm.ExtractBlockReferenceFromRequest(ctx, req)
+
+	// When the request alone doesn't carry a block number (e.g. tx-hash lookups
+	// like eth_getTransactionReceipt, or block-hash lookups like eth_getBlockByHash),
+	// try to extract it from the response body. This is critical for cache hits where
+	// the response contains blockNumber but the request only has a hash.
+	if blockNumber == 0 && resp != nil {
+		if _, respBlockNumber, err := evm.ExtractBlockReferenceFromResponse(ctx, resp); err == nil && respBlockNumber > 0 {
+			blockNumber = respBlockNumber
+		}
+	}
+
+	// If we still have no block number and the request is a wildcard/hash-only ref
+	// with no way to determine finality, return unknown early.
+	if blockNumber == 0 && (blockRef == "" || blockRef == "*") {
+		return finality // unknown
+	}
+
+	if blockRef != "" && blockRef != "*" && (blockRef[0] < '0' || blockRef[0] > '9') {
+		finality = common.DataFinalityStateRealtime
+		return finality
+	}
+
+	if blockNumber > 0 {
+		// Try response's upstream first (direct upstream responses)
+		if resp != nil {
+			upstream := resp.Upstream()
+			if upstream != nil {
+				if ups, ok := upstream.(common.EvmUpstream); ok {
+					if isFinalized, err := ups.EvmIsBlockFinalized(ctx, blockNumber, false); err == nil {
+						if isFinalized {
+							finality = common.DataFinalityStateFinalized
+						} else {
+							finality = common.DataFinalityStateUnfinalized
+						}
+						return finality
+					}
+				}
+			}
+		}
+
+		// Try LastUpstream from the request (retries or subsequent attempts)
+		if upstream := req.LastUpstream(); upstream != nil {
+			if ups, ok := upstream.(common.EvmUpstream); ok {
+				if isFinalized, err := ups.EvmIsBlockFinalized(ctx, blockNumber, false); err == nil {
+					if isFinalized {
+						finality = common.DataFinalityStateFinalized
+					} else {
+						finality = common.DataFinalityStateUnfinalized
+					}
+					return finality
+				}
+			}
+		}
+
+		// Fallback: use the network's lowest finalized block as a heuristic.
+		// This is the primary path for cache hits where no upstream is available.
+		if n.upstreamsRegistry != nil {
+			lowestFinalized := n.EvmLowestFinalizedBlockNumber(ctx)
+			if lowestFinalized > 0 {
+				if blockNumber <= lowestFinalized {
+					finality = common.DataFinalityStateFinalized
+				} else {
+					finality = common.DataFinalityStateUnfinalized
+				}
+				span.SetAttributes(
+					attribute.Bool("used_network_finalized_heuristic", true),
+					attribute.Int64("lowest_finalized", lowestFinalized),
+				)
+			}
+		}
+		// If we still can't determine, it remains unknown
+	}
+
+	return finality
+}
+
+func (n *Network) doForward(execSpanCtx context.Context, u common.Upstream, req *common.NormalizedRequest, skipCacheRead, isHedgeAttempt bool) (*common.NormalizedResponse, error) {
+	switch n.cfg.Architecture {
+	case common.ArchitectureEvm:
+		if handled, resp, err := evm.HandleUpstreamPreForward(execSpanCtx, n, u, req, skipCacheRead); handled {
+			return evm.HandleUpstreamPostForward(execSpanCtx, n, u, req, resp, err, skipCacheRead)
+		}
+	}
+
+	// If not handled, then fallback to the normal forward
+	resp, err := u.Forward(execSpanCtx, req, false, isHedgeAttempt)
+	return evm.HandleUpstreamPostForward(execSpanCtx, n, u, req, resp, err, skipCacheRead)
+}
+
+// upstreamHasBlockAvailabilityBounds reports whether the upstream has any
+// BlockAvailability bounds (lower or upper) configured. Presence of explicit
+// bounds is treated as the user's intent to enforce them when no higher-priority
+// explicit override has been set.
+func upstreamHasBlockAvailabilityBounds(u common.Upstream) bool {
+	if u == nil {
+		return false
+	}
+	cfg := u.Config()
+	if cfg == nil || cfg.Evm == nil || cfg.Evm.BlockAvailability == nil {
+		return false
+	}
+	ba := cfg.Evm.BlockAvailability
+	return ba.Lower != nil || ba.Upper != nil
+}
+
+// systemDefaultEnforceBlockAvailability returns the global system default for
+// EnforceBlockAvailability for a given method, or nil if no default is set.
+func systemDefaultEnforceBlockAvailability(method string) *bool {
+	if common.DefaultWithBlockCacheMethods == nil {
+		return nil
+	}
+	if dmc, ok := common.DefaultWithBlockCacheMethods[method]; ok && dmc != nil {
+		return dmc.EnforceBlockAvailability
+	}
+	return nil
+}
+
+// resolveEnforceBlockAvailability resolves the effective enforcement flag for block availability.
+// Precedence (highest to lowest):
+//  1. Explicit method-level user override that differs from the system default
+//     (system defaults get merged into n.cfg.Methods.Definitions during config
+//     loading, so a method-level value that matches the system default is
+//     treated as not-an-override).
+//  2. Explicit network-level user override (network.cfg.Evm.EnforceBlockAvailability).
+//  3. Per-upstream BlockAvailability bounds — configured bounds are themselves
+//     an opt-in signal that overrides the method common default.
+//  4. System default for this method (DefaultWithBlockCacheMethods).
+//  5. Fallback: enabled.
+func (n *Network) resolveEnforceBlockAvailability(method string, u common.Upstream) bool {
+	sysDefault := systemDefaultEnforceBlockAvailability(method)
+
+	// 1. Method-level user override (only when it differs from the system default).
+	//    The defaults loader merges DefaultWithBlockCacheMethods into Methods.Definitions,
+	//    so we cannot tell apart a user's explicit value from a merged-in default by
+	//    presence alone. Comparing values is the cleanest way to distinguish — and is
+	//    semantically harmless because a user explicitly setting the same value as the
+	//    default has the same intent as not setting it.
+	if n.cfg != nil && n.cfg.Methods != nil && n.cfg.Methods.Definitions != nil {
+		if mc, ok := n.cfg.Methods.Definitions[method]; ok && mc != nil && mc.EnforceBlockAvailability != nil {
+			if sysDefault == nil || *mc.EnforceBlockAvailability != *sysDefault {
+				return *mc.EnforceBlockAvailability
+			}
+			// Matches the system default — treat as not-an-override and fall through.
+		}
+	}
+	// 2. Explicit network-level user override
+	if n.cfg != nil && n.cfg.Evm != nil && n.cfg.Evm.EnforceBlockAvailability != nil {
+		return *n.cfg.Evm.EnforceBlockAvailability
+	}
+	// 3. Configured per-upstream bounds opt-in to enforcement, regardless of
+	//    method common defaults. This ensures that users who configure
+	//    BlockAvailability on an upstream actually get their bounds enforced
+	//    even for methods whose system default has it off (e.g. eth_getBlockByNumber).
+	if upstreamHasBlockAvailabilityBounds(u) {
+		return true
+	}
+	// 4. System default for this method
+	if sysDefault != nil {
+		return *sysDefault
+	}
+	// 5. Fallback: enabled
+	return true
+}
+
+// handleBlockSkip records telemetry when a block availability check causes an upstream to be skipped,
+// and triggers an async state poller refresh for retryable cases so subsequent retries see fresh block numbers.
+func (n *Network) handleBlockSkip(
+	ctx context.Context,
+	span trace.Span,
+	ulg *zerolog.Logger,
+	u common.Upstream,
+	req *common.NormalizedRequest,
+	method string,
+	skipErr error,
+	isRetryable bool,
+) {
+	ulg.Debug().Err(skipErr).Bool("retryable", isRetryable).Msg("skipping upstream due to block availability gating")
+	span.SetAttributes(
+		attribute.Bool("skipped", true),
+		attribute.String("skip_reason", skipErr.Error()),
+		attribute.Bool("skip_retryable", isRetryable),
+	)
+	finality := req.Finality(ctx)
+	telemetry.MetricUpstreamErrorTotal.WithLabelValues(
+		n.projectId, u.VendorName(), n.Label(), u.Id(), method,
+		common.ErrorFingerprint(skipErr), string(common.SeverityInfo),
+		req.CompositeType(), finality.String(),
+		req.UserId(), req.AgentName(),
+	).Inc()
+	errToStore := skipErr
+	if !isRetryable {
+		errToStore = common.NewErrUpstreamRequestSkipped(skipErr, u.Id())
+	}
+	req.MarkUpstreamCompleted(ctx, u, nil, errToStore)
+
+	// Record retryable block-availability skips as upstream failures in the
+	// health tracker so the selection policy's errorRate reflects what the
+	// upstream actually can't serve. Without this, an upstream whose poller is
+	// stuck behind the network aggregator gets gate-rejected indefinitely
+	// without ever moving errorRate, and the policy keeps it in `healthy` —
+	// preventing failover to fallbacks. Non-retryable skips remain silent
+	// (lower-bound / too-far-ahead are configuration semantics, not health).
+	if isRetryable && n.metricsTracker != nil {
+		n.metricsTracker.RecordUpstreamRequest(u, method, finality)
+		n.metricsTracker.RecordUpstreamFailure(u, method, finality, skipErr)
+	}
+
+	// When the block is slightly ahead (retryable), trigger an async poll so the
+	// state poller fetches the latest block number before the next retry fires.
+	// Without this the retry loop sleeps for blockUnavailableDelay but the cached
+	// latestBlock stays stale until the background ticker fires (often 10s+).
+	// PollLatestBlockNumber respects its own debounce interval so concurrent
+	// triggers from multiple upstreams/requests are coalesced safely.
+	if isRetryable {
+		if eu, ok := u.(common.EvmUpstream); ok {
+			if sp := eu.EvmStatePoller(); sp != nil && !sp.IsObjectNull() {
+				go func() {
+					pollCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					defer cancel()
+					_, _ = sp.PollLatestBlockNumberNow(pollCtx)
+				}()
+			}
+		}
+	}
+}
+
+// recordHedgeDiscard handles telemetry when a hedged request is discarded because another hedge won.
+func (n *Network) recordHedgeDiscard(
+	ctx context.Context,
+	span trace.Span,
+	ulg *zerolog.Logger,
+	u common.Upstream,
+	req *common.NormalizedRequest,
+	method string,
+	err error,
+	attempts int,
+	hedges int,
+) {
+	ulg.Debug().Err(err).Msgf("discarding hedged request to upstream")
+	finality := req.Finality(ctx)
+	telemetry.CounterHandle(telemetry.MetricNetworkHedgeDiscardsTotal,
+		n.projectId, n.Label(), u.Id(), method, fmt.Sprintf("%d", attempts),
+		fmt.Sprintf("%d", hedges), finality.String(),
+		req.UserId(), req.AgentName(),
+	).Inc()
+	common.SetTraceSpanError(span, common.NewErrUpstreamHedgeCancelled(u.Id(), err))
+}
+
+// checkUpstreamBlockAvailability performs per-upstream gating for the request based on block availability.
+// It is invoked just before forwarding to an upstream to avoid copying/filtering the list.
+// Returns (nil, false) if upstream has the block available.
+// Returns (error, isRetryable) if block is not available:
+//   - isRetryable=true: block is just slightly ahead (within MaxRetryableBlockDistance), upstream may catch up
+//   - isRetryable=false: block is too far ahead or below lower bound, not worth retrying this upstream
+//
+// This is the single point of block-availability enforcement. It runs whenever
+// EnforceBlockAvailability resolves to true OR the upstream has explicit
+// BlockAvailability bounds configured (the user's signal that they want bounds
+// enforced regardless of per-method defaults).
+//
+// FAIL-OPEN BEHAVIOR: If we cannot determine block availability (e.g., state poller issues),
+// we allow the request to proceed rather than blocking traffic.
+func (n *Network) checkUpstreamBlockAvailability(ctx context.Context, u common.Upstream, req *common.NormalizedRequest, method string) (error, bool) {
+	if n.cfg.Architecture != common.ArchitectureEvm {
+		return nil, false
+	}
+	if !n.resolveEnforceBlockAvailability(method, u) {
+		return nil, false
+	}
+	// Prefer the cached block number from normalization. Fall back to extracting
+	// from the request (defensive: handles paths that bypass json_rpc.go's
+	// normalization, and methods whose params haven't been pre-cached yet).
+	var bn int64
+	if v := req.EvmBlockNumber(); v != nil {
+		if n64, ok := v.(int64); ok {
+			bn = n64
+		}
+	}
+	if bn <= 0 {
+		if _, x, ebn := evm.ExtractBlockReferenceFromRequest(ctx, req); ebn == nil && x > 0 {
+			bn = x
+		}
+	}
+	if bn <= 0 {
+		// If still unknown, skip gating (fail-open)
+		return nil, false
+	}
+	eu, ok := u.(common.EvmUpstream)
+	if !ok {
+		return nil, false
+	}
+	available, err := eu.EvmAssertBlockAvailability(ctx, method, common.AvailbilityConfidenceBlockHead, true, bn)
+	if err != nil {
+		// FAIL-OPEN: Error during availability check - allow the request to proceed
+		// This prevents blocking traffic due to state poller or detection issues
+		n.logger.Debug().
+			Err(err).
+			Str("upstreamId", u.Id()).
+			Int64("blockNumber", bn).
+			Str("method", method).
+			Msg("block availability check failed; failing open to allow request")
+		return nil, false
+	}
+	if !available {
+		// Get poller state for detailed error
+		var latestBlock, finalizedBlock int64
+		if sp := eu.EvmStatePoller(); sp != nil && !sp.IsObjectNull() {
+			latestBlock = sp.LatestBlock()
+			finalizedBlock = sp.FinalizedBlock()
+		}
+
+		// Poller lag behind network TipHW (WS/Redis) is not evidence the
+		// upstream node lacks the block — TipHW means some ingress on this
+		// network already observed it. Fail-open so tip eth_call / reads
+		// reach the node instead of cascading ErrUpstreamBlockUnavailable.
+		if bn > latestBlock && latestBlock > 0 {
+			if tip := n.EvmHighestLatestBlockNumber(ctx); tip >= bn {
+				n.logger.Debug().
+					Str("upstreamId", u.Id()).
+					Int64("blockNumber", bn).
+					Int64("pollerLatest", latestBlock).
+					Int64("networkTip", tip).
+					Str("method", method).
+					Msg("poller lags TipHW; failing open block availability gate")
+				return nil, false
+			}
+		}
+
+		blockErr := common.NewErrUpstreamBlockUnavailable(u.Id(), bn, latestBlock, finalizedBlock)
+
+		// Determine if this is retryable based on distance
+		// Upper bound issue (block ahead of latest): retryable if within max distance
+		// Lower bound issue (block too old): not retryable
+		if bn > latestBlock && latestBlock > 0 {
+			distance := bn - latestBlock
+			maxDistance := int64(128) // default
+			if n.cfg.Evm != nil && n.cfg.Evm.MaxRetryableBlockDistance != nil {
+				maxDistance = *n.cfg.Evm.MaxRetryableBlockDistance
+			}
+			isRetryable := distance <= maxDistance
+			return blockErr, isRetryable
+		}
+
+		// Lower bound issue or unknown state - not retryable
+		return blockErr, false
+	}
+	return nil, false
+}
+
+// methodSkipMultiplexing reports whether a JSON-RPC method should bypass
+// in-flight dedup. Multiplexing is correct for idempotent reads where N
+// concurrent identical requests can share one result. It is wrong for
+// transaction-broadcast methods: a client retrying a signed payload
+// expects each retry to actually re-submit, not to silently block on a
+// prior in-flight attempt. Worse, if a retrying client cancels at its
+// own context deadline before the leader returns, eRPC's failsafe
+// leader continues executing on its CopyForCancellable child for the
+// remainder of the network-level budget — and every retry the client
+// issues in that window stacks up as a follower of the doomed leader,
+// all timing out together when their parent contexts fire.
+//
+// Tx broadcasts already handle duplicate submissions via the idempotent-
+// broadcast post-forward hook (nonce-already-known → synthetic success
+// keyed by tx hash). Skipping multiplexing here costs nothing in
+// correctness: duplicate work resolves at the upstream layer with the
+// same guarantees, and retries are no longer serialised behind a slow
+// leader.
+func methodSkipMultiplexing(method string) bool {
+	switch method {
+	case "eth_sendRawTransaction", "eth_sendTransaction":
+		return true
+	}
+	return false
+}
+
+func (n *Network) handleMultiplexing(ctx context.Context, lg *zerolog.Logger, req *common.NormalizedRequest, startTime time.Time) (*Multiplexer, *common.NormalizedResponse, error) {
+	if !n.cfg.MultiplexingEnabled() {
+		return nil, nil, nil
+	}
+
+	if method, _ := req.Method(); methodSkipMultiplexing(method) {
+		return nil, nil, nil
+	}
+
+	mlxHash, err := req.CacheHash()
+	lg.Trace().Str("hash", mlxHash).Object("request", req).Msgf("checking if multiplexing is possible")
+	if err != nil || mlxHash == "" {
+		lg.Debug().Str("hash", mlxHash).Err(err).Object("request", req).Msgf("could not get multiplexing hash for request")
+		return nil, nil, nil
+	}
+
+	// Try to atomically register as the leader or become a follower.
+	// Loop handles the edge case where we find a closed multiplexer during cleanup.
+	for {
+		mlx := NewMultiplexer(mlxHash)
+		vinf, loaded := n.inFlightRequests.LoadOrStore(mlxHash, mlx)
+
+		if !loaded {
+			// Our multiplexer was stored, we're the leader
+			return mlx, nil, nil
+		}
+
+		// Another request is already in flight - try to be a follower
+		inf := vinf.(*Multiplexer)
+
+		// Try to register as follower under lock to prevent race with cleanup's Wait()
+		inf.mu.Lock()
+		if inf.closed {
+			// Leader already finished and cleanup started, can't be a follower.
+			// Retry LoadOrStore - the old entry should be deleted soon, allowing
+			// us to properly become the new leader (with our mlx stored in the map).
+			inf.mu.Unlock()
+			continue
+		}
+
+		inf.copyWg.Add(1)
+		inf.mu.Unlock()
+
+		method, _ := req.Method()
+		finality := req.Finality(ctx)
+		telemetry.CounterHandle(telemetry.MetricNetworkMultiplexedRequests,
+			n.projectId, n.Label(), method, finality.String(), req.UserId(), req.AgentName(),
+		).Inc()
+
+		lg.Debug().Str("hash", mlxHash).Msgf("found identical request initiating multiplexer")
+
+		if span := trace.SpanFromContext(ctx); span.IsRecording() {
+			span.SetAttributes(attribute.String("multiplexer.hash", mlxHash))
+		}
+
+		resp, err := n.waitForMultiplexResult(ctx, inf, req, startTime)
+
+		// Done() is called in waitForMultiplexResult via defer
+		lg.Trace().Str("hash", mlxHash).Object("response", resp).Err(err).Msgf("multiplexed request result")
+
+		if err != nil {
+			return nil, nil, err
+		}
+		if resp != nil {
+			return nil, resp, nil
+		}
+
+		// Shouldn't reach here normally, but if we do, retry
+		lg.Warn().Str("hash", mlxHash).Msg("multiplexer follower got nil response and no error, retrying")
+	}
+}
+
+func (n *Network) waitForMultiplexResult(ctx context.Context, mlx *Multiplexer, req *common.NormalizedRequest, startTime time.Time) (*common.NormalizedResponse, error) {
+	ctx, span := common.StartSpan(ctx, "Network.WaitForMultiplexResult")
+	defer span.End()
+	span.SetAttributes(attribute.String("multiplexer.hash", mlx.hash))
+
+	// Caller already registered with copyWg.Add(1), ensure we signal completion
+	defer mlx.copyWg.Done()
+
+	// Wait for leader to complete (or check if already done)
+	select {
+	case <-mlx.done:
+		// Leader finished - copy the response
+		// Lock protects against concurrent reads, cleanup waits for copyWg so response is valid
+		mlx.mu.RLock()
+		out, err := common.CopyResponseForRequest(ctx, mlx.resp, req)
+		resultErr := mlx.err
+		mlx.mu.RUnlock()
+
+		if err != nil {
+			return nil, err
+		}
+		return out, resultErr
+	case <-ctx.Done():
+		err := ctx.Err()
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, common.NewErrNetworkRequestTimeout(time.Since(startTime), err)
+		}
+		return nil, err
+	}
+}
+
+func (n *Network) cleanupMultiplexer(mlx *Multiplexer) {
+	// Mark as closed under lock to prevent new followers from registering
+	mlx.mu.Lock()
+	mlx.closed = true
+	mlx.mu.Unlock()
+
+	// Remove from map so new requests create their own multiplexer
+	n.inFlightRequests.Delete(mlx.hash)
+
+	// Wait for all followers to finish copying before releasing.
+	// Wait() is safe because closed=true prevents any new Add() calls.
+	// This blocks the leader briefly, but the leader has already returned
+	// its response to the caller, so this only delays cleanup.
+	mlx.copyWg.Wait()
+
+	// After Wait(), no followers are accessing the response.
+	mlx.mu.Lock()
+	if mlx.resp != nil {
+		mlx.resp.Release()
+		mlx.resp = nil
+	}
+	mlx.mu.Unlock()
+}
+
+func (n *Network) shouldHandleMethod(req *common.NormalizedRequest, method string, upsList []common.Upstream) error {
+	// Check stateful methods policy
+	// Methods.Definitions is guaranteed to be populated by SetDefaults() with all necessary stateful methods
+	isStateful := false
+	if n.cfg != nil && n.cfg.Methods != nil && n.cfg.Methods.Definitions != nil {
+		if mc, ok := n.cfg.Methods.Definitions[method]; ok && mc != nil {
+			isStateful = mc.Stateful
+		}
+	}
+	if isStateful {
+		// Determine targeted upstream count
+		targeted := 0
+		if dr := req.Directives(); dr != nil && dr.UseUpstream != "" {
+			for _, u := range upsList {
+				if match, _ := common.WildcardMatch(dr.UseUpstream, u.Id()); match {
+					targeted++
+				}
+			}
+		} else {
+			targeted = len(upsList)
+		}
+		if targeted > 1 {
+			return common.NewErrNotImplemented("stateful method requires a single targeted upstream; either configure only 1 upstream or set Use-Upstream to a single upstream id")
+		}
+	}
+
+	if method == "eth_accounts" || method == "eth_sign" {
+		return common.NewErrNotImplemented("eth_accounts and eth_sign are not supported")
+	}
+
+	return nil
+}
+
+func (n *Network) enrichStatePoller(ctx context.Context, method string, req *common.NormalizedRequest, resp *common.NormalizedResponse) {
+	ctx, span := common.StartDetailSpan(ctx, "Network.EnrichStatePoller")
+	defer span.End()
+
+	switch n.Architecture() {
+	case common.ArchitectureEvm:
+		// TODO Move the logic to evm package as a post-forward hook?
+		if method == "eth_getBlockByNumber" {
+			// Prefer the original block reference preserved by normalization.
+			// This stays "latest"/"finalized" even if params were interpolated to hex.
+			var blkTag string
+			if ref := req.EvmBlockRef(); ref != nil {
+				if s, ok := ref.(string); ok && (s == "latest" || s == "finalized") {
+					blkTag = s
+				}
+			}
+			if lg := n.logger; lg != nil && lg.GetLevel() <= zerolog.TraceLevel {
+				lg.Trace().
+					Str("blkTagFromEvmBlockRef", blkTag).
+					Interface("evmBlockRefRaw", req.EvmBlockRef()).
+					Msg("enrichStatePoller: resolved block tag from request EvmBlockRef")
+			}
+			// Fallback to inspecting the request param only if we couldn't resolve from EvmBlockRef
+			if blkTag == "" {
+				jrq, err := req.JsonRpcRequest(ctx)
+				if err != nil {
+					return
+				}
+				jrq.RLock()
+				if len(jrq.Params) > 0 {
+					if s, ok := jrq.Params[0].(string); ok && (s == "latest" || s == "finalized") {
+						blkTag = s
+					}
+				}
+				jrq.RUnlock()
+				if lg := n.logger; lg != nil {
+					lg.Trace().
+						Str("blkTagFromParams", blkTag).
+						Msg("enrichStatePoller: resolved block tag from request params")
+				}
+			}
+			if blkTag == "" {
+				return
+			}
+			jrs, _ := resp.JsonRpcResponse(ctx)
+			bnh, err := jrs.PeekStringByPath(ctx, "number")
+			if err != nil {
+				return
+			}
+			blockNumber, err := common.HexToInt64(bnh)
+			if err != nil {
+				return
+			}
+			if lg := n.logger; lg != nil {
+				lg.Trace().
+					Str("blkTag", blkTag).
+					Int64("blockNumber", blockNumber).
+					Str("method", method).
+					Msg("enrichStatePoller: suggesting block number to state poller")
+			}
+			if ups := resp.Upstream(); ups != nil {
+				if ups, ok := ups.(common.EvmUpstream); ok {
+					// These methods are non-blocking and handle async updates internally
+					switch blkTag {
+					case "finalized":
+						ups.EvmStatePoller().SuggestFinalizedBlock(blockNumber)
+					case "latest":
+						ups.EvmStatePoller().SuggestLatestBlock(blockNumber)
+					}
+				}
+			}
+		} else if method == "eth_blockNumber" {
+			jrs, _ := resp.JsonRpcResponse(ctx)
+			bnh, err := jrs.PeekStringByPath(ctx)
+			if err == nil {
+				blockNumber, err := common.HexToInt64(bnh)
+				if err == nil {
+					if ups := resp.Upstream(); ups != nil {
+						if ups, ok := ups.(common.EvmUpstream); ok {
+							// This method is non-blocking and handles async updates internally
+							ups.EvmStatePoller().SuggestLatestBlock(blockNumber)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+func (n *Network) normalizeResponse(ctx context.Context, req *common.NormalizedRequest, resp *common.NormalizedResponse) error {
+	ctx, span := common.StartDetailSpan(ctx, "Network.NormalizeResponse")
+	defer span.End()
+
+	// For any JSON-RPC architecture: ensure the response ID always reflects the
+	// client's original request ID, regardless of what the upstream echoed back.
+	// This is especially important for proxies that normalize or multiplex IDs
+	// toward upstreams, and must apply to every JSON-RPC architecture — not just
+	// EVM — so non-EVM clients (Solana and future architectures) aren't left with
+	// mismatched response IDs.
+	if resp != nil {
+		if jrr, err := resp.JsonRpcResponse(ctx); err == nil && jrr != nil {
+			jrq, err := req.JsonRpcRequest(ctx)
+			if err != nil {
+				return err
+			}
+			// Prefer the verbatim request id bytes when available so that
+			// large integers (>2^53), fractional ids, and other exotic
+			// numeric formats round-trip without precision loss. Falls
+			// back to the typed id for programmatically-constructed
+			// requests where idRaw is unset.
+			if rawID := jrq.IDRawBytes(); len(rawID) > 0 {
+				if err := jrr.SetIDBytes(rawID); err != nil {
+					return err
+				}
+			} else if err := jrr.SetID(jrq.ID); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (n *Network) acquireRateLimitPermit(ctx context.Context, req *common.NormalizedRequest) error {
+	if n.cfg.RateLimitBudget == "" {
+		return nil
+	}
+
+	rlb, errNetLimit := n.rateLimitersRegistry.GetBudget(n.cfg.RateLimitBudget)
+	if errNetLimit != nil {
+		return errNetLimit
+	}
+	if rlb == nil {
+		return nil
+	}
+
+	method, errMethod := req.Method()
+	if errMethod != nil {
+		return errMethod
+	}
+	lg := n.logger.With().Str("method", method).Logger()
+
+	rules, errRules := rlb.GetRulesByMethod(method)
+	if errRules != nil {
+		return errRules
+	}
+	lg.Debug().Msgf("found %d network-level rate limiters", len(rules))
+
+	if len(rules) > 0 {
+		allowed, err := rlb.TryAcquirePermit(ctx, n.projectId, req, method, "", "", "", "network")
+		if err != nil {
+			return err
+		}
+		if !allowed {
+			// Blocked event already recorded in budget.TryAcquirePermit; avoid double recording here
+			return common.NewErrNetworkRateLimitRuleExceeded(
+				n.projectId,
+				n.networkId,
+				n.cfg.RateLimitBudget,
+				fmt.Sprintf("method:%s", method),
+			)
+		}
+	}
+
+	return nil
+}
+
+// tierUpstreamsByGroup returns a copy of ups with primary-tier upstreams
+// (those NOT tagged `tier:fallback`) ordered before fallback-tier upstreams.
+// Within each tier, input order is preserved (the caller's score-based
+// sort). If the input contains no fallback-tier upstreams, the original
+// slice is returned unchanged.
+func tierUpstreamsByGroup(ups []common.Upstream) []common.Upstream {
+	hasFallback := false
+	for _, u := range ups {
+		if u.Config() != nil && u.Config().HasTag(common.TagTierFallback) {
+			hasFallback = true
+			break
+		}
+	}
+	if !hasFallback {
+		return ups
+	}
+	tiered := make([]common.Upstream, 0, len(ups))
+	for _, u := range ups {
+		if u.Config() == nil || !u.Config().HasTag(common.TagTierFallback) {
+			tiered = append(tiered, u)
+		}
+	}
+	for _, u := range ups {
+		if u.Config() != nil && u.Config().HasTag(common.TagTierFallback) {
+			tiered = append(tiered, u)
+		}
+	}
+	return tiered
+}
+
+// partitionUpstreamsByLatestBlock stable-partitions ups so that upstreams
+// whose EvmStatePoller has observed a block number ≥ bn come first, in
+// their input order. Upstreams whose poller is behind bn (or has no
+// poller / isn't EVM) keep their input order and come after.
+//
+// This makes per-request routing consistent with what the indexer already
+// knows: when a WS upstream delivers newHead block N, its state poller's
+// LatestBlock advances to N immediately. If a subsequent eth_call from a
+// client references block N, this partition routes the call to that
+// upstream first instead of to an HTTP-only sibling whose own polling
+// hasn't caught up — which would fail checkUpstreamBlockAvailability and
+// burn retries. The partition is stable, so callers can layer it under
+// other orderings (tier, score) without disturbing them within each
+// partition.
+func partitionUpstreamsByLatestBlock(ups []common.Upstream, bn int64) []common.Upstream {
+	if bn <= 0 || len(ups) < 2 {
+		return ups
+	}
+	// Cheap fast-path: if all upstreams already have ≥ bn, or all are
+	// behind, the partition is the identity and we can avoid the
+	// allocation. We still walk once to compute LatestBlock either way,
+	// so the gain is just the slice copy.
+	haveCount := 0
+	for _, u := range ups {
+		eu, ok := u.(common.EvmUpstream)
+		if !ok {
+			continue
+		}
+		sp := eu.EvmStatePoller()
+		if sp == nil || sp.IsObjectNull() {
+			continue
+		}
+		if sp.LatestBlock() >= bn {
+			haveCount++
+		}
+	}
+	if haveCount == 0 || haveCount == len(ups) {
+		return ups
+	}
+	out := make([]common.Upstream, 0, len(ups))
+	for _, u := range ups {
+		eu, ok := u.(common.EvmUpstream)
+		if !ok {
+			continue
+		}
+		sp := eu.EvmStatePoller()
+		if sp != nil && !sp.IsObjectNull() && sp.LatestBlock() >= bn {
+			out = append(out, u)
+		}
+	}
+	for _, u := range ups {
+		eu, ok := u.(common.EvmUpstream)
+		if !ok {
+			out = append(out, u)
+			continue
+		}
+		sp := eu.EvmStatePoller()
+		if sp == nil || sp.IsObjectNull() || sp.LatestBlock() < bn {
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+// pinNearTipGetBlockToLeader sets UseUpstream to EvmLeaderUpstream when the
+// request is eth_getBlockByNumber for the leader tip or tip+1 (sibling import
+// race window). Skips if the client/config already set UseUpstream.
+func (n *Network) pinNearTipGetBlockToLeader(ctx context.Context, req *common.NormalizedRequest, method string, bn int64) {
+	if n == nil || req == nil || method != "eth_getBlockByNumber" || bn <= 0 {
+		return
+	}
+	leader := n.EvmLeaderUpstream(ctx)
+	if leader == nil {
+		return
+	}
+	eu, ok := leader.(common.EvmUpstream)
+	if !ok {
+		return
+	}
+	sp := eu.EvmStatePoller()
+	if sp == nil || sp.IsObjectNull() {
+		return
+	}
+	l := sp.LatestBlock()
+	if l <= 0 || bn < l || bn > l+1 {
+		return
+	}
+	dr := req.Directives()
+	if dr == nil {
+		dr = &common.RequestDirectives{}
+		req.SetDirectives(dr)
+	}
+	if dr.UseUpstream != "" {
+		return
+	}
+	dr.UseUpstream = leader.Id()
+}
+
+// requestBlockNumber resolves the specific block number a request targets,
+// or 0 when the request has no block reference. Mirrors the extraction
+// path in checkUpstreamBlockAvailability so routing and gating see the
+// same value.
+func requestBlockNumber(ctx context.Context, req *common.NormalizedRequest) int64 {
+	if req == nil {
+		return 0
+	}
+	if v := req.EvmBlockNumber(); v != nil {
+		if n64, ok := v.(int64); ok && n64 > 0 {
+			return n64
+		}
+	}
+	if _, x, ebn := evm.ExtractBlockReferenceFromRequest(ctx, req); ebn == nil && x > 0 {
+		return x
+	}
+	return 0
+}

@@ -1,0 +1,36 @@
+{
+  "name": "@erpc-cloud/config",
+  "version": "0.0.64",
+  "description": "Library of types for IDE autocompletion of erpc config in Typescript",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/erpc/erpc.git"
+  },
+  "main": "index.js",
+  "types": "./lib/index.d.ts",
+  "typings": "./lib/index.d.ts",
+  "scripts": {
+    "build": "pnpm build:lib && pnpm build:types",
+    "build:lib": "esbuild src/index.ts --outdir=lib --bundle --outbase=src --platform=node --format=cjs --sourcemap",
+    "build:types": "tsc src/index.ts --emitDeclarationOnly --declaration --outDir lib --declarationMap --module nodenext --moduleResolution nodenext",
+    "test": "tsc -p tsconfig.test.json"
+  },
+  "files": [
+    "lib",
+    "src/*.ts",
+    "src/types/*.ts"
+  ],
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "require": "./lib/index.js",
+      "import": "./lib/index.js",
+      "default": "./lib/index.js"
+    }
+  },
+  "keywords": [
+    "erpc"
+  ],
+  "author": "erpc",
+  "license": "Apache-2.0"
+}

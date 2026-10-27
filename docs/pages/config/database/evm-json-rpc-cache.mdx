@@ -1,0 +1,480 @@
+---
+title: "evmJsonRpcCache"
+description: Cache JSON-RPC responses across one or more storage backends — non-blocking, finality-aware, reorg-safe.
+---
+
+import { Callout } from "nextra/components";
+import {
+	ConfigTabs,
+	ConfigCode,
+	AISection,
+	LLMsTxtLink,
+} from "../../../components";
+
+# `evmJsonRpcCache`
+
+<LLMsTxtLink />
+
+The cache layer stores JSON-RPC responses across one or more **connectors** (memory, Redis, PostgreSQL, DynamoDB). Cache is **non-blocking on the critical path** — if the cache is slow or down, requests pass through to upstreams as normal.
+
+**You can configure:**
+
+- **Multiple connectors** — pick a different storage per use case (e.g. memory for hot/realtime, postgres for finalized archive)
+- **Per-policy routing** — each policy matches a network + method + params + finality state and picks which connector to use
+- **Finality awareness** — separate TTLs for `finalized` vs `unfinalized` vs `realtime` vs `unknown` data
+- **Empty-response handling** — `ignore` (default, skip caching), `allow` (cache anyway), or `only` (cache only empties — useful for separate negative-cache TTL)
+- **Size limits** — `minItemSize` / `maxItemSize` to skip responses too small or too large to be worth caching
+- **Compression** — Zstandard, on by default, threshold + level configurable
+- **Read/write split** — `appliesTo: get | set | both` so a connector can serve cache reads but not absorb writes (or vice versa)
+- **Per-method behavior overrides** — extend or replace the default cacheable-methods table
+
+## Minimum useful config
+
+A single memory connector with one finalized-only policy — enough to dedupe finalized reads in front of upstream RPS limits.
+
+<ConfigTabs
+	path="database > evmJsonRpcCache"
+	focus="5-13"
+	yaml={`database:
+  evmJsonRpcCache:
+    connectors:
+      - id: memory-cache
+        driver: memory
+        memory:
+          maxItems: 100000
+    policies:
+      - network: "*"
+        method: "*"
+        finality: finalized
+        empty: ignore
+        connector: memory-cache
+        ttl: 0          # 0 = forever; safe for finalized data`}
+	ts={`import { createConfig } from "@erpc-cloud/config";
+
+export default createConfig({
+  database: {
+    evmJsonRpcCache: {
+      connectors: [{
+        id: "memory-cache",
+        driver: "memory",
+        memory: { maxItems: 100000 },
+      }],
+      policies: [{
+        network: "*",
+        method: "*",
+        finality: "finalized",
+        empty: "ignore",
+        connector: "memory-cache",
+        ttl: 0,             // 0 = forever; safe for finalized data
+      }],
+    },
+  },
+});`}
+/>
+
+<Callout type="info">
+	Sizing: caching 70M blocks + 10M txs + 10M traces on Arbitrum needs ~200 GB of storage. Plan the connector accordingly — memory for hot data, Postgres/DynamoDB for the long tail.
+</Callout>
+
+## Finality states (cache-decision basics)
+
+| State | Meaning | Typical TTL |
+|---|---|---|
+| `finalized` | Block is past the chain's finalization horizon (safe from reorgs). | `0` (forever) |
+| `unfinalized` | Recent block that could still be reorged. | seconds (~ 2× block time) |
+| `realtime` | Data that updates every block (`eth_blockNumber`, `eth_gasPrice`, etc.). | seconds (short) |
+| `unknown` | Block number cannot be determined from request/response (`eth_getTransactionByHash`, `eth_traceTransaction`, etc.). | typically forever; data is keyed by tx hash so reorgs don't invalidate the cache key. |
+
+A response is reorg-safe (and cacheable long-term) when keyed on either a finalized block or an immutable identifier (tx hash). For chains without a `finalized` block method, eRPC treats the last 1024 blocks as unfinalized — tunable via `network.evm.fallbackFinalityDepth`.
+
+## Empty-response handling
+
+| `empty` | Behavior |
+|---|---|
+| `ignore` (default) | Empty responses are NOT cached. |
+| `allow` | Cache empties alongside non-empty results. |
+| `only` | Cache ONLY empties. Pair with a second policy on the same method to give empties their own TTL. |
+
+A response is "empty" if it's any of: `null`, `[]`, `{}`, `0x`, `"0x"`, or all-zero hex (e.g. `0x0...0`).
+
+<Callout type="warning">
+	Test your full dApp/indexer flow when enabling `empty: allow` on `unfinalized` policies — caching empties on tip-of-chain data can mask real propagation delays.
+</Callout>
+
+## Param matching
+
+The `params` array filters on request parameters positionally. Each slot can be a literal, wildcard, numeric range, or `<empty>` (matches null / undefined / missing). Use `|` to OR multiple values in one slot:
+
+```yaml
+# Match any address in slot 0, and slot 1 that is either empty/missing, true, or false
+params: ["0x*", "<empty>|true|false"]
+```
+
+This is useful for `eth_getBalance`-style calls where the second parameter (block tag) may be omitted by some clients. Full matcher syntax — including object-key matching for `eth_getLogs` filter objects — is in the [full reference](#param-matching-1) below.
+
+## Production example — multiple connectors and policies
+
+A realistic split: memory for hot tier, Postgres for the archive. Different TTLs per finality.
+
+<ConfigTabs
+	path="database > evmJsonRpcCache"
+	focus="3-18"
+	yaml={`database:
+  evmJsonRpcCache:
+    connectors:
+      - id: hot
+        driver: memory
+        memory: { maxItems: 100000 }
+      - id: archive
+        driver: postgresql
+        postgresql:
+          connectionUri: postgres://USER:PASS@HOST:5432/erpc
+          table: rpc_cache
+    policies:
+      # Realtime tip — short TTL, hot tier only
+      - { network: "*", method: "*", finality: realtime, connector: hot, ttl: 2s }
+      # Unfinalized recent blocks — short-ish TTL, hot tier
+      - { network: "*", method: "*", finality: unfinalized, connector: hot, ttl: 10s }
+      # Unknown finality (tx-hash keyed) — forever, archive
+      - { network: "*", method: "*", finality: unknown, connector: archive, ttl: 0 }
+      # Finalized — forever, archive, cache empties too
+      - { network: "*", method: "*", finality: finalized, empty: allow, connector: archive, ttl: 0 }`}
+	ts={`import { createConfig } from "@erpc-cloud/config";
+
+export default createConfig({
+  database: {
+    evmJsonRpcCache: {
+      connectors: [
+        { id: "hot", driver: "memory", memory: { maxItems: 100000 } },
+        {
+          id: "archive",
+          driver: "postgresql",
+          postgresql: {
+            connectionUri: "postgres://USER:PASS@HOST:5432/erpc",
+            table: "rpc_cache",
+          },
+        },
+      ],
+      policies: [
+        { network: "*", method: "*", finality: "realtime", connector: "hot", ttl: "2s" },
+        { network: "*", method: "*", finality: "unfinalized", connector: "hot", ttl: "10s" },
+        { network: "*", method: "*", finality: "unknown", connector: "archive", ttl: 0 },
+        { network: "*", method: "*", finality: "finalized", empty: "allow", connector: "archive", ttl: 0 },
+      ],
+    },
+  },
+});`}
+/>
+
+<AISection title="Copy for your AI assistant — full evmJsonRpcCache reference">
+
+### Full config skeleton
+
+```yaml
+database:
+  evmJsonRpcCache:
+
+    # === Storage backends ===
+    connectors:
+      - id: string                 # unique, referenced by policies
+        driver: memory | redis | postgresql | dynamodb
+        # ...driver-specific config (see /config/database/drivers)
+        failsafeForGets:            # optional; failsafe policies for cache reads
+          - matchMethod: "*"
+            timeout: { duration: 100ms }
+        failsafeForSets:            # optional; failsafe policies for cache writes
+          - matchMethod: "*"
+            timeout: { duration: 500ms }
+
+    # === Caching policies (evaluated in order) ===
+    policies:
+      - network: string             # optional, default "*". Matcher syntax.
+        method: string              # optional, default "*". Matcher syntax.
+        params: []any               # optional, per-position param matchers
+        finality: finalized | unfinalized | realtime | unknown
+        empty: ignore | allow | only          # optional, default "ignore"
+        appliesTo: get | set | both           # optional, default "both"
+        minItemSize: string         # optional, e.g. "1KB"
+        maxItemSize: string         # optional, e.g. "10MB"
+        connector: string           # required, references connectors[].id
+        ttl: duration               # optional; "0" means forever
+
+    # === Per-method classification overrides ===
+    methods:
+      <method_name>:
+        reqRefs: [][]any
+        respRefs: [][]any
+        finalized: bool
+        realtime: bool
+        stateful: bool
+        translateLatestTag: bool          # default true
+        translateFinalizedTag: bool       # default true
+        enforceBlockAvailability: bool    # optional, per-method override
+
+    # === Compression ===
+    compression:
+      enabled: bool                 # optional, default true
+      algorithm: "zstd"             # the only supported value today
+      zstdLevel: fastest | default | better | best
+      threshold: int                # bytes; values below this are stored uncompressed
+```
+
+### `policies[]` fields, exhaustive
+
+| Field | Default | Notes |
+|---|---|---|
+| `network` | `"*"` | Matcher: `evm:1`, `evm:*`, `evm:1\|evm:10`. |
+| `method` | `"*"` | Matcher: `eth_*`, `eth_getLogs\|trace_*`. |
+| `params` | none | Array of per-position matchers (see "Param matching" below). |
+| `finality` | `finalized` | Required; must match one of `finalized`/`unfinalized`/`realtime`/`unknown`. |
+| `empty` | `ignore` | `ignore`, `allow`, or `only`. |
+| `appliesTo` | `both` | `get` = read-through only; `set` = write-only; `both` = read + write. Lets a connector serve cache reads without absorbing writes (e.g. a remote read-only cache fronting an archive store). |
+| `minItemSize` | none | Skip caching responses smaller than this (`100B`, `1KB`, ...). Avoids overhead on tiny values. |
+| `maxItemSize` | none | Skip caching responses larger than this. Useful when the backend has a row-size limit (e.g. PostgreSQL B-tree indexes). |
+| `connector` | required | Must match one of `connectors[].id`. |
+| `ttl` | none | Duration string (`100ms`, `5s`, `1h`, `86400s`) or `0` for forever. |
+
+**Set-vs-get semantics:**
+
+- On cache **set**, every policy whose network/method/finality matches AND whose `appliesTo` includes `set` writes the entry.
+- On cache **get**, every policy whose network/method matches AND whose `appliesTo` includes `get` is queried top-to-bottom; the first hit returns.
+
+### Param matching
+
+The `params` array maps positionally to JSON-RPC parameters. Each slot can be a literal, a matcher string, an object (for nested param matching), or an array.
+
+```yaml
+# All matchers below are valid `params` slots:
+
+params: ["0x1 | 0x2 | 0x3", "*"]              # OR list
+params: [">=0x100 | <=0x200", "*"]             # numeric range
+params: ["*", "<empty>"]                        # explicit empty
+params: [[">0x123", ">=0x456"], "*"]            # array element matchers
+params:                                         # nested object matcher (eth_getLogs)
+  - fromBlock: ">=0x100"
+    toBlock: "<=0x200"
+    address: "*"
+    topics: ["*"]
+```
+
+Supported operators inside a matcher slot:
+
+- `*` — wildcard
+- `|` — OR (`0x1 | 0x2`)
+- `>value`, `>=value`, `<value`, `<=value` — numeric comparison (hex or decimal)
+- `<empty>` — match null / undefined
+
+Object matching: for parameters that are JSON objects (e.g. the filter object in `eth_getLogs`), each field gets its own matcher.
+
+### Connector failsafe — `failsafeForGets` / `failsafeForSets`
+
+Each connector can carry its own failsafe policies for reads and writes independently. Use this when a remote cache is "best effort" for reads (short timeout, no retry) but stricter on writes (longer timeout, retry once).
+
+```yaml
+connectors:
+  - id: redis-archive
+    driver: redis
+    redis: { uri: "redis://..." }
+    failsafeForGets:
+      - matchMethod: "*"
+        timeout: { duration: 50ms }
+    failsafeForSets:
+      - matchMethod: "*"
+        timeout: { duration: 500ms }
+        retry: { maxAttempts: 2, delay: 100ms }
+```
+
+### Compression
+
+Compression is **on by default** with Zstandard. Tune via `compression.*`:
+
+| Level | Performance | Compression ratio | Use case |
+|---|---|---|---|
+| `fastest` (default) | Best | ~50-70% | Default, recommended for most use cases. |
+| `default` | Good | ~60-80% | Balanced. |
+| `better` | Moderate | ~70-85% | When storage cost > write latency. |
+| `best` | Slowest | ~75-90% | Archival, batched writes. |
+
+`threshold` (default `1024` bytes) — values smaller than this are stored uncompressed because the codec overhead outweighs savings. Bumping this up reduces CPU at the cost of disk; bumping down does the opposite.
+
+For `eth_getBlockByNumber` requests that use a moving tag (`"latest"`, `"finalized"`, `"safe"`), eRPC keys the cache entry by the concrete block number — the response's own number on write, the network's tracked tip on read. That means a burst of concurrent tag queries landing on the same tip coalesces onto one cached entry, but once the tip advances the key changes and the next request forwards upstream. You don't have to worry about a `"latest"` query returning a block that's multiple tips stale just because the TTL hasn't expired.
+
+Compression is particularly effective for:
+
+- Large block responses (`eth_getBlockByNumber` with full transactions)
+- Transaction receipts with many logs
+- Trace data (`debug_traceTransaction`, `trace_block`)
+- `eth_getLogs` responses with many events
+
+### `methods[]` — overriding cacheable-method classification
+
+`methods` is a map keyed by RPC method name. The values tell the cache how to classify each method:
+
+| Field | Type | Notes |
+|---|---|---|
+| `finalized` | bool | This method always returns reorg-immutable data (e.g. `eth_chainId`). |
+| `realtime` | bool | Data changes every block (`eth_gasPrice`, `eth_blockNumber`). Use a short TTL. |
+| `stateful` | bool | Response depends on full chain state, not just the request params (rare; advanced). |
+| `reqRefs` | `[][]any` | Paths inside `request.params` to find the block number / hash. Put block number first if both are present so the cache picks block number for keying. |
+| `respRefs` | `[][]any` | Paths inside `response.result` to find the block number / hash. Same ordering rule. |
+| `translateLatestTag` | bool | Default `true`. Translate `latest` block tag to the concrete number at request time so cache keys are stable. |
+| `translateFinalizedTag` | bool | Default `true`. Same idea for `finalized`. |
+| `enforceBlockAvailability` | bool | Per-method override of the network-level setting. When `true`, requests are skipped against upstreams that haven't synced past the referenced block. |
+
+**`enforceBlockAvailability` network vs per-method:**
+
+```yaml
+# Network-level default: enforce block bounds for all cached methods (recommended)
+networks:
+  - id: evm:1
+    evm:
+      enforceBlockAvailability: true
+
+# Per-method override: disable the bound check for eth_getLogs only.
+# Useful when the cached range bound is too conservative for this method
+# and you'd rather let the upstream handle range errors itself.
+database:
+  evmJsonRpcCache:
+    methods:
+      eth_getLogs:
+        reqRefs:
+          - [0, fromBlock]
+          - [0, toBlock]
+          - [0, blockHash]
+        enforceBlockAvailability: false
+```
+
+The per-method value wins over the network-level value for that specific method.
+
+**Critical:** if you set `methods:`, you **REPLACE** the entire default classification table — defaults are **not** merged. Re-list every method you want cached.
+
+The special `reqRefs: [["*"]]` means "this method's data is keyed by something other than a block reference (e.g. tx hash), so it's safe to cache regardless of reorgs."
+
+### Default cacheable methods (full table)
+
+Below is the default `methods:` table that ships with eRPC. Re-paste and adjust it if you need to override.
+
+```yaml
+methods:
+  # === Static methods that return fixed values ===
+  eth_chainId: { finalized: true }
+  net_version: { finalized: true }
+
+  # === Realtime methods (change every block) ===
+  eth_hashrate: { realtime: true }
+  eth_mining: { realtime: true }
+  eth_syncing: { realtime: true }
+  net_peerCount: { realtime: true }
+  eth_gasPrice: { realtime: true }
+  eth_maxPriorityFeePerGas: { realtime: true }
+  eth_blobBaseFee: { realtime: true }
+  eth_blockNumber: { realtime: true }
+  erigon_blockNumber: { realtime: true }
+
+  # === Methods with block refs in request/response ===
+  # (Always put number before hash in reqRefs/respRefs so cache picks number for keying.)
+  eth_getLogs:
+    reqRefs:
+      - [0, fromBlock]
+      - [0, toBlock]
+      - [0, blockHash]
+  eth_getBlockByHash:
+    reqRefs: [[0]]
+    respRefs: [[number], [hash]]
+  eth_getBlockByNumber:
+    reqRefs: [[0]]
+    respRefs: [[number], [hash]]
+  eth_getTransactionByBlockHashAndIndex:
+    reqRefs: [[0]]
+    respRefs: [[blockNumber], [blockHash]]
+  eth_getTransactionByBlockNumberAndIndex:
+    reqRefs: [[0]]
+    respRefs: [[blockNumber], [blockHash]]
+  eth_getUncleByBlockHashAndIndex:
+    reqRefs: [[0]]
+    respRefs: [[number], [hash]]
+  eth_getUncleByBlockNumberAndIndex:
+    reqRefs: [[0]]
+    respRefs: [[number], [hash]]
+  eth_getBlockTransactionCountByHash: { reqRefs: [[0]] }
+  eth_getBlockTransactionCountByNumber: { reqRefs: [[0]] }
+  eth_getUncleCountByBlockHash: { reqRefs: [[0]] }
+  eth_getUncleCountByBlockNumber: { reqRefs: [[0]] }
+  eth_getStorageAt: { reqRefs: [[2]] }
+  eth_getBalance: { reqRefs: [[1]] }
+  eth_getTransactionCount: { reqRefs: [[1]] }
+  eth_getCode: { reqRefs: [[1]] }
+  eth_call: { reqRefs: [[1]] }
+  eth_getProof: { reqRefs: [[2]] }
+  arbtrace_call: { reqRefs: [[2]] }
+  eth_feeHistory: { reqRefs: [[1]] }
+  eth_getAccount: { reqRefs: [[1]] }
+  eth_estimateGas: { reqRefs: [[1]] }
+  debug_traceCall: { reqRefs: [[1]] }
+  eth_simulateV1: { reqRefs: [[1]] }
+  erigon_getBlockByTimestamp: { reqRefs: [[1]] }
+  arbtrace_callMany: { reqRefs: [[1]] }
+  eth_getBlockReceipts: { reqRefs: [[0]] }
+  trace_block: { reqRefs: [[0]] }
+  debug_traceBlockByNumber: { reqRefs: [[0]] }
+  trace_replayBlockTransactions: { reqRefs: [[0]] }
+  debug_storageRangeAt: { reqRefs: [[0]] }
+  debug_traceBlockByHash: { reqRefs: [[0]] }
+  debug_getRawBlock: { reqRefs: [[0]] }
+  debug_getRawHeader: { reqRefs: [[0]] }
+  debug_getRawReceipts: { reqRefs: [[0]] }
+  erigon_getHeaderByNumber: { reqRefs: [[0]] }
+  arbtrace_block: { reqRefs: [[0]] }
+  arbtrace_replayBlockTransactions: { reqRefs: [[0]] }
+
+  # === Tx-hash-keyed methods (safe to cache irrespective of block reorgs) ===
+  # reqRefs: [["*"]] tells the cache "this data isn't keyed by a block, so reorgs
+  # don't invalidate it." If a reorg removes the tx, a client querying for that
+  # tx hash already knows they need to verify via a separate path.
+  eth_getTransactionReceipt:
+    reqRefs: [["*"]]
+    respRefs: [[blockNumber], [blockHash]]
+  eth_getTransactionByHash:
+    reqRefs: [["*"]]
+    respRefs: [[blockNumber], [blockHash]]
+  arbtrace_replayTransaction: { reqRefs: [["*"]] }
+  trace_replayTransaction:    { reqRefs: [["*"]] }
+  debug_traceTransaction:     { reqRefs: [["*"]] }
+  trace_rawTransaction:       { reqRefs: [["*"]] }
+  trace_transaction:          { reqRefs: [["*"]] }
+  debug_traceBlock:           { reqRefs: [["*"]] }
+```
+
+**Methods explicitly NOT cached by default:** all write methods (`eth_sendRawTransaction`, `eth_sendTransaction`), subscription methods (`eth_subscribe`, `eth_unsubscribe`), and admin/state-changing methods. If you want to cache a method that's not in the default table, add it under `methods:` (and remember the whole table is replaced).
+
+### Reorg-safety strategies
+
+The finality + TTL combination is what keeps reorg-unsafe data from leaking:
+
+1. **Finalized data → cache forever** — guaranteed past the reorg horizon.
+2. **Unfinalized data → seconds** — `ttl: 5s`-`10s`, matching the upstream re-orgs window expectation.
+3. **Mixed strategy for the same method** — write two policies:
+
+   ```yaml
+   policies:
+     - { network: "*", method: "eth_getBlockByNumber", finality: finalized, connector: archive, ttl: 0 }
+     - { network: "*", method: "eth_getBlockByNumber", finality: unfinalized, connector: hot, ttl: 5s }
+   ```
+
+4. **`unknown` finality** — typically tx-hash-keyed responses; caching forever is safe because the cache key isn't the block.
+5. **`realtime` finality** — never cache long; choose a TTL ≤ ~2× the chain's block time.
+
+### Common pitfalls
+
+- **`methods:` replaces, does not merge.** Setting one custom method drops every default.
+- **Policies are first-match-wins on get.** Order matters. Put narrower / faster policies higher.
+- **`empty: only` without a paired `empty: ignore` policy** caches only nulls but never hits — make sure another policy actually stores the non-empties.
+- **`maxItemSize` and Postgres B-tree limits.** PostgreSQL row-cache backends have a hard ceiling around ~8 KB per indexed value. Configure `maxItemSize: "8KB"` for Postgres connectors.
+- **`appliesTo: set` without a paired `get` policy** means writes succeed but reads always miss. Useful as a "shadow write" debugging mode; rarely the right production shape.
+- **Compression `threshold` interactions with `minItemSize`** — values below `minItemSize` aren't stored at all; values between `minItemSize` and `compression.threshold` are stored uncompressed; values above `compression.threshold` are stored compressed.
+
+</AISection>
+
+<Callout type="tip">
+	Append `.llms.txt` to this URL (or use the **AI** link above) to fetch the entire expanded reference as plain markdown for an AI assistant.
+</Callout>

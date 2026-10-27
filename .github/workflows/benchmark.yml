@@ -1,0 +1,147 @@
+name: benchmark
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  issues: write
+  pull-requests: write
+  contents: read
+
+jobs:
+  performance:
+    timeout-minutes: 20
+    runs-on: "${{ github.repository_owner == 'erpc' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-24.04' }}"
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '/benchmark') &&
+      (
+        github.event.comment.author_association == 'OWNER' ||
+        github.event.comment.author_association == 'MEMBER' ||
+        github.event.comment.author_association == 'COLLABORATOR'
+      )
+
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@5ef0c079ce82195b2a36a210272d6b661572d83e # v2.14.2
+        with:
+          egress-policy: audit
+
+      - name: Get PR details
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_JSON=$(gh pr view ${{ github.event.issue.number }} --repo ${{ github.repository }} --json headRefName,headRepository)
+          echo "head_ref=$(echo "$PR_JSON" | jq -r '.headRefName')" >> "$GITHUB_OUTPUT"
+          echo "head_repo=$(echo "$PR_JSON" | jq -r '.headRepository.owner.login + "/" + .headRepository.name')" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.25.x'
+
+      - name: Checkout base main
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Install benchstat
+        run: go install golang.org/x/perf/cmd/benchstat@latest
+
+      - name: Check out PR code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ${{ steps.pr.outputs.head_repo }}
+          ref: ${{ steps.pr.outputs.head_ref }}
+          fetch-depth: 0
+
+      - name: Install benchstat
+        run: go install golang.org/x/perf/cmd/benchstat@latest
+
+      - name: Benchmark main branch
+        env:
+          BASE_REPO: ${{ github.repository }}
+        run: |
+          PR_COMMIT=$(git rev-parse HEAD)
+
+          git remote add upstream "https://github.com/${BASE_REPO}.git" 2>/dev/null || true
+          git fetch upstream main
+          git checkout upstream/main
+          make bench > /tmp/benchmark-main.txt || touch /tmp/benchmark-main.txt
+
+          git checkout "$PR_COMMIT"
+        shell: bash
+
+      - name: Benchmark PR code
+        run: |
+          make bench > /tmp/benchmark-pr.txt
+
+      - name: Compare benchmarks
+        run: |
+          benchstat /tmp/benchmark-main.txt /tmp/benchmark-pr.txt > benchmark-result.txt
+
+      - name: Comment PR with results
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6.4.1
+        with:
+          script: |
+            const fs = require('fs');
+            const benchmarkResult = fs.readFileSync('benchmark-result.txt', 'utf8');
+
+            // Collect all geomean percentages
+            const geomeanMatches = benchmarkResult.matchAll(/geomean\s+[\d\.µn]+\s+[\d\.µn]+\s+([+-]\d+\.\d+)%/g);
+            let totalChange = 0;
+            let count = 0;
+            
+            for (const match of geomeanMatches) {
+              totalChange += parseFloat(match[1]);
+              count++;
+            }
+            
+            const avgChange = count > 0 ? totalChange / count : 0;
+            
+            let header;
+            if (avgChange) {
+              if (avgChange < 0) {
+                header = `### ✅ Benchmark Results (${Math.abs(avgChange).toFixed(2)}% faster)`;
+              } else if (avgChange > 0) {
+                header = `### ❌ Benchmark Results (${avgChange.toFixed(2)}% slower)`;
+              } else {
+                header = `### ℹ️ Benchmark Results (no significant change)`;
+              }
+            } else {
+              header = `### ℹ️ Benchmark Results (no geomean data)`;
+            }
+            
+            const comment = `${header}\n\`\`\`\n${benchmarkResult}\n\`\`\``;
+
+            // Get existing comments to see if we previously posted a benchmark
+            const { data: existingComments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            
+            const existing = existingComments.find(c => c.body && c.body.includes('Benchmark Results'));
+            
+            if (existing) {
+              // Update the old comment
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: comment,
+              });
+            } else {
+              // Create a new comment
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: comment,
+              });
+            }
+

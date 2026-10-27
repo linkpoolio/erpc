@@ -1,0 +1,44 @@
+packages:
+  - path: "github.com/erpc/erpc/common"
+    output_path: "typescript/config/src/generated.ts"
+    flavor: "yaml"
+    type_mappings:
+      time.Duration: "number /* time in nanoseconds (time.Duration) */"
+      # The following doesn't work, cause tygo only replace types when it's an `ast.SelectorExpr`, and following types are simple `ast.Ident`
+      #  waiting for PR: https://github.com/gzuidhof/tygo/pull/74
+      # id_ConnectorDriverType: "TsConnectorDriverType"
+      # id_ConnectorConfig: "TsConnectorConfig"
+      # id_UpstreamType: "TsUpstreamType"
+      # id_NetworkArchitecture: "TsNetworkArchitecture"
+      # id_DurationString: "Duration"
+      # id_ByteSizeString: "ByteSize"
+    frontmatter: |
+      import type {
+        LogLevel,
+        Duration,
+        ByteSize,
+        ConnectorDriverType as TsConnectorDriverType,
+        ConnectorConfig as TsConnectorConfig,
+        UpstreamType as TsUpstreamType,
+        NetworkArchitecture as TsNetworkArchitecture,
+        AuthType as TsAuthType,
+        AuthStrategyConfig as TsAuthStrategyConfig,
+        EvmNetworkConfigForDefaults as TsEvmNetworkConfigForDefaults,
+        SelectionPolicyEvalFunction,
+        BoolOrString
+      } from "./types"
+    exclude_files:
+      - "utils.go"
+      - "thirdparty.go"
+      - "errors.go"
+      - "json_rpc.go"
+      - "request.go"
+      - "response.go"
+      - "duration.go"
+      - "defaults.go"
+      - "matcher.go"
+      - "runtime.go"
+      - "upstream_fake.go"
+      - "vendors.go"
+      - "tracing_core.go"
+      - "tracing_util.go"

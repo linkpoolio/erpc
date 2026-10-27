@@ -1,0 +1,496 @@
+---
+title: Consensus
+description: Consensus policy compares responses from multiple upstreams and returns the agreed result, detecting misbehaving nodes and providing deterministic behavior during faults.
+---
+
+import { Callout } from "nextra/components";
+import {
+	ConfigTabs,
+	ConfigCode,
+	AISection,
+	LLMsTxtLink,
+} from "../../../components";
+
+# Consensus
+
+<LLMsTxtLink />
+
+The `consensus` policy sends the same request to multiple upstreams in parallel and returns a result only when enough of them agree. This improves correctness, detects misbehaving nodes, and provides deterministic behavior during faults.
+
+**You can configure:**
+
+- How many upstreams participate and how many must agree (`maxParticipants`, `agreementThreshold`)
+- What to do when upstreams disagree or too few respond (`disputeBehavior`, `lowParticipantsBehavior`)
+- Which fields to exclude from comparison (`ignoreFields` — useful for timestamps and chain-specific extras)
+- How to prefer certain results (`preferNonEmpty`, `preferLargerResponses`, `preferHighestValueFor`)
+- How to track and penalize misbehaving upstreams (`punishMisbehavior`, `misbehaviorsDestination`)
+
+<Callout type="warning">
+  Consensus can only be configured at **network level** since it requires multiple upstreams to compare results.
+</Callout>
+
+<ConfigTabs
+	path="projects > networks > failsafe > consensus"
+	focus="8-21"
+	yaml={`projects:
+  - id: main
+    networks:
+      - architecture: evm
+        evm:
+          chainId: 42161
+        failsafe:
+          - matchMethod: "*"
+            consensus:
+              maxParticipants: 3
+              agreementThreshold: 2
+              disputeBehavior: acceptMostCommonValidResult
+              lowParticipantsBehavior: acceptMostCommonValidResult
+              preferNonEmpty: true
+              preferLargerResponses: true
+              punishMisbehavior:
+                disputeThreshold: 10
+                disputeWindow: 10m
+                sitOutPenalty: 30m`}
+	ts={`import { createConfig } from "@erpc-cloud/config";
+
+export default createConfig({
+  projects: [{
+    id: "main",
+    networks: [{
+      architecture: "evm",
+      evm: { chainId: 42161 },
+      failsafe: [{
+        matchMethod: "*",
+        consensus: {
+          maxParticipants: 3,
+          agreementThreshold: 2,
+          disputeBehavior: "acceptMostCommonValidResult",
+          lowParticipantsBehavior: "acceptMostCommonValidResult",
+          preferNonEmpty: true,
+          preferLargerResponses: true,
+          punishMisbehavior: {
+            disputeThreshold: 10,
+            disputeWindow: "10m",
+            sitOutPenalty: "30m",
+          },
+        },
+      }],
+    }],
+  }],
+});`}
+/>
+
+## Transaction inclusion with `preferHighestValueFor` and `fireAndForget`
+
+For reliable transaction submission, configure per-method consensus policies that pick the best values rather than requiring strict agreement:
+
+<ConfigTabs
+	path="projects > networks > failsafe > consensus"
+	focus="8-27"
+	yaml={`projects:
+  - id: main
+    networks:
+      - architecture: evm
+        evm:
+          chainId: 1
+        failsafe:
+          # 1. Nonce: always pick the highest to avoid 'nonce too low' errors
+          - matchMethod: eth_getTransactionCount
+            consensus:
+              maxParticipants: 3
+              agreementThreshold: 1
+              preferHighestValueFor:
+                eth_getTransactionCount: ["result"]
+
+          # 2. Gas fees: pick highest for better inclusion during congestion
+          - matchMethod: eth_gasPrice|eth_maxPriorityFeePerGas
+            consensus:
+              maxParticipants: 3
+              agreementThreshold: 1
+              preferHighestValueFor:
+                eth_gasPrice: ["result"]
+                eth_maxPriorityFeePerGas: ["result"]
+
+          # 3. Broadcast: fan-out to all nodes and return immediately
+          - matchMethod: eth_sendRawTransaction
+            consensus:
+              maxParticipants: 5
+              agreementThreshold: 1
+              fireAndForget: true`}
+	ts={`import { createConfig } from "@erpc-cloud/config";
+
+export default createConfig({
+  projects: [{
+    id: "main",
+    networks: [{
+      architecture: "evm",
+      evm: { chainId: 1 },
+      failsafe: [
+        {
+          matchMethod: "eth_getTransactionCount",
+          consensus: {
+            maxParticipants: 3,
+            agreementThreshold: 1,
+            preferHighestValueFor: { eth_getTransactionCount: ["result"] },
+          },
+        },
+        {
+          matchMethod: "eth_gasPrice|eth_maxPriorityFeePerGas",
+          consensus: {
+            maxParticipants: 3,
+            agreementThreshold: 1,
+            preferHighestValueFor: {
+              eth_gasPrice: ["result"],
+              eth_maxPriorityFeePerGas: ["result"],
+            },
+          },
+        },
+        {
+          matchMethod: "eth_sendRawTransaction",
+          consensus: {
+            maxParticipants: 5,
+            agreementThreshold: 1,
+            fireAndForget: true,
+          },
+        },
+      ],
+    }],
+  }],
+});`}
+/>
+
+## Misbehavior logging to S3
+
+Export full dispute events (JSONL) to S3 for offline analysis. Each record contains the full request, all participant responses, the analysis summary, and the winner:
+
+```yaml
+consensus:
+  maxParticipants: 3
+  agreementThreshold: 2
+  misbehaviorsDestination:
+    type: s3
+    path: s3://my-bucket/erpc-disputes
+    filePattern: "{dateByHour}/{networkId}/{method}-{instanceId}.jsonl"
+    s3:
+      region: us-east-1
+      maxRecords: 100
+      maxSize: 1048576        # 1 MB
+      flushInterval: 60s
+      contentType: application/jsonl
+      credentials:
+        mode: env             # picks AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY from env
+```
+
+<AISection title="Copy for your AI assistant — full consensus reference">
+
+### How consensus works
+
+1. Send the request to up to `maxParticipants` healthy upstreams in parallel; group identical results.
+2. If any valid group meets `agreementThreshold`, it wins.
+3. If no winner, apply behaviors: low participants → `lowParticipantsBehavior`; otherwise → `disputeBehavior`.
+4. Preferences (`preferNonEmpty`, `preferLargerResponses`, `preferHighestValueFor`) may override selection in specific contexts.
+5. Ties without preferences → dispute.
+6. All upstreams return identical error → return that error; otherwise return a low-participants error.
+
+Performance note: consensus increases costs and latency since it waits for multiple responses. Use it selectively for critical workloads rather than all methods.
+
+### `ConsensusPolicyConfig` — every field
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `maxParticipants` | int | — | Number of upstreams to query per round. The policy selects the first N healthy upstreams by score. |
+| `agreementThreshold` | int | `maxParticipants/2 + 1` | Minimum upstreams that must return identical results to declare a winner. |
+| `disputeBehavior` | string | `returnError` | What to do when upstreams disagree and no group meets threshold. See values below. |
+| `lowParticipantsBehavior` | string | `returnError` | What to do when fewer than `agreementThreshold` valid responses are available. See values below. |
+| `punishMisbehavior` | PunishMisbehaviorConfig | — | Optional. Temporarily removes upstreams that consistently dispute consensus. |
+| `disputeLogLevel` | string | `debug` | Verbosity of dispute log events: `trace`, `debug`, `info`, `warn`, `error`. |
+| `ignoreFields` | map[string]string[] | — | Per-method dot-path fields excluded from canonical hash comparison. |
+| `preferNonEmpty` | bool | `false` | Bias dispute resolution toward non-empty results over empty results or errors. |
+| `preferLargerResponses` | bool | `false` | When multiple valid groups exist, prefer the one with the largest response body. |
+| `misbehaviorsDestination` | MisbehaviorsDestinationConfig | — | Optional. Export full dispute events to a file or S3 prefix. |
+| `preferHighestValueFor` | map[string]string[] | — | Per-method field paths; picks the response with the highest numeric value at those paths. Used for nonces and gas prices. |
+| `fireAndForget` | bool | `false` | When `true`, return immediately upon reaching agreement without cancelling remaining in-flight requests. Ideal for broadcasts like `eth_sendRawTransaction`. |
+| `maxWaitOnResult` | AdaptiveDuration | `{ quantile: 0.5, min: 5ms, max: 1s }` | After the first **non-empty** response arrives, cancel remaining in-flight participants at most this long after. Bounds tail latency when one slow upstream drags the whole round. See "Tail-latency caps" below. |
+| `maxWaitOnEmpty` | AdaptiveDuration | `{ quantile: 0.9, min: 50ms, max: 2s }` | After the first response of **any kind** (empty, error, or non-empty) arrives, give remaining participants at most this long. Fires before `maxWaitOnResult` when only empties/errors have landed so far. |
+| `requiredParticipants` | `{ tag, minParticipants }[]` | — | Optional. Enforce a minimum number of participants carrying a given tag (e.g. region/provider diversity). Off by default. See "Tag-based participant quotas" below. |
+
+### `disputeBehavior` values
+
+| Value | Behavior |
+|---|---|
+| `returnError` | Always return a dispute error when no group meets threshold. |
+| `acceptMostCommonValidResult` | Apply preferences and select the best valid result; if no group meets threshold, return dispute. |
+| `preferBlockHeadLeader` | If the upstream with the highest block number has a non-error result, return it; otherwise fall back to `acceptMostCommonValidResult`. |
+| `onlyBlockHeadLeader` | Return the block head leader's non-error result if available; otherwise dispute. |
+
+The **block head leader** is the upstream reporting the highest block number, determined by each upstream's state poller.
+
+### `lowParticipantsBehavior` values
+
+Same set of values as `disputeBehavior`, with one addition:
+
+| Value | Behavior |
+|---|---|
+| `returnError` | Return a low-participants error. |
+| `acceptMostCommonValidResult` | Apply preferences to pick a valid result; still respects threshold semantics. |
+| `preferBlockHeadLeader` | If the block head leader has a non-error result, return it; otherwise fall back to `acceptMostCommonValidResult`. |
+| `onlyBlockHeadLeader` | If the leader has a non-error result, return it; if only an error, return that error; otherwise return a low-participants error. |
+
+### Tag-based participant quotas (`requiredParticipants`)
+
+By default consensus fills its `maxParticipants` slots with the first N healthy upstreams by score. `requiredParticipants` adds a per-tag floor on top of that: each entry says "at least `minParticipants` of the participants must carry `tag`". Use it for diversity guarantees — e.g. always include a node from a second region or a second provider in every consensus round.
+
+The engine front-loads enough tag-matching upstreams into the participant set so the first `maxParticipants` drawn satisfy every entry. It does **not** change `maxParticipants`, and it leaves the order of non-required participants (their score ranking) intact — only set *membership* matters for voting.
+
+```yaml
+consensus:
+  maxParticipants: 3
+  agreementThreshold: 2
+  requiredParticipants:
+    - tag: "region:us-*"   # glob; matched against each upstream's tags
+      minParticipants: 1   # ≥1 US participant every round
+    - tag: "provider:quicknode"
+      minParticipants: 1   # ≥1 QuickNode participant every round
+```
+
+Tag the upstreams accordingly:
+
+```yaml
+upstreams:
+  - id: alchemy-us
+    tags: [region:us-east, provider:alchemy]
+  - id: quicknode-eu
+    tags: [region:eu-west, provider:quicknode]
+  # ...
+```
+
+Semantics:
+
+- **Off by default** — omit `requiredParticipants` and consensus behaves exactly as before.
+- **Best-effort** — if a required group has fewer healthy upstreams than `minParticipants` (or the quotas can't all fit within `maxParticipants`), consensus runs with what it can promote and the resulting participation is handled by your existing `lowParticipantsBehavior` / `agreementThreshold` — exactly like any organic low-participation round. No new failure mode is introduced.
+- **Healthy-only** — quotas are satisfied from the upstreams already eligible for this request (post selection-policy filtering), so a cordoned or excluded upstream is never forced in.
+- **`tag`** is a glob pattern (`*`, `?`); a single upstream can satisfy multiple entries it matches.
+
+### `preferNonEmpty` semantics
+
+Prioritizes meaningful data over empty responses, and empty over errors:
+
+- **Above threshold**: if both a non-empty and a consensus-valid error group meet threshold, pick the best non-empty (by count, then size).
+- **Below threshold**: with exactly one non-empty and at least one empty, pick the non-empty.
+- Prevents short-circuiting to empty or consensus-error when a non-empty result may still arrive.
+
+### `preferLargerResponses` semantics
+
+- Below threshold with `acceptMostCommonValidResult`: choose the largest non-empty.
+- Above threshold with multiple valid groups: choose the largest non-empty.
+- If a smaller non-empty meets threshold but a larger non-empty exists:
+  - `acceptMostCommonValidResult` → choose the largest.
+  - `returnError` → dispute (don't accept the smaller).
+
+### Tail-latency caps (`maxWaitOnResult` / `maxWaitOnEmpty`)
+
+When one participant is consistently slow — e.g. a 10 s archive query while siblings return in 50 ms — that single laggard drags the whole request's wall-clock. The wait caps bound this **after the first response arrives**:
+
+| Field | Triggers when |
+|---|---|
+| `maxWaitOnResult` | At least one **non-empty** response is in the bag. |
+| `maxWaitOnEmpty` | The first response of any kind — empty, error, or non-empty — is in the bag. |
+
+When the cap fires, the analyzer resolves with what it has using the configured `disputeBehavior` / `lowParticipantsBehavior`. In-flight participants are cancelled (or left running under `fireAndForget`). The earlier of the two caps wins.
+
+**Defaults** (applied whenever `consensus` is configured):
+
+| Cap | Default value |
+|---|---|
+| `maxWaitOnResult` | `{ quantile: 0.5, min: 5ms, max: 1s }` — once any real answer is in, give the rest at most ~p50 of observed latency. |
+| `maxWaitOnEmpty` | `{ quantile: 0.9, min: 50ms, max: 2s }` — wait longer when only empties/errors have arrived, since a real answer might still land. |
+
+The quantiles read from the same per-method DDSketch the timeout policy uses. Adaptive caps self-tune across methods — `eth_chainId` (typical p50 ~5ms) gets a tight cap; `eth_getLogs` over a wide range (typical p50 ~200ms) gets a proportional one.
+
+**Static overrides** when you'd rather not adapt:
+
+```yaml
+consensus:
+  maxParticipants:    5
+  agreementThreshold: 3
+  maxWaitOnResult:    200ms     # static: scalar shorthand
+  maxWaitOnEmpty:     2s        # static: scalar shorthand
+```
+
+**Custom adaptive bounds:**
+
+```yaml
+consensus:
+  maxParticipants:    5
+  agreementThreshold: 3
+  maxWaitOnResult:
+    quantile: 0.5
+    min:      10ms
+    max:      500ms
+  maxWaitOnEmpty:
+    quantile: 0.9
+    min:      100ms
+    max:      3s
+```
+
+The `erpc_consensus_wait_capped_total{trigger}` metric counts firings by trigger (`result` or `empty`); a high rate signals an upstream that should be tightened or dropped from the pool.
+
+### `ignoreFields` — matcher syntax
+
+`ignoreFields` is a map of JSON-RPC method name → list of dot-path field patterns to exclude from canonical hash comparison. Useful for fields that legitimately differ across upstreams (timestamps, chain-specific extras).
+
+Dot-path syntax:
+- `fieldName` — top-level field
+- `a.b.c` — nested path
+- `*.fieldName` — wildcard at any array index (e.g. `*.blockTimestamp` in an array of receipts)
+- `transactions.*.gasPrice` — field inside every element of a nested array
+
+Example — real-world safe-to-ignore fields:
+
+```yaml
+ignoreFields:
+  eth_getLogs:
+    - "*.blockTimestamp"
+  eth_getTransactionReceipt:
+    - "blockTimestamp"
+    - "logs.*.blockTimestamp"
+    - "l1Fee"
+    - "l1GasPrice"
+    - "l1GasUsed"
+    - "gasUsedForL1"
+    - "timeboosted"
+    - "l1BlockNumber"
+  eth_getBlockByHash:
+    - "requestsHash"
+    - "transactions.*.gasPrice"
+    - "transactions.*.accessList"
+    - "transactions.*.chainId"
+    - "transactions.*.l1Fee"
+    - "transactions.*.yParity"
+    - "transactions.*.isSystemTx"
+    - "transactions.*.depositReceiptVersion"
+  eth_getBlockByNumber:
+    - "requestsHash"
+    - "transactions.*.gasPrice"
+    - "transactions.*.accessList"
+    - "transactions.*.chainId"
+    - "transactions.*.l1Fee"
+    - "transactions.*.yParity"
+    - "transactions.*.isSystemTx"
+    - "transactions.*.depositReceiptVersion"
+  eth_getBlockReceipts:
+    - "*.blockTimestamp"
+    - "*.l1Fee"
+    - "*.l1GasPrice"
+    - "*.l1GasUsed"
+    - "*.logs.*.blockTimestamp"
+```
+
+### `PunishMisbehaviorConfig` — every field
+
+| Field | Notes |
+|---|---|
+| `disputeThreshold` | Number of disputes before an upstream is penalized (e.g. `10` = penalize after 10 strikes). |
+| `disputeWindow` | Time window for counting disputes (e.g. `10m`). Counter resets after the window. |
+| `sitOutPenalty` | How long the upstream is excluded from consensus after hitting the threshold (e.g. `30m`). |
+
+### `MisbehaviorsDestinationConfig` — every field
+
+| Field | Notes |
+|---|---|
+| `type` | `file` or `s3`. |
+| `path` | For `file`: absolute path to the destination **directory** (must be absolute). eRPC creates it with `mkdir -p` semantics on boot if it doesn't exist. Each misbehavior event is appended to a file inside the directory whose name is resolved from `filePattern` at write time — when `filePattern` includes `{dateByDay}` or `{dateByHour}`, you get implicit time-based bucketing (one file per day / hour). There is no automatic file rotation; use an external log-rotation tool if you need to bound file size. For `s3`: `s3://bucket/prefix`. |
+| `filePattern` | Filename template. See placeholders below. Default: `{timestampMs}-{method}-{networkId}.jsonl`. |
+| `s3` | S3FlushConfig block — required when `type: s3`. |
+
+`filePattern` placeholders:
+
+| Placeholder | Value |
+|---|---|
+| `{dateByHour}` | UTC hour — `YYYY-MM-DD-HH` |
+| `{dateByDay}` | UTC day — `YYYY-MM-DD` |
+| `{method}` | JSON-RPC method name |
+| `{networkId}` | Network ID with `:` replaced by `_` |
+| `{instanceId}` | Unique instance ID (auto-derived from env / pod / hostname, or generated) |
+| `{timestampMs}` | UTC timestamp in milliseconds — avoids key collisions on S3 |
+
+Notes:
+- File writes use atomic append. Use external rotation for large volumes.
+- S3 uploads are buffered and flushed by record count, byte size, or time interval.
+- Each record is a JSONL line containing: full JSON-RPC request, all participant responses or errors, analysis summary, winner, and policy snapshot. No truncation.
+
+### `S3FlushConfig` — every field
+
+| Field | Default | Notes |
+|---|---|---|
+| `region` | — | AWS region for the S3 bucket. If omitted, eRPC falls back to the `AWS_REGION` environment variable. If neither is set, S3 flush fails on the first attempt with a region-required error. |
+| `maxRecords` | — | Flush buffer after this many records. |
+| `maxSize` | — | Flush buffer after this many bytes (e.g. `1048576` for 1 MB). |
+| `flushInterval` | — | Flush buffer after this duration even if size/count thresholds are not met (e.g. `60s`). |
+| `contentType` | `application/jsonl` | MIME type written to the S3 object metadata. |
+| `credentials` | — | S3CredentialsConfig — see below. |
+
+S3 credentials modes:
+
+| `mode` | Extra fields | Notes |
+|---|---|---|
+| `env` | — | Reads `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` from the environment. No additional fields needed. |
+| `file` | `credentialsFile` (path to credentials file), `profile` (profile name within that file, optional) | Reads from a standard AWS credentials file. Example: `credentialsFile: /etc/erpc/aws-credentials`, `profile: my-profile`. |
+| `secret` | `accessKeyID`, `secretAccessKey` | Inline credentials. Use env-var interpolation (`${VAR}` in YAML) to avoid committing secrets. Prefer `env` or `file` modes in production. |
+
+The same `AwsAuthConfig` block is used for DynamoDB cache credentials — see the [DynamoDB driver reference](/config/database/drivers#dynamodb) for worked examples with each mode.
+
+### Common pitfalls
+
+- **`agreementThreshold` too low** — `agreementThreshold: 1` means any single upstream wins, which defeats the purpose of consensus entirely (equivalent to no consensus). Use at least `maxParticipants/2 + 1` for majority voting.
+- **`ignoreFields` too aggressive** — ignoring structural fields like `blockHash` or `transactionIndex` can mask real disagreements. Only ignore fields you have verified are non-deterministic across correct nodes.
+- **S3 costs at high dispute rates** — if many methods dispute frequently, misbehavior logging can generate substantial S3 traffic. Start with `file` type and switch to S3 after validating dispute volume.
+- **`disputeBehavior: returnError` in production** — this surfaces disputes as errors to clients, which can cause retries and amplify load. Prefer `acceptMostCommonValidResult` unless you specifically need strict failure signaling.
+- **`fireAndForget: true` on read methods** — designed for broadcast writes. On read methods, it causes unnecessary in-flight requests that consume upstream quota without benefiting the client.
+- **Forgetting to scale `maxParticipants` with upstream count** — if you have only 2 upstreams but set `maxParticipants: 3`, the policy silently proceeds with 2 and requires both to agree (or triggers `lowParticipantsBehavior`).
+- **`punishMisbehavior` with a very short `disputeWindow`** — a 1-second window combined with a low `disputeThreshold` can cause flapping. Use windows of minutes and thresholds of 10+ for production.
+
+### Real-world examples
+
+**Multi-chain correctness check — require majority agreement:**
+
+```yaml
+failsafe:
+  - matchMethod: "eth_call|eth_getBalance|eth_getLogs"
+    consensus:
+      maxParticipants: 3
+      agreementThreshold: 2
+      disputeBehavior: acceptMostCommonValidResult
+      preferNonEmpty: true
+      ignoreFields:
+        eth_getLogs: ["*.blockTimestamp"]
+      punishMisbehavior:
+        disputeThreshold: 5
+        disputeWindow: 5m
+        sitOutPenalty: 15m
+```
+
+**Archive node — accept best available when data is sparse:**
+
+```yaml
+failsafe:
+  - matchMethod: "eth_getBlockByNumber|eth_getBlockByHash"
+    consensus:
+      maxParticipants: 2
+      agreementThreshold: 1
+      disputeBehavior: preferBlockHeadLeader
+      ignoreFields:
+        eth_getBlockByNumber:
+          - "requestsHash"
+          - "transactions.*.accessList"
+```
+
+**Transaction pipeline — nonce, gas, broadcast:**
+
+See the [transaction inclusion example](#transaction-inclusion-with-preferhighestvaluefor-and-fireandforget) at the top of this page.
+
+</AISection>
+
+<Callout type="tip">
+	Append `.llms.txt` to this URL (or use the **AI** link above) to fetch the entire expanded reference as plain markdown for an AI assistant.
+</Callout>

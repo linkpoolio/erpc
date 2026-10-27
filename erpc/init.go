@@ -1,0 +1,160 @@
+package erpc
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"time"
+
+	"github.com/erpc/erpc/architecture/evm"
+	"github.com/erpc/erpc/common"
+	"github.com/erpc/erpc/data"
+	"github.com/erpc/erpc/telemetry"
+	"github.com/erpc/erpc/util"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/rs/zerolog"
+)
+
+func Init(
+	appCtx context.Context,
+	cfg *common.Config,
+	logger zerolog.Logger,
+) error {
+	//
+	// 1) Set the right log level depending on the configuration
+	//
+	level, err := zerolog.ParseLevel(cfg.LogLevel)
+	if err != nil {
+		logger.Warn().Msgf("invalid log level '%s', defaulting to 'debug': %s", cfg.LogLevel, err)
+		level = zerolog.DebugLevel
+	} else {
+		logger = logger.Level(level)
+	}
+
+	if logger.GetLevel() <= zerolog.InfoLevel {
+		finalCfgJson, err := common.SonicCfg.Marshal(cfg)
+		if err != nil {
+			logger.Warn().Msgf("failed to marshal final configuration for tracing: %v", err)
+		} else {
+			logger.Info().RawJSON("config", finalCfgJson).Msg("")
+		}
+	}
+
+	//
+	// 2) Set the right histogram buckets and label filter
+	//
+	bucketStr := ""
+	if cfg.Metrics != nil {
+		if cfg.Metrics.HistogramBuckets != "" {
+			bucketStr = cfg.Metrics.HistogramBuckets
+		}
+		// Must run before SetHistogramBuckets so the new Vecs are built with the filter applied.
+		telemetry.SetHistogramLabelFilter(cfg.Metrics.HistogramDropLabels, cfg.Metrics.HistogramLabelOverrides)
+	}
+	if err := telemetry.SetHistogramBuckets(bucketStr); err != nil {
+		logger.Warn().Err(err).Msg("failed to set histogram buckets, using defaults")
+	}
+
+	//
+	// 3) Initialize eRPC
+	//
+	logger.Info().Msg("initializing eRPC core")
+	var evmJsonRpcCache *evm.EvmJsonRpcCache
+	var sharedState data.SharedStateRegistry
+	if cfg.Database != nil {
+		if cfg.Database.EvmJsonRpcCache != nil {
+			evmJsonRpcCache, err = evm.NewEvmJsonRpcCache(appCtx, &logger, cfg.Database.EvmJsonRpcCache)
+			if err != nil {
+				logger.Warn().Msgf("failed to initialize evm json rpc cache: %v", err)
+			}
+		}
+		if cfg.Database.SharedState != nil {
+			sharedState, err = data.NewSharedStateRegistry(appCtx, &logger, cfg.Database.SharedState)
+			if err != nil {
+				logger.Warn().Msgf("failed to initialize shared state registry: %v", err)
+			}
+		}
+	}
+	erpcInstance, err := NewERPC(appCtx, &logger, sharedState, evmJsonRpcCache, cfg)
+	if err != nil {
+		return err
+	}
+
+	// Bootstrap core before starting servers so routes are ready
+	erpcInstance.Bootstrap(appCtx)
+
+	//
+	// 4) Expose Transports
+	//
+	logger.Info().Msg("initializing transports")
+	if cfg.Server != nil {
+		httpServer, err := NewHttpServer(appCtx, &logger, cfg.Server, cfg.HealthCheck, cfg.Admin, cfg.Indexer, erpcInstance)
+		if err != nil {
+			return err
+		}
+		go func() {
+			if err := httpServer.Start(&logger); err != nil {
+				if err != http.ErrServerClosed {
+					logger.Error().Msgf("failed to start http server: %v", err)
+					util.OsExit(util.ExitCodeHttpServerFailed)
+				}
+			}
+		}()
+	}
+	if cfg.Server != nil && cfg.Server.GrpcEnabled != nil && *cfg.Server.GrpcEnabled && !grpcSharesHttpV4(cfg.Server) {
+		grpcServer, err := NewGrpcServer(appCtx, &logger, cfg.Server, erpcInstance)
+		if err != nil {
+			return err
+		}
+		go func() {
+			if err := grpcServer.Start(&logger); err != nil {
+				logger.Error().Msgf("failed to start gRPC server: %v", err)
+				util.OsExit(util.ExitCodeHttpServerFailed)
+			}
+		}()
+	}
+	if cfg.Metrics != nil && cfg.Metrics.Enabled != nil && *cfg.Metrics.Enabled {
+		if cfg.Metrics.ErrorLabelMode != "" {
+			common.SetErrorLabelMode(cfg.Metrics.ErrorLabelMode)
+		}
+		if cfg.Metrics.Port == nil {
+			return fmt.Errorf("metrics.port is not configured")
+		}
+		logger.Info().Msgf("starting metrics server on port: %d", *cfg.Metrics.Port)
+		srv := &http.Server{
+			BaseContext: func(ln net.Listener) context.Context {
+				return appCtx
+			},
+			Addr:              fmt.Sprintf(":%d", *cfg.Metrics.Port),
+			Handler:           promhttp.Handler(),
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		go func() {
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logger.Error().Msgf("error starting metrics server: %s", err)
+				util.OsExit(util.ExitCodeHttpServerFailed)
+			}
+		}()
+		go func() {
+			<-appCtx.Done()
+			logger.Info().Msg("shutting down metrics server...")
+			shutdownCtx, cancel := context.WithTimeout(appCtx, 5*time.Second)
+			defer cancel()
+			if err := srv.Shutdown(shutdownCtx); err != nil {
+				logger.Error().Msgf("metrics server forced to shutdown: %s", err)
+			} else {
+				logger.Info().Msg("metrics server stopped")
+			}
+		}()
+	}
+
+	// Wait until the context is cancelled, then give the http server some time to finish draining.
+	<-appCtx.Done()
+	logger.Info().Msg("shutting down gracefully...")
+	if cfg.Server != nil && cfg.Server.WaitAfterShutdown != nil {
+		time.Sleep(cfg.Server.WaitAfterShutdown.Duration())
+	}
+
+	return nil
+}

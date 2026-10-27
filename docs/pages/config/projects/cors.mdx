@@ -1,0 +1,222 @@
+---
+title: CORS
+description: Configure Cross-Origin Resource Sharing (CORS) per project so browser-based frontends can call eRPC directly — control which origins, methods, and headers are permitted.
+---
+
+import { Callout } from "nextra/components";
+import { ConfigTabs, ConfigCode, AISection, LLMsTxtLink } from "../../../components";
+
+# CORS
+
+<LLMsTxtLink />
+
+When your frontend calls eRPC directly from the browser, you need CORS configured so browsers allow the cross-origin request. eRPC evaluates the `Origin` header on every incoming request and, when it matches an allowed origin, adds the appropriate `Access-Control-*` response headers.
+
+**You can configure:**
+
+- **`allowedOrigins`** — exact origins or wildcard-subdomain patterns (e.g. `https://*.example.com`)
+- **`allowedMethods`** — HTTP methods browsers may use (`GET`, `POST`, `OPTIONS`)
+- **`allowedHeaders`** — request headers the browser may send
+- **`exposedHeaders`** — response headers the browser JS may read
+- **`allowCredentials`** — whether cookies / auth headers are included
+- **`maxAge`** — how long (seconds) the browser caches a preflight response
+
+## Minimal config — single origin
+
+<ConfigTabs
+  path="projects > cors"
+  focus="3-10"
+  yaml={`projects:
+  - id: main
+    cors:
+      allowedOrigins:
+        - "https://app.example.com"
+      allowedMethods:
+        - "GET"
+        - "POST"
+        - "OPTIONS"
+      allowedHeaders:
+        - "Content-Type"
+    upstreams:
+      - endpoint: alchemy://\${ALCHEMY_KEY}`}
+  ts={`import { createConfig } from "@erpc-cloud/config";
+
+export default createConfig({
+  projects: [{
+    id: "main",
+    cors: {
+      allowedOrigins: ["https://app.example.com"],
+      allowedMethods: ["GET", "POST", "OPTIONS"],
+      allowedHeaders: ["Content-Type"],
+    },
+    upstreams: [{ endpoint: \`alchemy://\${process.env.ALCHEMY_KEY}\` }],
+  }],
+});`}
+/>
+
+## Wildcard subdomains + credentials
+
+Allow any subdomain and include cookies or `Authorization` headers. Note: `allowCredentials: true` requires an explicit origin — `"*"` is rejected by browsers.
+
+<ConfigTabs
+  path="projects > cors"
+  focus="3-12"
+  yaml={`projects:
+  - id: main
+    cors:
+      allowedOrigins:
+        - "https://*.example.com"
+      allowedMethods:
+        - "GET"
+        - "POST"
+        - "OPTIONS"
+      allowedHeaders:
+        - "Content-Type"
+        - "Authorization"
+      exposedHeaders:
+        - "X-Request-ID"
+      allowCredentials: true
+      maxAge: 3600`}
+  ts={`import { createConfig } from "@erpc-cloud/config";
+
+export default createConfig({
+  projects: [{
+    id: "main",
+    cors: {
+      allowedOrigins: ["https://*.example.com"],
+      allowedMethods: ["GET", "POST", "OPTIONS"],
+      allowedHeaders: ["Content-Type", "Authorization"],
+      exposedHeaders: ["X-Request-ID"],
+      allowCredentials: true,
+      maxAge: 3600,
+    },
+  }],
+});`}
+/>
+
+## Development (localhost)
+
+<ConfigTabs
+  path="projects > cors"
+  focus="3-8"
+  yaml={`projects:
+  - id: main
+    cors:
+      allowedOrigins:
+        - "http://localhost:3000"
+        - "http://127.0.0.1:3000"
+      allowedMethods:
+        - "GET"
+        - "POST"
+        - "OPTIONS"
+      allowedHeaders:
+        - "*"
+      allowCredentials: true
+      maxAge: 86400`}
+  ts={`import { createConfig } from "@erpc-cloud/config";
+
+export default createConfig({
+  projects: [{
+    id: "main",
+    cors: {
+      allowedOrigins: [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+      ],
+      allowedMethods: ["GET", "POST", "OPTIONS"],
+      allowedHeaders: ["*"],
+      allowCredentials: true,
+      maxAge: 86400,
+    },
+  }],
+});`}
+/>
+
+<AISection title="Copy for your AI assistant — full CORS reference">
+
+### `CORSConfig` — all fields
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `allowedOrigins` | `string[]` | `[]` | Origins permitted to make cross-origin requests. Supports exact strings (`https://app.example.com`) and wildcard-subdomain patterns (`https://*.example.com`). Use `["*"]` to allow any origin — but NOT with `allowCredentials: true`. |
+| `allowedMethods` | `string[]` | `[]` | HTTP methods the browser may use. For JSON-RPC over POST, minimum is `["POST", "OPTIONS"]`. Include `GET` if you also serve REST-style endpoints. |
+| `allowedHeaders` | `string[]` | `[]` | Request headers the browser is allowed to send. Use `["*"]` to allow all headers (non-standard headers still require explicit listing in some older browsers). Typical set: `["Content-Type", "Authorization"]`. |
+| `exposedHeaders` | `string[]` | `[]` | Response headers the browser JS may read via `response.headers.get(...)`. By default only a small safe-listed set (`Cache-Control`, `Content-Language`, `Content-Type`, `Expires`, `Last-Modified`, `Pragma`) is accessible. |
+| `allowCredentials` | `bool` | `false` | When `true`, tells browsers to include cookies, `Authorization` headers, and TLS client certs. **Cannot be combined with `allowedOrigins: ["*"]`** — browsers will block the response. |
+| `maxAge` | `int` | `0` | Seconds the browser caches the preflight (`OPTIONS`) response. Reduces preflight round-trips. Common values: `300` (5 min), `3600` (1 h). Maximum varies by browser — Chrome caps at 7200, Firefox at 86400. |
+
+### Where CORS lives
+
+CORS is configured per project, directly under the project object:
+
+```yaml
+projects:
+  - id: main
+    cors:
+      allowedOrigins: ["https://app.example.com"]
+      # ...
+```
+
+There is no global CORS config — each project sets its own policy. This lets you lock down a `frontend` project to your app's domain while keeping a `backend` project unrestricted (no CORS headers at all).
+
+The admin HTTP server (`adminServer`) does not share the project CORS config. If you expose an admin UI in a browser context, restrict it via network/firewall rather than CORS.
+
+### Origin matching rules
+
+eRPC matches the request's `Origin` header against each entry in `allowedOrigins` in order:
+
+- **Exact match**: `"https://app.example.com"` matches only that origin.
+- **Wildcard subdomain**: `"https://*.example.com"` matches `https://app.example.com`, `https://staging.example.com`, etc. The `*` matches exactly one label — `https://a.b.example.com` does NOT match `https://*.example.com`.
+- **Wildcard all origins**: `"*"` matches every origin. Only safe when `allowCredentials: false`.
+
+If no entry matches, eRPC returns the response without any `Access-Control-*` headers. The browser then blocks the response for cross-origin JS callers (standards-compliant behavior — the server never hard-drops the request).
+
+### Preflight (OPTIONS) handling
+
+Browsers send an `OPTIONS` preflight before any cross-origin request that is not a "simple request" (e.g. uses `POST` with `Content-Type: application/json`, or custom headers). eRPC automatically handles the `OPTIONS` preflight when the origin matches — it returns `200 OK` with the `Access-Control-*` headers and does not forward the preflight to an upstream.
+
+Always include `"OPTIONS"` in `allowedMethods` if you want preflights to succeed.
+
+### Full example — browser frontend + multi-project
+
+```yaml
+projects:
+  # Browser dApp — tight CORS, no credentials
+  - id: frontend
+    cors:
+      allowedOrigins:
+        - "https://app.example.com"
+        - "https://*.app.example.com"
+      allowedMethods:
+        - "GET"
+        - "POST"
+        - "OPTIONS"
+      allowedHeaders:
+        - "Content-Type"
+      exposedHeaders:
+        - "X-Request-ID"
+      allowCredentials: false
+      maxAge: 3600
+    upstreams:
+      - endpoint: alchemy://${ALCHEMY_KEY}
+
+  # Backend indexer — no CORS needed (server-to-server)
+  - id: indexer
+    upstreams:
+      - endpoint: ${ARCHIVE_NODE_URL}
+```
+
+### Common pitfalls
+
+- **`allowCredentials: true` with `allowedOrigins: ["*"]`** — browsers refuse the response with a CORS error. You must list explicit origins when credentials are enabled.
+- **Missing `"OPTIONS"` in `allowedMethods`** — preflight is answered without the methods header; browsers block the actual request.
+- **`maxAge` above the browser cap** — Chrome silently caps at 7200 s, Firefox at 86400 s. Setting a higher value has no effect and may mislead you about cache TTL.
+- **Case sensitivity of header names** — `allowedHeaders` entries are matched case-insensitively by eRPC, but list them in their canonical form (e.g. `Content-Type`, not `content-type`) for clarity.
+- **Wildcard subdomain too broad** — `https://*.example.com` also matches `https://evil.example.com` if an attacker can create a subdomain. Combine with auth strategies for production frontends.
+- **No CORS on the admin server** — admin endpoints (`:9090/admin/...`) do not inherit project CORS. Do not expose the admin port publicly; restrict via network rules.
+
+</AISection>
+
+<Callout type="tip">
+  Append `.llms.txt` to this URL (or use the **AI** link above) to fetch the entire expanded reference as plain markdown for an AI assistant.
+</Callout>

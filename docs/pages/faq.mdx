@@ -1,0 +1,70 @@
+---
+title: FAQ
+description: Frequently asked questions about running, configuring, and troubleshooting eRPC.
+---
+
+import { LLMsTxtLink, ConfigTabs } from "../components";
+
+## Frequently Asked Questions
+
+<LLMsTxtLink />
+
+### How to set env variables?
+
+To use env variables in [erpc.yaml](/config/example), follow these steps:
+
+1. **Set env variables**: Define the env variables in your system or shell before running your application:
+
+```bash
+export ETHEREUM_RPC_URL=https://mainnet.infura.io/v3/YOUR_INFURA_KEY
+````
+
+2. **Use placeholders in config**: Add placeholders in your config file where you want the env variables to be used:
+
+<ConfigTabs
+  path="projects > upstreams[]"
+  yaml={`projects:
+  - id: main
+    upstreams:
+      - endpoint: \${ETHEREUM_RPC_URL}`}
+  ts={`projects: [{
+  id: "main",
+  upstreams: [
+    { endpoint: process.env.ETHEREUM_RPC_URL },
+  ],
+}]`}
+/>
+
+### How to disable caching?
+
+To disable caching, set [`evmJsonRpcCache`](/config/database/evm-json-rpc-cache) to `null` in your configuration:
+
+<ConfigTabs
+  path="database > evmJsonRpcCache"
+  yaml={`database:
+  evmJsonRpcCache: ~`}
+  ts={`database: {
+  evmJsonRpcCache: null,
+}`}
+/>
+
+### How do I set up CORS for frontend usage?
+
+If you’re deploying eRPC on Railway (or elsewhere) and plan to call it directly from a web application in the browser, you must enable CORS in your [erpc.yaml](/config/projects/cors#config). Below is a minimal example that allows requests from a specific origin or any origin:
+
+```yaml filename="erpc.yaml"
+projects:
+  - id: main
+    cors:
+      allowedOrigins: 
+        # If you want to allow all origins, use "*" which means any frontend can make calls to your erpc instance
+        - "https://myapp.com"
+      allowedMethods: 
+        - "GET"
+        - "POST"
+        - "OPTIONS"
+      allowedHeaders:
+        - "Content-Type"
+      allowCredentials: false
+      maxAge: 300
+```

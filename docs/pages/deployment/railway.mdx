@@ -1,0 +1,78 @@
+---
+title: Railway
+description: One-click deploy template for eRPC on Railway.
+---
+
+import { Steps, Callout } from "nextra/components";
+import { LLMsTxtLink } from "../../components";
+
+# Railway installation
+
+<LLMsTxtLink />
+
+[Railway](https://railway.app) provides a quick and easy way to deploy eRPC. To get started, please ensure that you have signed up or logged in to Railway and connected your GitHub account.
+
+<Steps>
+
+### Deploy
+
+Click the `Deploy on Railway` button below to get started. This will take you to our eRPC template, which includes proxy and monitoring services.
+
+[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/template/10iW1q)
+
+<Callout type="info">
+  This template comes with a default [erpc.yaml](/config/projects/providers#repository) configuration that will give you access to 2,000+ chains and 4,000+ public free EVM RPC endpoints.
+</Callout>
+
+### Config customizaiton 
+
+<Callout type="warning">
+  **Frontend / browser usage?** If you plan to consume eRPC from a frontend (e.g browser), be sure to set up 
+  the appropriate CORS headers in your [erpc.yaml](/config/projects/cors#config) configuration. 
+</Callout>
+
+  If you need further [customization](/config/example#full-config-example), you can fork the [template's repository](https://github.com/erpc/railway-deployment). E.g. you can create an `erpc.yaml` file in your forked repository to add your own premium RPC endpoints, caching, customised network or upstream level failsafe configs, etc. 
+
+  After forking and adjustments, you can either connect your forked repository to your existing deployment or create a new service linked to this forked repository.
+
+  ![image](https://i.imgur.com/xZQudNq.png)
+
+### Usage in your services
+
+If your backend services (like indexers or MEV bots) are on the same Railway project as eRPC, you can reduce cost and overhead by using private networking (`.railway.internal`) to connect:
+
+```js
+const result = await fetch("https://my-erpc.railway.internal/main/evm/1", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+  },
+  body: JSON.stringify({
+    method: "eth_getBlockByNumber",
+    params: ["0x1203319", false],
+    id: 9199,
+    jsonrpc: "2.0",
+  }),
+});
+```
+
+If you need external access or your services are hosted elsewhere, use the public URL found under `Settings > Networking > Public Networking` in your eRPC service:
+
+![image](https://i.imgur.com/WRezSaK.png)
+
+### Monitoring
+
+After sending more requests, click on `monitoring` service and find your Grafana url under `Settings > Networking > Public Networking`
+
+You can login with the following credentials:
+
+- username: `admin`
+- password: `admin`
+
+![image](https://i.imgur.com/sOpBuXe.png)
+
+Send more requests and watch the metrics being collected and visualized in Grafana.
+
+![image](https://i.imgur.com/2aOA960.png)
+
+</Steps>

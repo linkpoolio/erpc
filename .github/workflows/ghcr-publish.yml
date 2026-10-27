@@ -45,18 +45,26 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Set build metadata
         id: meta
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
+          if [[ ! "$INPUT_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "::error::invalid image tag"
+            exit 1
+          fi
           SHA="$(git rev-parse HEAD)"
           SHORT="$(git rev-parse --short HEAD)"
           IMAGE="ghcr.io/linkpoolio/docker-images/erpc"
           echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
           echo "short_sha=${SHORT}" >> "$GITHUB_OUTPUT"
           echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
-          echo "Building ref=${{ inputs.ref }} sha=${SHORT} → ${IMAGE}:${{ inputs.tag }}"
+          echo "Building ref=${INPUT_REF} sha=${SHORT} → ${IMAGE}:${INPUT_TAG}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -84,5 +92,8 @@ jobs:
           sbom: false
 
       - name: Print digest
+        env:
+          IMAGE: ${{ steps.meta.outputs.image }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          docker buildx imagetools inspect "${{ steps.meta.outputs.image }}:${{ inputs.tag }}"
+          docker buildx imagetools inspect "${IMAGE}:${INPUT_TAG}"

@@ -1,0 +1,562 @@
+name: release
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: 'Version tag for the release (e.g., 1.0.0)'
+        required: true
+  push:
+    branches:
+      - main
+
+permissions: read-all
+
+jobs:
+  # Prepare the release branch - only on workflow_dispatch
+  prepare-release:
+    permissions:
+      contents: write
+    runs-on: "${{ github.repository_owner == 'erpc' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-24.04' }}"
+    if: github.event_name == 'workflow_dispatch'
+    outputs:
+      version: ${{ github.event.inputs.version_tag }}
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.25.x'
+
+      - name: Generate types
+        run: |
+          go install github.com/gzuidhof/tygo@v0.2.21
+          tygo generate
+      
+      - name: Setup Syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+
+      # Run goreleaser in snapshot mode to generate checksums
+      - name: Run GoReleaser Snapshot
+        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6.4.0
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --snapshot --clean
+        env:
+          GORELEASER_CURRENT_TAG: ${{ github.event.inputs.version_tag }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # The ldflags path and the Go symbol it targets drifted apart once and
+      # every release binary shipped reporting "dev". The snapshot is already
+      # built here, so ask it what version it thinks it is.
+      - name: Check the snapshot binary reports its version
+        env:
+          VERSION: ${{ github.event.inputs.version_tag }}
+        run: |
+          set -euo pipefail
+          BIN=$(jq -r 'map(select(.type == "Binary" and .goos == "linux" and .goarch == "amd64"))[0].path' dist/artifacts.json)
+          REPORTED=$("$BIN" --version)
+          echo "$REPORTED"
+          if [[ "$REPORTED" != *"$VERSION"* ]]; then
+            echo "::error::binary reports '$REPORTED', expected it to carry '$VERSION' - ldflags are not reaching common.ErpcVersion"
+            exit 1
+          fi
+
+      # Setup pnpm + node and install dependencies
+      - name: Setup pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5.0.0
+        with:
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+          cache: 'pnpm'
+
+      - name: Install dependencies without postinstall hooks
+        run: pnpm install --ignore-scripts
+        env:
+          CI: true
+
+      - name: Try building npm package
+        run: pnpm run build
+
+      # Update version in package.json files
+      - name: Update package versions
+        run: |
+          for pkg in . typescript/cli typescript/config; do
+            cd $pkg
+            npm version ${{ github.event.inputs.version_tag }} --no-git-tag-version
+            cd -
+          done
+
+      # Generate the release files using the snapshot checksums
+      - name: Generate CLI release files
+        working-directory: typescript/cli
+        run: |
+          export VERSION="${{ github.event.inputs.version_tag }}"
+          export COMMIT_SHA=${{ github.sha }}
+          export CHECKSUMS_FILE=../../dist/checksums.txt
+          pnpm run build
+          npx ts-node ./src/script/generate-release-files.ts
+
+      - name: Cleanup generated files 
+        run: |
+          rm -rf dist/
+
+      # GitHub Actions is not permitted to open pull requests on this repo, so
+      # this job pushes the branch and the summary carries the link to open it.
+      - name: Push release branch
+        id: release_branch
+        env:
+          VERSION: ${{ github.event.inputs.version_tag }}
+        run: |
+          set -euo pipefail
+          BRANCH="release/${VERSION}"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch --force-create "$BRANCH"
+          git add -A
+          git commit -m "chore: release ${VERSION}"
+          git push --force-with-lease origin "$BRANCH:refs/heads/$BRANCH"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Link release pull request
+        env:
+          VERSION: ${{ github.event.inputs.version_tag }}
+          BRANCH: ${{ steps.release_branch.outputs.branch }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          TITLE="chore: release ${VERSION}"
+          BODY=$(printf '\xf0\x9f\x9a\x80 Release preparation for version %s\n\nThis PR includes:\n- Version bumps in package.json files\n- Generated TypeScript types\n- Generated release files\n- Generated checksums\n' "$VERSION")
+          QUERY="quick_pull=1&labels=release&title=$(printf '%s' "$TITLE" | jq -sRr @uri)&body=$(printf '%s' "$BODY" | jq -sRr @uri)"
+          {
+            echo "## Release ${VERSION}"
+            echo
+            echo "Branch \`${BRANCH}\` is pushed. Open the pull request:"
+            echo
+            echo "**[Open pull request](https://github.com/${REPO}/compare/main...${BRANCH}?${QUERY})**"
+            echo
+            echo "Or from a terminal:"
+            echo
+            echo '```bash'
+            echo "gh pr create --repo ${REPO} --base main --head ${BRANCH} --label release \\"
+            echo "  --title '${TITLE}' \\"
+            echo "  --body '${BODY}'"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Run on release PR merge
+  release:
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+    if: |
+      github.event_name == 'push' && 
+      github.ref == 'refs/heads/main' && 
+      contains(github.event.head_commit.message, 'chore: release')
+    environment: release
+    runs-on: "${{ github.repository_owner == 'erpc' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-24.04' }}"
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Setup Syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+
+      # Extract version from commit message
+      - name: Extract version
+        id: version
+        env:
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          VERSION=$(echo "$COMMIT_MESSAGE" | grep -oP 'release \K([0-9]+\.[0-9]+\.[0-9]+)')
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version: '1.25.x'
+
+      - name: Configure Git
+        run: |
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+
+      # Create git tag
+      - name: Create tag
+        run: |
+          git tag ${{ steps.version.outputs.VERSION }} -f
+          git push origin ${{ steps.version.outputs.VERSION }} -f
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6.4.0
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-checksums: ./dist/checksums.txt
+
+  # npm publishing lives in its own workflow so a release that dies after the
+  # tag exists can be completed from the Actions tab, without re-running
+  # GoReleaser or rebuilding the Docker images.
+  publish-npm:
+    needs: [release]
+    if: |
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      contains(github.event.head_commit.message, 'chore: release')
+    uses: ./.github/workflows/publish-npm.yml
+    with:
+      version_tag: ${{ needs.release.outputs.version }}
+    secrets:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # Native single-arch builds on matching runners; then compose a multi-arch manifest
+  docker-build-amd64:
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    runs-on: "${{ github.repository_owner == 'erpc' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-24.04' }}"
+    needs: [prepare-release, release]
+    if: always() && github.ref == 'refs/heads/main'
+    timeout-minutes: 35
+    outputs:
+      digest_main: ${{ steps.build_main.outputs.digest }}
+      digest_release: ${{ steps.build_release.outputs.digest }}
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Blacksmith Builder
+        if: github.repository_owner == 'erpc'
+        uses: useblacksmith/setup-docker-builder@9309da73a81f66976a6d750572e221508b1e2682 # v1.12.0
+
+      - name: Set up Docker Buildx
+        if: github.repository_owner != 'erpc'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute repo and short SHA
+        id: meta
+        run: |
+          REPO="${{ github.repository }}"
+          echo "repo=${REPO@L}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Extract version (release commits only)
+        id: version
+        if: "contains(github.event.head_commit.message, 'chore: release')"
+        env:
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          VERSION=$(echo "$COMMIT_MESSAGE" | grep -oP 'release \K([0-9]+\.[0-9]+\.[0-9]+)')
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Build+push by digest (main)
+        id: build_main
+        if: github.event.inputs.version_tag == ''
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          platforms: linux/amd64
+          build-args: |
+            VERSION=main
+            COMMIT_SHA=${{ steps.meta.outputs.short_sha }}
+          sbom: false # not supported on docker driver, maybe works with blacksmith?
+          outputs: type=registry,name=ghcr.io/${{ steps.meta.outputs.repo }},push-by-digest=true
+
+      - name: Build+push by digest (release)
+        id: build_release
+        if: "contains(github.event.head_commit.message, 'chore: release')"
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          platforms: linux/amd64
+          build-args: |
+            VERSION=${{ steps.version.outputs.VERSION }}
+            COMMIT_SHA=${{ steps.meta.outputs.short_sha }}
+          sbom: false # not supported on docker driver, maybe works with blacksmith?
+          outputs: type=registry,name=ghcr.io/${{ steps.meta.outputs.repo }},push-by-digest=true
+
+      - name: Attest build provenance (Docker Build)
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        if: steps.build_release.outputs.digest != '' || steps.build_main.outputs.digest != ''
+        with:
+          subject-name: ghcr.io/${{ steps.meta.outputs.repo }}
+          subject-digest: "${{ contains(github.event.head_commit.message, 'chore: release') && steps.build_release.outputs.digest || steps.build_main.outputs.digest }}"
+          push-to-registry: true
+
+  docker-build-arm64:
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    runs-on: "${{ github.repository_owner == 'erpc' && 'blacksmith-8vcpu-ubuntu-2404-arm' || 'ubuntu-24.04-arm' }}"
+    needs: [prepare-release, release]
+    if: always() && github.ref == 'refs/heads/main'
+    timeout-minutes: 35
+    outputs:
+      digest_main: ${{ steps.build_main.outputs.digest }}
+      digest_release: ${{ steps.build_release.outputs.digest }}
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Blacksmith Builder
+        if: github.repository_owner == 'erpc'
+        uses: useblacksmith/setup-docker-builder@9309da73a81f66976a6d750572e221508b1e2682 # v1.12.0
+
+      - name: Set up Docker Buildx
+        if: github.repository_owner != 'erpc'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute repo and short SHA
+        id: meta
+        run: |
+          REPO="${{ github.repository }}"
+          echo "repo=${REPO@L}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Extract version (release commits only)
+        id: version
+        if: "contains(github.event.head_commit.message, 'chore: release')"
+        env:
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          VERSION=$(echo "$COMMIT_MESSAGE" | grep -oP 'release \K([0-9]+\.[0-9]+\.[0-9]+)')
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Build+push by digest (main)
+        id: build_main
+        if: github.event.inputs.version_tag == ''
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          platforms: linux/arm64
+          build-args: |
+            VERSION=main
+            COMMIT_SHA=${{ steps.meta.outputs.short_sha }}
+          sbom: false # not supported on docker driver, maybe works with blacksmith?
+          outputs: type=registry,name=ghcr.io/${{ steps.meta.outputs.repo }},push-by-digest=true
+
+      - name: Build+push by digest (release)
+        id: build_release
+        if: "contains(github.event.head_commit.message, 'chore: release')"
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          platforms: linux/arm64
+          build-args: |
+            VERSION=${{ steps.version.outputs.VERSION }}
+            COMMIT_SHA=${{ steps.meta.outputs.short_sha }}
+          sbom: false # not supported on docker driver, maybe works with blacksmith?
+          outputs: type=registry,name=ghcr.io/${{ steps.meta.outputs.repo }},push-by-digest=true
+      
+      - name: Attest build provenance (Docker Build)
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        if: steps.build_release.outputs.digest != '' || steps.build_main.outputs.digest != ''
+        with:
+          subject-name: ghcr.io/${{ steps.meta.outputs.repo }}
+          subject-digest: "${{ contains(github.event.head_commit.message, 'chore: release') && steps.build_release.outputs.digest || steps.build_main.outputs.digest }}"
+          push-to-registry: true
+
+  docker-manifest:
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    runs-on: "${{ github.repository_owner == 'erpc' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}"
+    needs: [docker-build-amd64, docker-build-arm64]
+    if: always() && github.ref == 'refs/heads/main'
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute repo
+        id: meta
+        run: |
+          REPO="${{ github.repository }}"
+          echo "repo=${REPO@L}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract version (release commits only)
+        id: version
+        if: "contains(github.event.head_commit.message, 'chore: release')"
+        env:
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          VERSION=$(echo "$COMMIT_MESSAGE" | grep -oP 'release \K([0-9]+\.[0-9]+\.[0-9]+)')
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create multi-arch manifest for main
+        id: main
+        if: github.event.inputs.version_tag == ''
+        run: |
+          docker buildx imagetools create \
+            -t ghcr.io/${{ steps.meta.outputs.repo }}:main \
+            ghcr.io/${{ steps.meta.outputs.repo }}@${{ needs.docker-build-amd64.outputs.digest_main }} \
+            ghcr.io/${{ steps.meta.outputs.repo }}@${{ needs.docker-build-arm64.outputs.digest_main }}
+
+          docker pull ghcr.io/${{ steps.meta.outputs.repo }}:main
+          DIGEST_MAIN=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/${{ steps.meta.outputs.repo }}:main)
+          echo "digest_main=${DIGEST_MAIN#*@}" >> "$GITHUB_OUTPUT"
+
+      - name: Create multi-arch manifests for release
+        id: release
+        if: "contains(github.event.head_commit.message, 'chore: release')"
+        run: |
+          docker buildx imagetools create \
+            -t ghcr.io/${{ steps.meta.outputs.repo }}:${{ steps.version.outputs.VERSION }} \
+            ghcr.io/${{ steps.meta.outputs.repo }}@${{ needs.docker-build-amd64.outputs.digest_release }} \
+            ghcr.io/${{ steps.meta.outputs.repo }}@${{ needs.docker-build-arm64.outputs.digest_release }}
+          
+          docker buildx imagetools create \
+            -t ghcr.io/${{ steps.meta.outputs.repo }}:latest \
+            ghcr.io/${{ steps.meta.outputs.repo }}@${{ needs.docker-build-amd64.outputs.digest_release }} \
+            ghcr.io/${{ steps.meta.outputs.repo }}@${{ needs.docker-build-arm64.outputs.digest_release }}
+          
+          docker pull ghcr.io/${{ steps.meta.outputs.repo }}:${{ steps.version.outputs.VERSION }}
+          DIGEST_RELEASE=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/${{ steps.meta.outputs.repo }}:${{ steps.version.outputs.VERSION }})
+          docker pull ghcr.io/${{ steps.meta.outputs.repo }}:latest
+          DIGEST_LATEST=$(docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/${{ steps.meta.outputs.repo }}:latest)
+          echo "digest_release=${DIGEST_RELEASE#*@}" >> "$GITHUB_OUTPUT"
+          echo "digest_latest=${DIGEST_LATEST#*@}" >> "$GITHUB_OUTPUT"
+
+      - name: Attest build provenance (Docker Manifest Main)
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        if: github.event.inputs.version_tag == ''
+        with:
+          subject-name: ghcr.io/${{ steps.meta.outputs.repo }}
+          subject-digest: "${{ steps.main.outputs.digest_main }}"
+          push-to-registry: true
+
+      - name: Attest build provenance (Docker Manifest Release)
+        if: "contains(github.event.head_commit.message, 'chore: release')"
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-name: ghcr.io/${{ steps.meta.outputs.repo }}
+          subject-digest: "${{ steps.release.outputs.digest_release }}"
+          push-to-registry: true
+
+      - name: Attest build provenance (Docker Manifest Latest)
+        if: "contains(github.event.head_commit.message, 'chore: release')"
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-name: ghcr.io/${{ steps.meta.outputs.repo }}
+          subject-digest: "${{ steps.release.outputs.digest_latest }}"
+          push-to-registry: true
+
+  # Cleanup sha256-* tags that are created when pushing by digest.
+  # We keep only meaningful tags like "main", "latest" and semver releases.
+  docker-cleanup-sha256-tags:
+    permissions:
+      packages: write
+    runs-on: "${{ github.repository_owner == 'erpc' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}"
+    needs: [docker-manifest]
+    if: always() && github.ref == 'refs/heads/main'
+    steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - name: Delete sha256-* GHCR tags (keep main/latest/semver)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+          OWNER="${REPO%%/*}"
+          NAME="${REPO#*/}"
+          PACKAGE="${NAME,,}" # lower-case
+
+          if [[ "${{ github.repository_owner }}" == "erpc" ]]; then
+            SCOPE_PATH="orgs/$OWNER"
+          else
+            SCOPE_PATH="users/$OWNER"
+          fi
+
+          echo "Scanning GHCR package '$PACKAGE' under $SCOPE_PATH for sha256-only versions to delete..."
+
+          gh api --paginate "/$SCOPE_PATH/packages/container/$PACKAGE/versions?per_page=100" \
+            -H "Accept: application/vnd.github+json" \
+          | jq -r '
+              .[] 
+              | select(.metadata.container.tags | length == 1)
+              | select((.metadata.container.tags | map(startswith("sha256-")) | all))
+              | .id
+            ' \
+          | while read -r VERSION_ID; do
+              echo "Deleting version ${VERSION_ID} (sha256-only tags)..."
+              gh api --method DELETE "/$SCOPE_PATH/packages/container/$PACKAGE/versions/${VERSION_ID}" \
+                -H "Accept: application/vnd.github+json" || true
+            done

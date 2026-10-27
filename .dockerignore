@@ -1,0 +1,50 @@
+# Version control
+.git
+.gitignore
+.claude/
+.cursor/
+.github/
+.vscode/
+
+# Build artifacts
+bin/
+dist/
+build/
+temp/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Development and IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Test files
+*_test.go
+*.test
+coverage.out
+
+# Dependencies that will be reinstalled
+node_modules/
+
+# Local development files
+.env
+.env.local
+*.log
+tmp/
+scylla/data/
+Makefile
+
+# Documentation
+docs/
+*.md
+LICENSE
+
+# Docker files themselves
+Dockerfile
+.dockerignore
+docker-compose*.yml

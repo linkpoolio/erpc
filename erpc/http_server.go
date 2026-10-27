@@ -1,0 +1,2513 @@
+package erpc
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"path"
+	"runtime/debug"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/bytedance/sonic"
+	"github.com/erpc/erpc/auth"
+	"github.com/erpc/erpc/common"
+	"github.com/erpc/erpc/indexer"
+	"github.com/erpc/erpc/telemetry"
+	"github.com/erpc/erpc/util"
+	"github.com/gorilla/websocket"
+	"github.com/klauspost/compress/gzip"
+	"github.com/rs/zerolog"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+)
+
+// Only compress responses larger than 1KB to save CPU on small responses
+const compressionThreshold = 1024
+
+type HttpServer struct {
+	appCtx                  context.Context
+	serverCfg               *common.ServerConfig
+	healthCheckCfg          *common.HealthCheckConfig
+	adminCfg                *common.AdminConfig
+	serverV4                *http.Server
+	serverV6                *http.Server
+	sharedGrpcServer        *GrpcServer
+	erpc                    *ERPC
+	logger                  *zerolog.Logger
+	healthCheckAuthRegistry *auth.AuthRegistry
+	draining                *atomic.Bool
+	// drained is closed once the post-SIGTERM drain (waitBeforeShutdown, then
+	// Shutdown) has finished, so Init can keep the process alive until then.
+	drained                 chan struct{}
+	gzipPool                *util.GzipReaderPool
+	trustedForwarderNets    []net.IPNet
+	trustedForwarderIPs     map[string]struct{}
+	trustedIPHeaders        []string
+	resolvedResponseHeaders map[string]string
+	subscriptionManager     *SubscriptionManager
+	activeWsConns           sync.Map // connId -> *WsConnection
+	reqMaxTimeout           time.Duration
+}
+
+func NewHttpServer(
+	ctx context.Context,
+	logger *zerolog.Logger,
+	cfg *common.ServerConfig,
+	healthCheckCfg *common.HealthCheckConfig,
+	adminCfg *common.AdminConfig,
+	indexerCfg *common.IndexerConfig,
+	erpc *ERPC,
+) (*HttpServer, error) {
+	reqMaxTimeout := 150 * time.Second
+	if cfg.MaxTimeout != nil {
+		reqMaxTimeout = cfg.MaxTimeout.Duration()
+	}
+	readTimeout := 30 * time.Second
+	if cfg.ReadTimeout != nil {
+		readTimeout = cfg.ReadTimeout.Duration()
+	}
+	writeTimeout := 120 * time.Second
+	if cfg.WriteTimeout != nil {
+		writeTimeout = cfg.WriteTimeout.Duration()
+	}
+
+	draining := atomic.Bool{}
+	go func() {
+		<-ctx.Done()
+		draining.Store(true)
+		logger.Info().Msg("entering draining mode → healthcheck will fail")
+	}()
+
+	gzipPool := util.NewGzipReaderPool()
+
+	subMgrLogger := logger.With().Str("component", "subscriptions").Logger()
+	indexerLogger := logger.With().Str("component", "indexer").Logger()
+	indexerOpts := indexer.Options{}
+	if indexerCfg != nil {
+		indexerOpts.DedupWindowSize = indexerCfg.DedupWindowSize
+	}
+	idx := indexer.New(&indexerLogger, indexerOpts)
+
+	srv := &HttpServer{
+		logger:              logger,
+		appCtx:              ctx,
+		serverCfg:           cfg,
+		healthCheckCfg:      healthCheckCfg,
+		adminCfg:            adminCfg,
+		erpc:                erpc,
+		draining:            &draining,
+		drained:             make(chan struct{}),
+		gzipPool:            gzipPool,
+		subscriptionManager: NewSubscriptionManager(&subMgrLogger, idx),
+		reqMaxTimeout:       reqMaxTimeout,
+	}
+
+	if cfg != nil {
+		srv.trustedForwarderIPs = make(map[string]struct{}, len(cfg.TrustedIPForwarders))
+		var forwarders []string
+		forwarders = append(forwarders, cfg.TrustedIPForwarders...)
+		for _, entry := range forwarders {
+			val := strings.TrimSpace(entry)
+			if val == "" {
+				continue
+			}
+			if strings.Contains(val, "/") {
+				if _, ipnet, err := net.ParseCIDR(val); err == nil && ipnet != nil {
+					srv.trustedForwarderNets = append(srv.trustedForwarderNets, *ipnet)
+				} else {
+					logger.Warn().Str("trustedForwarder", val).Msg("invalid CIDR in trusted forwarders; ignoring")
+				}
+			} else {
+				if ip := net.ParseIP(val); ip != nil {
+					srv.trustedForwarderIPs[ip.String()] = struct{}{}
+				} else {
+					logger.Warn().Str("trustedForwarder", val).Msg("invalid IP in trusted forwarders; ignoring")
+				}
+			}
+		}
+	}
+
+	if cfg != nil {
+		var hdrs []string
+		hdrs = append(hdrs, cfg.TrustedIPHeaders...)
+		for _, h := range hdrs {
+			h = strings.TrimSpace(h)
+			if h == "" {
+				continue
+			}
+			srv.trustedIPHeaders = append(srv.trustedIPHeaders, h)
+		}
+	}
+
+	// Resolve custom response headers (expand env vars at startup)
+	if cfg != nil && len(cfg.ResponseHeaders) > 0 {
+		srv.resolvedResponseHeaders = make(map[string]string, len(cfg.ResponseHeaders))
+		for key, value := range cfg.ResponseHeaders {
+			// Expand env vars (handles both ${VAR} and $VAR syntax)
+			resolved := os.ExpandEnv(value)
+			if resolved != "" {
+				srv.resolvedResponseHeaders[key] = resolved
+				logger.Info().Str("header", key).Str("value", resolved).Msg("custom response header configured")
+			} else {
+				logger.Debug().Str("header", key).Msg("custom response header skipped (empty value after env expansion)")
+			}
+		}
+	}
+
+	h := srv.createRequestHandler()
+
+	if cfg.EnableGzip != nil && *cfg.EnableGzip {
+		h = gzipHandler(h)
+	}
+
+	// Create handler with timeout
+	httpHandler := TimeoutHandler(logger, h, reqMaxTimeout)
+	handlerV4 := httpHandler
+	handlerV6 := httpHandler
+
+	if grpcSharesHttpV4(cfg) {
+		sharedGrpcServer, err := NewGrpcServer(ctx, logger, cfg, erpc)
+		if err != nil {
+			return nil, err
+		}
+		srv.sharedGrpcServer = sharedGrpcServer
+		handlerV4 = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.ProtoMajor == 2 && strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "application/grpc") {
+				sharedGrpcServer.server.ServeHTTP(w, r)
+				return
+			}
+			httpHandler.ServeHTTP(w, r)
+		})
+	}
+
+	// Without TLS, serve cleartext HTTP/2 (h2c prior knowledge) natively next to
+	// HTTP/1.1 on both listeners. Native support keeps h2c connections tracked by
+	// the http.Server, so Shutdown sends them GOAWAY, lets in-flight streams
+	// finish and waits for them, and SetKeepAlivesEnabled(false) GOAWAYs each one
+	// the next time its last open stream completes. (x/net's h2c.NewHandler
+	// hijacks the connection away from the server, which disables all of that.)
+	// HTTP/1.1 `Upgrade: h2c` is not supported. With TLS, nil keeps net/http's
+	// default: HTTP/1.1 and HTTP/2 negotiated via ALPN.
+	var protocols *http.Protocols
+	if cfg.TLS == nil || !cfg.TLS.Enabled {
+		protocols = new(http.Protocols)
+		protocols.SetHTTP1(true)
+		protocols.SetUnencryptedHTTP2(true)
+	}
+
+	// Create IPv4 server if configured
+	if cfg.ListenV4 != nil && *cfg.ListenV4 {
+		srv.serverV4 = &http.Server{
+			Handler:        handlerV4,
+			Protocols:      protocols,
+			ReadTimeout:    readTimeout,
+			WriteTimeout:   writeTimeout,
+			IdleTimeout:    300 * time.Second,
+			MaxHeaderBytes: 1 << 20, // 1MB
+		}
+	}
+
+	// Create IPv6 server if configured
+	if cfg.ListenV6 != nil && *cfg.ListenV6 {
+		srv.serverV6 = &http.Server{
+			Handler:        handlerV6,
+			Protocols:      protocols,
+			ReadTimeout:    readTimeout,
+			WriteTimeout:   writeTimeout,
+			IdleTimeout:    300 * time.Second,
+			MaxHeaderBytes: 1 << 20, // 1MB
+		}
+	}
+
+	if healthCheckCfg != nil && healthCheckCfg.Auth != nil {
+		var err error
+		srv.healthCheckAuthRegistry, err = auth.NewAuthRegistry(ctx, logger, "healthcheck", healthCheckCfg.Auth, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create healthcheck auth registry: %w", err)
+		}
+	}
+
+	go func() {
+		<-ctx.Done()
+		defer close(srv.drained)
+		// Actively drain keep-alive connections during the grace window: stamp
+		// `Connection: close` on every HTTP/1.1 response and GOAWAY each HTTP/2
+		// (h2 and h2c) connection the next time its last open stream completes,
+		// so pooled clients migrate to healthy instances BEFORE Shutdown starts
+		// closing connections. Load balancers that preserve established flows
+		// (e.g. AWS NLB) never break these pools on their own — without this, a
+		// client pushing traffic over kept-alive connections rides them straight
+		// into Shutdown and sees resets (502s) on every deploy.
+		if srv.serverV4 != nil {
+			srv.serverV4.SetKeepAlivesEnabled(false)
+		}
+		if srv.serverV6 != nil {
+			srv.serverV6.SetKeepAlivesEnabled(false)
+		}
+		// Hijacked WebSocket connections are not affected by the above, so
+		// close them now: clients reconnect elsewhere while in-flight
+		// requests get the grace window to finish.
+		var grace time.Duration
+		if srv.serverCfg.WaitBeforeShutdown != nil {
+			grace = srv.serverCfg.WaitBeforeShutdown.Duration()
+		}
+		go srv.shutdownWebSockets(logger, grace)
+		// wait for readiness probe to mark the pod NotReady
+		// ideally (period_seconds * failure_threshold) + safety margin (1s)
+		time.Sleep(grace)
+		// Shutdown closes the listeners and idle HTTP/1.1 connections, sends
+		// GOAWAY on every HTTP/2 connection, and waits (within its budget) for
+		// in-flight requests and streams to finish.
+		if err := srv.Shutdown(logger); err != nil {
+			logger.Error().Msgf("http server forced to shutdown: %s", err)
+		} else {
+			logger.Info().Msg("http server stopped")
+		}
+	}()
+
+	return srv, nil
+}
+
+func (s *HttpServer) createRequestHandler() http.Handler {
+	handleRequest := func(httpCtx context.Context, r *http.Request, w http.ResponseWriter, writeFatalError func(ctx context.Context, statusCode int, body error)) {
+		startedAt := time.Now()
+		encoder := common.SonicCfg.NewEncoder(w)
+		encoder.SetEscapeHTML(false)
+
+		// Get host without port number
+		host := r.Host
+		if colonIndex := strings.Index(host, ":"); colonIndex != -1 {
+			host = host[:colonIndex]
+		}
+
+		var projectId, architecture, chainId string
+		var isAdmin, isHealthCheck bool
+		var err error
+
+		// Check aliasing rules
+		if s.serverCfg.Aliasing != nil {
+			for _, rule := range s.serverCfg.Aliasing.Rules {
+				matched, err := common.WildcardMatch(rule.MatchDomain, host)
+				if err != nil {
+					s.logger.Error().Err(err).Interface("rule", rule).Msg("failed to match aliasing rule")
+					continue
+				}
+				if matched {
+					projectId = rule.ServeProject
+					architecture = rule.ServeArchitecture
+					chainId = rule.ServeChain
+					break
+				}
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		// executionHeaders:"off" suppresses all X-ERPC-* headers, including these.
+		if s.executionHeadersMode() != common.ExecutionHeadersOff {
+			w.Header().Set("X-ERPC-Version", common.ErpcVersion)
+			w.Header().Set("X-ERPC-Commit", common.ErpcCommitSha)
+		}
+
+		// Add custom response headers (resolved at startup with env var expansion)
+		for key, value := range s.resolvedResponseHeaders {
+			w.Header().Set(key, value)
+		}
+
+		projectId, architecture, chainId, isAdmin, isHealthCheck, err = s.parseUrlPath(r, projectId, architecture, chainId)
+		if err != nil {
+			handleErrorResponse(
+				httpCtx,
+				s.logger,
+				&startedAt,
+				nil,
+				err,
+				w,
+				encoder,
+				writeFatalError,
+				&common.TRUE,
+				s.executionHeadersMode(),
+			)
+			return
+		}
+
+		// Set network in context for force-trace matching in child spans (uses existing parsed values)
+		if !isAdmin && !isHealthCheck && architecture != "" && chainId != "" {
+			httpCtx = common.SetForceTraceNetwork(httpCtx, architecture+":"+chainId)
+		}
+
+		if isHealthCheck {
+			s.handleHealthCheck(httpCtx, w, r, &startedAt, projectId, architecture, chainId, encoder, writeFatalError)
+			return
+		}
+
+		if isAdmin {
+			if s.adminCfg != nil && s.adminCfg.CORS != nil {
+				if !s.handleCORS(httpCtx, w, r, s.adminCfg.CORS) || r.Method == http.MethodOptions {
+					return
+				}
+			}
+		}
+
+		var lg zerolog.Logger
+		if isAdmin {
+			lg = s.logger.With().Str("component", "admin").Logger()
+		} else {
+			lg = s.logger.With().Str("component", "proxy").Str("projectId", projectId).Str("networkId", fmt.Sprintf("%s:%s", architecture, chainId)).Logger()
+		}
+
+		if projectId == "" && !isAdmin {
+			handleErrorResponse(
+				httpCtx,
+				&lg,
+				&startedAt,
+				nil,
+				common.NewErrInvalidRequest(fmt.Errorf("projectId is required in path or must be aliased")),
+				w,
+				encoder,
+				writeFatalError,
+				s.serverCfg.IncludeErrorDetails,
+				s.executionHeadersMode(),
+			)
+			return
+		}
+
+		project, err := s.erpc.GetProject(projectId)
+		if err != nil {
+			handleErrorResponse(
+				httpCtx,
+				&lg,
+				&startedAt,
+				nil,
+				err,
+				w,
+				encoder,
+				writeFatalError,
+				&common.TRUE,
+				s.executionHeadersMode(),
+			)
+			return
+		}
+
+		if project != nil && project.Config.CORS != nil {
+			if !s.handleCORS(httpCtx, w, r, project.Config.CORS) || r.Method == http.MethodOptions {
+				return
+			}
+		}
+
+		// A WebSocket connection serves the one network in its URL.
+		if isWebSocketUpgradeRequest(r) {
+			if architecture == "" || chainId == "" {
+				handleErrorResponse(
+					httpCtx,
+					&lg,
+					&startedAt,
+					nil,
+					common.NewErrInvalidUrlPath("websocket connections must target a network, for example /<project>/<architecture>/<chainId>", r.URL.Path),
+					w,
+					encoder,
+					writeFatalError,
+					&common.TRUE,
+					s.executionHeadersMode(),
+				)
+				return
+			}
+			// Every message on the connection authenticates with this upgrade
+			// request's credentials, so refuse the upgrade when no strategy
+			// accepts them rather than hold a connection that can never be
+			// served. Method scoping and rate limits still apply per message.
+			nq := common.NewNormalizedRequest(nil)
+			nq.SetClientIP(s.resolveRealClientIP(r))
+			ap, err := auth.NewPayloadFromHttp("", r.RemoteAddr, r.Header, r.URL.Query())
+			if err == nil {
+				err = project.AcceptsConsumerPayload(httpCtx, nq, ap)
+			}
+			if err != nil {
+				handleErrorResponse(
+					httpCtx,
+					&lg,
+					&startedAt,
+					nil,
+					err,
+					w,
+					encoder,
+					writeFatalError,
+					s.serverCfg.IncludeErrorDetails,
+					s.executionHeadersMode(),
+				)
+				return
+			}
+			s.handleWebSocket(w, r, &lg, project, architecture, chainId)
+			return
+		}
+
+		// Handle gzipped request bodies
+		var bodyReader io.Reader = r.Body
+		if r.Header.Get("Content-Encoding") == "gzip" {
+			gzReader, err := s.gzipPool.GetReset(r.Body)
+			if err != nil {
+				handleErrorResponse(
+					httpCtx,
+					&lg,
+					&startedAt,
+					nil,
+					common.NewErrInvalidRequest(fmt.Errorf("invalid gzip body: %w", err)),
+					w,
+					encoder,
+					writeFatalError,
+					&common.TRUE,
+					s.executionHeadersMode(),
+				)
+				return
+			}
+			defer s.gzipPool.Put(gzReader)
+			bodyReader = gzReader
+		}
+
+		// Replace the existing body read with our potentially decompressed reader
+		_, readBodySpan := common.StartDetailSpan(httpCtx, "Http.ReadBody")
+		body, cleanup, err := util.ReadAll(bodyReader, 2048)
+		// Clean up buffer after parsing the request
+		if cleanup != nil {
+			defer cleanup()
+		}
+		readBodySpan.End()
+		if err != nil {
+			common.SetTraceSpanError(readBodySpan, err)
+			handleErrorResponse(
+				httpCtx,
+				&lg,
+				&startedAt,
+				nil,
+				err,
+				w,
+				encoder,
+				writeFatalError,
+				&common.TRUE,
+				s.executionHeadersMode(),
+			)
+			return
+		}
+
+		_, parseRequestsSpan := common.StartDetailSpan(httpCtx, "Http.ParseRequests")
+		if len(body) > 0 {
+			lg.Info().RawJSON("body", body).Msgf("received http request")
+		} else {
+			lg.Info().Msgf("received http request with empty body")
+		}
+
+		var requests []json.RawMessage
+		isBatch := len(body) > 0 && body[0] == '['
+		if !isBatch {
+			requests = []json.RawMessage{body}
+		} else {
+			err = common.SonicCfg.Unmarshal(body, &requests)
+			if err != nil {
+				handleErrorResponse(
+					httpCtx,
+					&lg,
+					&startedAt,
+					nil,
+					common.NewErrJsonRpcRequestUnmarshal(err, body),
+					w,
+					encoder,
+					writeFatalError,
+					&common.TRUE,
+					s.executionHeadersMode(),
+				)
+				common.SetTraceSpanError(parseRequestsSpan, err)
+				parseRequestsSpan.End()
+				return
+			}
+		}
+
+		responses := make([]interface{}, len(requests))
+		var wg sync.WaitGroup
+
+		headers := r.Header
+		queryArgs := r.URL.Query()
+
+		parseRequestsSpan.End()
+
+		// We no longer need the top-level body; drop reference early to free its backing array
+		body = nil
+
+		for i, reqBody := range requests {
+			wg.Add(1)
+			go func(index int, rawReq json.RawMessage, headers http.Header, queryArgs map[string][]string) {
+				defer func() {
+					defer wg.Done()
+					if rec := recover(); rec != nil {
+						telemetry.MetricUnexpectedPanicTotal.WithLabelValues(
+							"request-handler",
+							fmt.Sprintf("project:%s network:%s", architecture, chainId),
+							common.ErrorFingerprint(rec),
+						).Inc()
+						lg.Error().
+							Interface("panic", rec).
+							Str("stack", string(debug.Stack())).
+							Msgf("unexpected server panic on per-request handler")
+						err := fmt.Errorf("unexpected server panic on per-request handler: %v stack: %s", rec, string(debug.Stack()))
+						responses[index] = processErrorBody(&lg, &startedAt, nil, err, s.serverCfg.IncludeErrorDetails)
+					}
+				}()
+
+				nq := common.NewNormalizedRequest(rawReq)
+				nq.ForwardHeaders = make(http.Header)
+
+				// Help GC: drop reference to the rawReq slice copy in the parent slice as soon as possible
+				rawReq = nil
+				requestCtx := common.StartRequestSpan(httpCtx, nq)
+
+				// Resolve and set real client IP before any rate limiting/auth checks
+				clientIP := s.resolveRealClientIP(r)
+				nq.SetClientIP(clientIP)
+
+				// Validate the raw JSON-RPC payload early
+				if err := nq.Validate(); err != nil {
+					responses[index] = processErrorBody(&lg, &startedAt, nq, err, &common.TRUE)
+					common.EndRequestSpan(requestCtx, nil, responses[index])
+					return
+				}
+
+				if err := applyForwardHeaders(project, nq, headers); err != nil {
+					responses[index] = processErrorBody(&lg, &startedAt, nq, err, &common.TRUE)
+					common.EndRequestSpan(requestCtx, nil, responses[index])
+					return
+				}
+
+				method, _ := nq.Method()
+				rlg := lg.With().Str("method", method).Logger()
+
+				shouldHandleMethod, err := isMethodAllowed(project, method)
+				if err != nil {
+					responses[index] = processErrorBody(&rlg, &startedAt, nq, err, &common.TRUE)
+					common.EndRequestSpan(requestCtx, nil, err)
+					return
+				}
+
+				if !shouldHandleMethod {
+					jsonrpcVersion := "2.0"
+					var reqId interface{}
+					if jrr, _ := nq.JsonRpcRequest(); jrr != nil {
+						jsonrpcVersion = jrr.JSONRPC
+						reqId = jrr.ID
+					}
+					responses[index] = &HttpJsonRpcErrorResponse{
+						Jsonrpc: jsonrpcVersion,
+						Id:      reqId,
+						Error: map[string]interface{}{
+							"code":    int(common.JsonRpcErrorUnsupportedException),
+							"message": fmt.Sprintf("method not supported: %s", method),
+						},
+						Cause:   nil,
+						Request: nq,
+					}
+					common.EndRequestSpan(requestCtx, nil, nil)
+					return
+				}
+
+				var ap *auth.AuthPayload
+
+				if project != nil {
+					ap, err = auth.NewPayloadFromHttp(method, r.RemoteAddr, headers, queryArgs)
+				} else if isAdmin {
+					ap, err = auth.NewPayloadFromHttp(method, r.RemoteAddr, headers, queryArgs)
+				}
+				if err != nil {
+					responses[index] = processErrorBody(&rlg, &startedAt, nq, err, &common.TRUE)
+					common.EndRequestSpan(requestCtx, nil, err)
+					return
+				}
+
+				if isAdmin {
+					_, err := s.erpc.AdminAuthenticate(requestCtx, nq, method, ap)
+					if err != nil {
+						responses[index] = processErrorBody(&rlg, &startedAt, nq, err, &common.TRUE)
+						common.EndRequestSpan(requestCtx, nil, err)
+						return
+					}
+				} else {
+					user, err := project.AuthenticateConsumer(requestCtx, nq, method, ap)
+					if err != nil {
+						responses[index] = processErrorBody(&rlg, &startedAt, nq, err, s.serverCfg.IncludeErrorDetails, common.NetworkArchitecture(architecture))
+						common.EndRequestSpan(requestCtx, nil, err)
+						return
+					}
+					if user != nil {
+						rlg = rlg.With().Str("userId", user.Id).Logger()
+					}
+					nq.SetUser(user)
+				}
+
+				// Trusted upstream identity: when auth resolved no user and the
+				// project opts in, take the user id from the X-ERPC-User-Id header
+				// (set by a trusted gateway that already authenticated the caller)
+				// so per-user metrics/logs stay attributed without erpc doing auth.
+				if project != nil && project.Config != nil && project.Config.TrustUserIdHeader && nq.User() == nil {
+					nq.SetUserFromTrustedHeader(headers.Get(common.HeaderUserId))
+					if user := nq.User(); user != nil {
+						rlg = rlg.With().Str("userId", user.Id).Logger()
+					}
+				}
+
+				if isAdmin {
+					if s.adminCfg != nil {
+						if blocked, berr := isAdminMethodBlocked(s.adminCfg, method); berr != nil {
+							responses[index] = processErrorBody(&rlg, &startedAt, nq, berr, &common.TRUE)
+							common.EndRequestSpan(requestCtx, nil, berr)
+							return
+						} else if blocked {
+							jrr, _ := nq.JsonRpcRequest()
+							var reqId interface{}
+							jsonrpcVersion := "2.0"
+							if jrr != nil {
+								jsonrpcVersion = jrr.JSONRPC
+								reqId = jrr.ID
+							}
+							responses[index] = &HttpJsonRpcErrorResponse{
+								Jsonrpc: jsonrpcVersion,
+								Id:      reqId,
+								Error: map[string]interface{}{
+									"code":    int(common.JsonRpcErrorUnsupportedException),
+									"message": fmt.Sprintf("method not supported: %s", method),
+								},
+								Request: nq,
+							}
+							common.EndRequestSpan(requestCtx, nil, nil)
+							return
+						}
+						resp, err := s.erpc.AdminHandleRequest(requestCtx, nq)
+						if err != nil {
+							responses[index] = processErrorBody(&rlg, &startedAt, nq, err, &common.TRUE)
+							common.EndRequestSpan(requestCtx, nil, err)
+							return
+						}
+						responses[index] = resp
+						common.EndRequestSpan(requestCtx, resp, nil)
+						return
+					} else {
+						responses[index] = processErrorBody(
+							&rlg,
+							&startedAt,
+							nq,
+							common.NewErrAuthUnauthorized(
+								"",
+								"admin is not enabled for this project",
+							),
+							s.serverCfg.IncludeErrorDetails,
+						)
+						common.EndRequestSpan(requestCtx, nil, err)
+						return
+					}
+				}
+
+				var networkId string
+
+				if architecture == "" || chainId == "" {
+					// Read the hint off the envelope nq.Validate() already parsed above,
+					// rather than decoding the body again into a map here.
+					if networkIdFromBody := nq.NetworkIdHint(); networkIdFromBody != "" {
+						networkId = networkIdFromBody
+						// SplitN limit 2 so three-part SVM IDs (svm:<chain>:<cluster>)
+						// keep the chain:cluster tail intact as chainId; it is
+						// reassembled as architecture+":"+chainId below.
+						parts := strings.SplitN(networkId, ":", 2)
+						if len(parts) == 2 {
+							architecture = parts[0]
+							chainId = parts[1]
+						}
+					}
+				} else {
+					networkId = fmt.Sprintf("%s:%s", architecture, chainId)
+				}
+
+				if architecture == "" || chainId == "" {
+					responses[index] = processErrorBody(&rlg, &startedAt, nq, common.NewErrInvalidRequest(fmt.Errorf(
+						"architecture and chain must be provided in URL (for example /<project>/evm/42161) or in request body (for example \"networkId\":\"evm:42161\") or configureed via domain aliasing",
+					)), s.serverCfg.IncludeErrorDetails)
+					common.EndRequestSpan(requestCtx, nil, err)
+					return
+				}
+
+				nw, err := project.GetNetwork(httpCtx, networkId)
+				if err != nil {
+					responses[index] = processErrorBody(&rlg, &startedAt, nq, err, s.serverCfg.IncludeErrorDetails)
+					common.EndRequestSpan(requestCtx, nil, err)
+					return
+				}
+				nq.SetNetwork(nw)
+
+				applyRequestDirectives(project, nw, nq, headers, queryArgs)
+				rlg.Trace().Interface("directives", nq.Directives()).Msgf("applied request directives")
+
+				resp, err := project.Forward(requestCtx, networkId, nq)
+				if err != nil {
+					// If an error occurred but a response was produced (e.g., lastValidResponse),
+					// release it now since we are not going to write it.
+					if resp != nil {
+						go resp.Release()
+					}
+					responses[index] = processErrorBody(&rlg, &startedAt, nq, err, s.serverCfg.IncludeErrorDetails)
+					common.EndRequestSpan(requestCtx, nil, err)
+					return
+				}
+
+				responses[index] = resp
+				common.EndRequestSpan(requestCtx, resp, nil)
+			}(i, reqBody, headers, queryArgs)
+		}
+
+		wg.Wait()
+
+		httpCtx, writeResponseSpan := common.StartDetailSpan(httpCtx, "HttpServer.WriteResponse")
+		defer writeResponseSpan.End()
+
+		if err := httpCtx.Err(); err != nil {
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				cause := context.Cause(httpCtx)
+				if cause != nil {
+					err = cause
+				}
+				s.logger.Trace().Err(err).Msg("request premature context error")
+				writeFatalError(httpCtx, http.StatusInternalServerError, err)
+			}
+			// Ensure we do not retain responses when the request context is done
+			for _, resp := range responses {
+				if v, ok := resp.(*common.NormalizedResponse); ok && v != nil {
+					go v.Release()
+				}
+			}
+			return
+		}
+
+		common.InjectHTTPResponseTraceContext(httpCtx, w)
+
+		if isBatch {
+			s.writeBatchExecHeaders(httpCtx, w, responses)
+			s.writeCostHeaders(httpCtx, w, responses)
+			w.WriteHeader(http.StatusOK)
+
+			bw := NewBatchResponseWriter(responses)
+			_, err = bw.WriteTo(w)
+			for _, resp := range responses {
+				if r, ok := resp.(*common.NormalizedResponse); ok {
+					go r.Release()
+				}
+			}
+
+			if err != nil && !errors.Is(err, http.ErrHandlerTimeout) {
+				s.logger.Error().Err(err).Msg("failed to write batch response")
+				writeFatalError(httpCtx, http.StatusInternalServerError, err)
+				return
+			}
+
+			common.EnrichHTTPServerSpan(httpCtx, http.StatusOK, nil)
+		} else {
+			res := responses[0]
+			setResponseHeaders(httpCtx, res, w, s.executionHeadersMode())
+			s.writeCostHeaders(httpCtx, w, responses)
+
+			// Determine HTTP status code - defaults to 200 for JSON-RPC responses,
+			// but transport-level errors (auth, rate limit, etc.) get appropriate status codes
+			statusCode := determineResponseStatusCode(res)
+			w.WriteHeader(statusCode)
+
+			switch v := res.(type) {
+			case *common.NormalizedResponse:
+				_, err = v.WriteTo(w)
+				go v.Release()
+			case *HttpJsonRpcErrorResponse:
+				_, err = writeJsonRpcError(w, v)
+			default:
+				err = common.SonicCfg.NewEncoder(w).Encode(res)
+			}
+
+			if err != nil {
+				writeFatalError(httpCtx, statusCode, err)
+				return
+			} else {
+				common.EnrichHTTPServerSpan(httpCtx, statusCode, nil)
+			}
+		}
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Extract trace context from request headers and start a new span
+		httpCtx, span := common.StartHTTPServerSpan(r.Context(), r)
+		defer span.End()
+
+		finalErrorOnce := &sync.Once{}
+		writeFatalError := func(httpCtx context.Context, statusCode int, err error) {
+			finalErrorOnce.Do(func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						telemetry.MetricUnexpectedPanicTotal.WithLabelValues(
+							"final-error-writer",
+							fmt.Sprintf("statusCode:%d", statusCode),
+							common.ErrorFingerprint(rec)+" via err:"+common.ErrorFingerprint(err),
+						).Inc()
+						s.logger.Error().
+							Interface("panic", rec).
+							Str("stack", string(debug.Stack())).
+							Msgf("unexpected server panic on final error writer")
+					}
+				}()
+				// Keep transport 200 for JSON-RPC POST requests per spec
+				if r.Method == http.MethodPost {
+					statusCode = http.StatusOK
+				}
+				w.WriteHeader(statusCode)
+
+				msg, err := common.SonicCfg.Marshal(err.Error())
+				if err != nil {
+					msg, _ = common.SonicCfg.Marshal(err.Error())
+				}
+				body := fmt.Sprintf(`{"jsonrpc":"2.0","error":{"code":-32603,"message":%s}}`, msg)
+
+				fmt.Fprint(w, body) // #nosec G705 -- body is JSON-marshaled, not raw user input; XSS risk is a false positive
+				common.EnrichHTTPServerSpan(httpCtx, statusCode, err)
+			})
+		}
+
+		defer func() {
+			if rec := recover(); rec != nil {
+				telemetry.MetricUnexpectedPanicTotal.WithLabelValues(
+					"top-level-handler",
+					"",
+					common.ErrorFingerprint(rec),
+				).Inc()
+				s.logger.Error().
+					Interface("panic", rec).
+					Str("stack", string(debug.Stack())).
+					Msgf("unexpected panic on top-level handler")
+				writeFatalError(
+					httpCtx,
+					http.StatusInternalServerError,
+					fmt.Errorf(`unexpected server panic on top-level handler: %s`, rec),
+				)
+			}
+		}()
+
+		handleRequest(httpCtx, r, w, writeFatalError)
+	})
+}
+
+func (s *HttpServer) parseUrlPath(
+	r *http.Request,
+	preSelectedProjectId,
+	preSelectedArchitecture,
+	preSelectedChainId string,
+) (
+	projectId, architecture, chainId string,
+	isAdmin bool,
+	isHealthCheck bool,
+	err error,
+) {
+	ps := path.Clean(r.URL.Path)
+	segments := strings.Split(ps, "/")
+
+	// Remove empty first segment from leading slash
+	segments = segments[1:]
+
+	isPost := r.Method == http.MethodPost
+	isOptions := r.Method == http.MethodOptions
+
+	// Initialize with preselected values
+	projectId = preSelectedProjectId
+	architecture = preSelectedArchitecture
+	chainId = preSelectedChainId
+
+	// Special case for admin endpoint
+	if len(segments) == 1 && segments[0] == "admin" && (isPost || isOptions) {
+		return "", "", "", true, false, nil
+	}
+
+	// Handle healthcheck variations
+	if len(segments) > 0 && segments[len(segments)-1] == "healthcheck" {
+		isHealthCheck = true
+		segments = segments[:len(segments)-1] // Remove healthcheck segment
+	} else if len(segments) == 0 || (len(segments) == 1 && segments[0] == "") {
+		if !(isPost || isOptions) {
+			isHealthCheck = true
+			segments = nil
+		}
+	}
+
+	// Parse remaining segments based on what's preselected
+	switch {
+	case projectId == "" && architecture == "" && chainId == "":
+		// Case: Nothing preselected
+		switch len(segments) {
+		case 1:
+			projectId = segments[0]
+		case 2:
+			projectId = segments[0]
+			// Check if second segment is a network alias
+			if project, err := s.erpc.GetProject(projectId); err == nil {
+				architecture, chainId = project.networksRegistry.ResolveAlias(segments[1])
+			}
+			if architecture == "" {
+				architecture = segments[1]
+			}
+		case 3:
+			projectId = segments[0]
+			architecture = segments[1]
+			chainId = segments[2]
+		case 0:
+			if !isHealthCheck {
+				return "", "", "", false, false, common.NewErrInvalidUrlPath("must provide /<project>/<architecture>/<chainId>", ps)
+			}
+		default:
+			return "", "", "", false, false, common.NewErrInvalidUrlPath("must only provide /<project>/<architecture>/<chainId>", ps)
+		}
+
+	case projectId != "" && architecture == "" && chainId == "":
+		// Case: Only projectId preselected
+		switch len(segments) {
+		case 1:
+			// Check if segment is a network alias
+			if project, err := s.erpc.GetProject(projectId); err == nil {
+				architecture, chainId = project.networksRegistry.ResolveAlias(segments[0])
+			}
+			if architecture == "" {
+				architecture = segments[0]
+			}
+		case 2:
+			architecture = segments[0]
+			chainId = segments[1]
+		case 3:
+			// Still allow explicitly specifying projectId
+			projectId = segments[0]
+			architecture = segments[1]
+			chainId = segments[2]
+		case 0:
+			if !isHealthCheck {
+				return "", "", "", false, false, common.NewErrInvalidUrlPath("for project-only alias must provide /<architecture>/<chainId>", ps)
+			}
+		default:
+			return "", "", "", false, false, common.NewErrInvalidUrlPath("for project-only alias must only provide /<architecture>/<chainId>", ps)
+		}
+
+	case projectId != "" && architecture != "" && chainId == "":
+		// Case: ProjectId and architecture preselected
+		switch len(segments) {
+		case 1:
+			// Check if segment is a network alias
+			if project, err := s.erpc.GetProject(projectId); err == nil {
+				ar, ch := project.networksRegistry.ResolveAlias(segments[0])
+				if ar != "" && ch != "" {
+					architecture = ar
+					chainId = ch
+				}
+			}
+			if chainId == "" {
+				chainId = segments[0]
+			}
+			if chainId == "" && !isHealthCheck {
+				return "", "", "", false, false, common.NewErrInvalidUrlPath("for project-and-architecture alias must provide /<chainId>", ps)
+			}
+		case 3:
+			// Still allow explicitly specifying projectId+architecture
+			projectId = segments[0]
+			architecture = segments[1]
+			chainId = segments[2]
+		case 0:
+			if !isHealthCheck {
+				return "", "", "", false, false, common.NewErrInvalidUrlPath("for project-and-architecture alias must provide /<chainId>", ps)
+			}
+		default:
+			return "", "", "", false, false, common.NewErrInvalidUrlPath("for project-and-architecture alias must only provide /<chainId>", ps)
+		}
+
+	case projectId != "" && architecture != "" && chainId != "":
+		// Case: All values preselected
+		if len(segments) > 1 && !isHealthCheck {
+			return "", "", "", false, false, common.NewErrInvalidUrlPath("must not provide anything on the path and only use /", ps)
+		}
+
+	case projectId == "" && architecture != "" && chainId != "":
+		switch len(segments) {
+		case 1:
+			projectId = segments[0]
+			if projectId == "" && !isHealthCheck {
+				return "", "", "", false, false, common.NewErrInvalidUrlPath("for architecture-and-chain alias must provide /<project>", ps)
+			}
+		case 0:
+			if !isHealthCheck {
+				return "", "", "", false, false, common.NewErrInvalidUrlPath("for architecture-and-chain alias must provide /<project>", ps)
+			}
+		case 3:
+			// Still allow explicitly specifying project+architecture+chain
+			projectId = segments[0]
+			architecture = segments[1]
+			chainId = segments[2]
+		default:
+			return "", "", "", false, false, common.NewErrInvalidUrlPath("for architecture-and-chain alias must only provide /<project>", ps)
+		}
+
+	case projectId == "" && architecture != "" && chainId == "":
+		switch len(segments) {
+		case 0:
+			// Allow global healthcheck when only architecture is aliased
+			// (e.g., host preselects architecture like "evm" and path is just /healthcheck or /)
+			if !isHealthCheck {
+				return "", "", "", false, false, common.NewErrInvalidUrlPath("for architecture-only alias must provide /<project>", ps)
+			}
+		case 1:
+			projectId = segments[0]
+		case 2:
+			projectId = segments[0]
+			chainId = segments[1]
+		case 3:
+			// Still allow explicitly specifying project+architecture+chain
+			projectId = segments[0]
+			architecture = segments[1]
+			chainId = segments[2]
+		default:
+			return "", "", "", false, false, common.NewErrInvalidUrlPath("for architecture-only alias must only provide /<project>", ps)
+		}
+
+	default:
+		if projectId != "" && architecture == "" && chainId != "" {
+			return "", "", "", false, false, common.NewErrInvalidUrlPath("it is not possible to alias for project and chain WITHOUT architecture", ps)
+		}
+		// Invalid combination of preselected values
+		return "", "", "", false, false, common.NewErrInvalidUrlPath("invalid combination of path elements and/or aliasing rules", ps)
+	}
+
+	if projectId == "" && !isHealthCheck {
+		return "", "", "", false, false, common.NewErrInvalidUrlPath("project is required either in path or via domain aliasing", ps)
+	}
+
+	if (chainId != "" || architecture != "") && !common.IsValidArchitecture(architecture) {
+		return "", "", "", false, false, common.NewErrInvalidUrlPath("architecture is not valid (must be 'evm' or 'svm')", ps)
+	}
+
+	if !isPost && !isOptions && !isWebSocketUpgradeRequest(r) {
+		isHealthCheck = true
+	}
+
+	return projectId, architecture, chainId, isAdmin, isHealthCheck, nil
+}
+
+func (s *HttpServer) handleCORS(httpCtx context.Context, w http.ResponseWriter, r *http.Request, corsConfig *common.CORSConfig) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		// When no Origin is provided, we allow the request as there's no point in enforcing CORS.
+		// For example if client is a custom code (not mainstream browser) there's no point in enforcing CORS.
+		// Besides, eRPC is not relying on cookies so CORS is not a big concern (i.e. session hijacking is irrelevant).
+		// Bad actors can just build a custom proxy and spoof headers to bypass it.
+		// Therefore in the context of eRPC, even using "*" (allowed origins) is not a big concern, in this context
+		// CORS is just useful to prevent normies from putting your eRPC URL in their frontend code for example.
+		return true
+	}
+
+	telemetry.MetricCORSRequestsTotal.WithLabelValues(r.URL.Path, origin).Inc()
+
+	allowed := false
+	for _, allowedOrigin := range corsConfig.AllowedOrigins {
+		match, err := common.WildcardMatch(allowedOrigin, origin)
+		if err != nil {
+			s.logger.Error().Err(err).Msgf("failed to match CORS origin")
+			continue
+		}
+		if match {
+			allowed = true
+			break
+		}
+	}
+
+	// If disallowed origin, we can continue without CORS headers
+	if !allowed {
+		s.logger.Debug().Str("origin", origin).Msg("CORS request from disallowed origin, continuing without CORS headers")
+		telemetry.MetricCORSDisallowedOriginTotal.WithLabelValues(r.URL.Path, origin).Inc()
+
+		// If it's a preflight OPTIONS request, we can send a basic 204 with no CORS.
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			common.EnrichHTTPServerSpan(httpCtx, http.StatusNoContent, nil)
+			return false
+		}
+
+		// Otherwise, continue the request without any Access-Control-Allow-* headers.
+		// The browser will block it if it *requires* CORS, but non-browser clients or
+		// extensions can still proceed.
+		return true
+	}
+
+	// We get here if the origin is allowed, so we can set CORS headers
+	w.Header().Set("Access-Control-Allow-Origin", origin)
+	w.Header().Set("Access-Control-Allow-Methods", strings.Join(corsConfig.AllowedMethods, ", "))
+	w.Header().Set("Access-Control-Allow-Headers", strings.Join(corsConfig.AllowedHeaders, ", "))
+	w.Header().Set("Access-Control-Expose-Headers", strings.Join(corsConfig.ExposedHeaders, ", "))
+
+	if corsConfig.AllowCredentials != nil && *corsConfig.AllowCredentials {
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+	}
+
+	if corsConfig.MaxAge > 0 {
+		w.Header().Set("Access-Control-Max-Age", fmt.Sprintf("%d", corsConfig.MaxAge))
+	}
+
+	// If it's a preflight request, return a 204 and don't continue to main handler.
+	if r.Method == http.MethodOptions {
+		telemetry.MetricCORSPreflightRequestsTotal.WithLabelValues(r.URL.Path, origin).Inc()
+		w.WriteHeader(http.StatusNoContent)
+		common.EnrichHTTPServerSpan(httpCtx, http.StatusNoContent, nil)
+		return false
+	}
+
+	// Otherwise, allow the request to proceed
+	return true
+}
+
+// executionHeadersMode returns the configured per-request diagnostic
+// header mode, defaulting to "all" when unset.
+func (s *HttpServer) executionHeadersMode() common.ExecutionHeadersMode {
+	if s == nil || s.serverCfg == nil || s.serverCfg.ExecutionHeaders == nil {
+		return common.ExecutionHeadersAll
+	}
+	return *s.serverCfg.ExecutionHeaders
+}
+
+// setResponseHeaders emits the full X-ERPC-* diagnostic surface for a
+// single response — success OR error. Defensive: any nil piece is
+// silently skipped so headers stay consistent across paths. Called
+// from every response-write path the server exposes.
+//
+// The function composes three independent header groups:
+//  1. Counter headers (always emitted when ExecState exists): totals
+//     + per-scope (Upstream-/Network-/Cache-) + consensus.
+//  2. Response-metadata headers (cache HIT/MISS, winning upstream id,
+//     duration ms) — only present when we have a real response.
+//  3. Per-attempt trace headers (Upstreams-Tried/Outcomes/...) — only
+//     when ExecutionHeaders is "all" (skipped in "summary" mode).
+//
+// All three groups are driven from a single source of truth — the
+// request's ExecState — so totals can never drift from per-scope
+// counts and operators see the same numbers in headers, metrics, and
+// spans.
+func setResponseHeaders(ctx context.Context, res interface{}, w http.ResponseWriter, mode common.ExecutionHeadersMode) {
+	if mode == common.ExecutionHeadersOff {
+		return
+	}
+
+	req := extractRequest(res)
+	var st *common.ExecState
+	if req != nil {
+		st = req.ExecState()
+	}
+
+	// 1. Counter headers (always when ExecState exists).
+	writeCounterHeaders(st, w)
+
+	// 2. Response-derived headers (cache, winner, duration).
+	writeResponseMetadataHeaders(ctx, res, w)
+
+	// 3. Per-attempt trace headers (skipped in "summary" mode to keep
+	// header bytes minimal for bandwidth-constrained clients).
+	if mode != common.ExecutionHeadersSummary {
+		writeUpstreamTraceHeaders(st, w)
+	}
+}
+
+// extractRequest walks the response payload to find the originating
+// NormalizedRequest. Returns nil only for very-early errors (URL parse,
+// project lookup) where no request was ever constructed.
+func extractRequest(res interface{}) *common.NormalizedRequest {
+	switch v := res.(type) {
+	case *common.NormalizedResponse:
+		if v != nil {
+			return v.Request()
+		}
+	case *HttpJsonRpcErrorResponse:
+		if v != nil {
+			return v.Request
+		}
+	}
+	return nil
+}
+
+// writeCounterHeaders emits the request-wide attempt total plus the
+// per-scope retry/hedge breakdowns. Always called with a non-nil
+// writer; st may be nil — in which case counters are emitted as "0"
+// so clients can rely on header presence as a contract.
+//
+// Header contract:
+//   - X-ERPC-Attempts: total physical operations across the request
+//     (Upstream + Cache). NetworkAttempts is a rotation count, exposed
+//     per-scope but NOT summed into this total to avoid double-counting.
+//   - Retries / Hedges are emitted PER SCOPE only — operators see
+//     where retry/hedge activity happened rather than an aggregate
+//     that hides which layer was responsible.
+func writeCounterHeaders(st *common.ExecState, w http.ResponseWriter) {
+	snap := st.Snapshot() // nil-safe: returns zero snapshot
+	setInt(w, "X-ERPC-Attempts", snap.Attempts)
+	setInt(w, "X-ERPC-Upstream-Attempts", snap.UpstreamAttempts)
+	setInt(w, "X-ERPC-Upstream-Retries", snap.UpstreamRetries)
+	setInt(w, "X-ERPC-Upstream-Hedges", snap.UpstreamHedges)
+	setInt(w, "X-ERPC-Network-Attempts", snap.NetworkAttempts)
+	setInt(w, "X-ERPC-Network-Retries", snap.NetworkRetries)
+	setInt(w, "X-ERPC-Network-Hedges", snap.NetworkHedges)
+	// Cache + consensus are conditional — they only appear when the
+	// scope was actually exercised, to keep the header footprint small
+	// on the common path.
+	if snap.CacheAttempts > 0 || snap.CacheRetries > 0 || snap.CacheHedges > 0 {
+		setInt(w, "X-ERPC-Cache-Attempts", snap.CacheAttempts)
+		setInt(w, "X-ERPC-Cache-Retries", snap.CacheRetries)
+		setInt(w, "X-ERPC-Cache-Hedges", snap.CacheHedges)
+	}
+	if snap.ConsensusSlots > 0 {
+		setInt(w, "X-ERPC-Consensus-Slots", snap.ConsensusSlots)
+	}
+	if snap.ConsensusDisputes > 0 {
+		setInt(w, "X-ERPC-Consensus-Disputes", snap.ConsensusDisputes)
+	}
+	if snap.ConsensusLowParticipants > 0 {
+		setInt(w, "X-ERPC-Consensus-Low-Participants", snap.ConsensusLowParticipants)
+	}
+}
+
+// writeResponseMetadataHeaders emits X-ERPC-Cache, X-ERPC-Upstream,
+// X-ERPC-Duration — fields that depend on having a final response with
+// metadata. Silently skipped when no metadata is available.
+func writeResponseMetadataHeaders(ctx context.Context, res interface{}, w http.ResponseWriter) {
+	rm := lookupResponseMetadata(res)
+	if rm != nil && !rm.IsObjectNull(ctx) {
+		if rm.FromCache() {
+			w.Header().Set("X-ERPC-Cache", "HIT")
+		} else {
+			w.Header().Set("X-ERPC-Cache", "MISS")
+		}
+		if ups := rm.UpstreamId(); ups != "" {
+			w.Header().Set("X-ERPC-Upstream", ups)
+		}
+	}
+	if resp, ok := res.(*common.NormalizedResponse); ok && resp != nil {
+		setInt64(w, "X-ERPC-Duration", resp.Duration().Milliseconds())
+	}
+}
+
+// lookupResponseMetadata pulls a ResponseMetadata view out of any
+// supported response shape (success or error). Returns nil when the
+// payload doesn't carry metadata (very-early error paths).
+func lookupResponseMetadata(res interface{}) common.ResponseMetadata {
+	if rm, ok := res.(common.ResponseMetadata); ok {
+		return rm
+	}
+	if jrsp, ok := res.(map[string]interface{}); ok {
+		if cause, ok := jrsp["cause"]; ok {
+			if ser, ok := cause.(error); ok {
+				return common.LookupResponseMetadata(ser)
+			}
+		}
+	}
+	if hjrsp, ok := res.(*HttpJsonRpcErrorResponse); ok && hjrsp != nil {
+		return common.LookupResponseMetadata(hjrsp.Cause)
+	}
+	return nil
+}
+
+// writeUpstreamTraceHeaders emits the per-attempt participation log as
+// a single compact header. Each segment is one physical attempt:
+//
+//	<upstreamId>=<reason>:<outcome>:<duration>ms[:won]
+//
+// Segments are joined with `;`. The `:won` suffix marks attempts whose
+// response contributed to the final response — for a single-winner
+// request that's one segment, for consensus it's every participant in
+// the winning agreement group.
+//
+// Example:
+//
+//	X-ERPC-Upstreams: alchemy=primary:success:50ms:won;quicknode=hedge:timeout:5000ms;drpc=consensus_slot:exec_revert:20ms
+func writeUpstreamTraceHeaders(st *common.ExecState, w http.ResponseWriter) {
+	if st == nil {
+		return
+	}
+	attempts := st.UpstreamAttemptLog()
+	if len(attempts) == 0 {
+		return
+	}
+	segments := make([]string, len(attempts))
+	for i, a := range attempts {
+		segments[i] = formatUpstreamAttempt(a)
+	}
+	w.Header().Set("X-ERPC-Upstreams", strings.Join(segments, ";"))
+}
+
+// formatUpstreamAttempt formats one attempt for the X-ERPC-Upstreams
+// header. Kept as a free function so the format is testable in isolation
+// and the same shape can be reused in span attributes / log fields.
+func formatUpstreamAttempt(a common.UpstreamAttempt) string {
+	var b strings.Builder
+	b.Grow(64)
+	b.WriteString(a.UpstreamId)
+	b.WriteByte('=')
+	b.WriteString(string(a.Reason))
+	b.WriteByte(':')
+	b.WriteString(string(a.Outcome))
+	b.WriteByte(':')
+	b.WriteString(strconv.FormatInt(a.Duration.Milliseconds(), 10))
+	b.WriteString("ms")
+	if a.Won {
+		b.WriteString(":won")
+	}
+	return b.String()
+}
+
+func setInt(w http.ResponseWriter, name string, v int) { w.Header().Set(name, strconv.Itoa(v)) }
+func setInt64(w http.ResponseWriter, name string, v int64) {
+	w.Header().Set(name, strconv.FormatInt(v, 10))
+}
+
+// costHeadersEnabled reports whether the opt-in cost/billing header group
+// (`server.costHeaders`) is on. Off by default.
+func (s *HttpServer) costHeadersEnabled() bool {
+	return s != nil && s.serverCfg != nil &&
+		s.serverCfg.CostHeaders != nil && *s.serverCfg.CostHeaders
+}
+
+// isBillableItem classifies one routed sub-response for X-ERPC-Billable.
+// Billable = the node did real work the caller asked for: successful and
+// empty-but-valid responses bill (cache hits included — served value; their
+// COST is zero, which X-ERPC-Credits reflects, not their billability), and
+// execution reverts bill (the EVM executed the call; vendors charge for
+// it). Protocol, transport, rate-limit and cancellation failures do not.
+func isBillableItem(ctx context.Context, item interface{}) bool {
+	switch v := item.(type) {
+	case *common.NormalizedResponse:
+		return v != nil && !v.IsObjectNull(ctx)
+	case *HttpJsonRpcErrorResponse:
+		return v != nil && common.HasErrorCode(v.Cause, common.ErrCodeEndpointExecutionException)
+	}
+	return false
+}
+
+// writeCostHeaders emits the opt-in cost/billing header group for the
+// routed sub-responses of one HTTP response — the same shape on the single
+// and batch write paths, always before WriteHeader:
+//
+//	X-ERPC-Calls:           routed JSON-RPC sub-calls in this response
+//	X-ERPC-Billable:        how many were billable (isBillableItem)
+//	X-ERPC-Methods:         distinct methods, sorted, comma-joined
+//	X-ERPC-Credits:         `vendor:method=<units>` segments, sorted and
+//	                        ';'-joined — the credit units accrued by every
+//	                        physical upstream attempt (retries, hedges,
+//	                        consensus slots; see UpstreamAttempt.CreditUnits),
+//	                        read from the request-object aggregate
+//	                        (NormalizedRequest.CreditUnitsByVendor).
+//	                        Omitted when nothing accrued (e.g. pure cache hits).
+//	X-ERPC-Credits-Total:   the grand total credit units across all vendors
+//	                        and sub-calls in this response; alongside X-ERPC-Credits.
+//	X-ERPC-Credits-Version: the eRPC version the built-in vendor tables
+//	                        shipped with; only alongside X-ERPC-Credits.
+//	X-ERPC-Network-Id:      canonical network id of the routed call
+//	                        (e.g. `evm:42161`).
+//	X-ERPC-Network-Alias:   its configured alias — the SAME value eRPC's own
+//	                        `network` metric label carries (NetworkLabel:
+//	                        alias when set, else the id), so a proxy in front
+//	                        can attribute usage per network without parsing
+//	                        bodies or re-deriving the network from the URL.
+//	                        Both are emitted only when every routed sub-call
+//	                        resolved to ONE network: a batch is addressed to a
+//	                        single network, so a disagreement means the value
+//	                        is not a fact about the response and is omitted
+//	                        rather than guessed.
+//
+// Early errors that never routed a request get no cost headers — there is
+// no routed call to account for.
+func (s *HttpServer) writeCostHeaders(ctx context.Context, w http.ResponseWriter, items []interface{}) {
+	if !s.costHeadersEnabled() || len(items) == 0 {
+		return
+	}
+	billable := 0
+	methods := map[string]struct{}{}
+	credits := map[string]int64{} // "vendor:method" → units
+	var creditsTotal int64
+	networkId, networkAlias := "", ""
+	networkAmbiguous := false
+	for _, item := range items {
+		if isBillableItem(ctx, item) {
+			billable++
+		}
+		req := extractRequest(item)
+		if req == nil {
+			continue
+		}
+		// Network of the routed call. "n/a" is what NetworkId/NetworkLabel
+		// return when the network was never resolved (e.g. internal
+		// eth_chainId probes), so it is not a network and is skipped.
+		if id := req.NetworkId(); id != "" && id != "n/a" {
+			switch {
+			case networkId == "":
+				networkId, networkAlias = id, req.NetworkLabel()
+			case networkId != id:
+				networkAmbiguous = true
+			}
+		}
+		method, _ := req.Method()
+		if method != "" {
+			methods[method] = struct{}{}
+		}
+		// Per-vendor credit totals come from the request-object aggregate
+		// (thread-safe; sums every physical attempt against each vendor,
+		// retries/hedges/consensus included). A request carries a single
+		// method, so keying the header segment by this request's method
+		// preserves the vendor:method=units contract.
+		for vendor, units := range req.CreditUnitsByVendor() {
+			if units > 0 {
+				credits[vendor+":"+method] += units
+				creditsTotal += units
+			}
+		}
+	}
+	setInt(w, "X-ERPC-Calls", len(items))
+	setInt(w, "X-ERPC-Billable", billable)
+	if networkId != "" && !networkAmbiguous {
+		w.Header().Set("X-ERPC-Network-Id", networkId)
+		if networkAlias != "" && networkAlias != "n/a" {
+			w.Header().Set("X-ERPC-Network-Alias", networkAlias)
+		}
+	}
+	if len(methods) > 0 {
+		names := make([]string, 0, len(methods))
+		for m := range methods {
+			names = append(names, m)
+		}
+		sort.Strings(names)
+		w.Header().Set("X-ERPC-Methods", strings.Join(names, ","))
+	}
+	if len(credits) > 0 {
+		keys := make([]string, 0, len(credits))
+		for k := range credits {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		segments := make([]string, len(keys))
+		for i, k := range keys {
+			segments[i] = k + "=" + strconv.FormatInt(credits[k], 10)
+		}
+		w.Header().Set("X-ERPC-Credits", strings.Join(segments, ";"))
+		w.Header().Set("X-ERPC-Credits-Total", strconv.FormatInt(creditsTotal, 10))
+		w.Header().Set("X-ERPC-Credits-Version", common.ErpcVersion)
+	}
+}
+
+// maxBatchTraceSegments caps X-ERPC-Upstreams on batch responses so a huge
+// batch cannot emit an unbounded header; the dropped count is surfaced as
+// X-ERPC-Upstreams-Truncated.
+const maxBatchTraceSegments = 50
+
+// writeBatchExecHeaders is the batch-path counterpart of setResponseHeaders:
+// ONE aggregated diagnostic header set for the whole HTTP response,
+// respecting the same ExecutionHeaders mode. Counters sum across
+// sub-requests; X-ERPC-Cache becomes HIT / MISS / PARTIAL:<n> (n = sub-calls
+// served from cache); X-ERPC-Duration is the slowest sub-call; the
+// per-attempt trace keeps the exact single-response segment format,
+// concatenated in sub-call order and capped. X-ERPC-Upstream (the single
+// winner id) has no batch meaning and is not emitted.
+func (s *HttpServer) writeBatchExecHeaders(ctx context.Context, w http.ResponseWriter, items []interface{}) {
+	mode := s.executionHeadersMode()
+	if mode == common.ExecutionHeadersOff || len(items) == 0 {
+		return
+	}
+
+	var total common.ExecStateSnapshot
+	var segments []string
+	truncated := 0
+	withMeta, fromCache := 0, 0
+	var maxDurationMs int64
+
+	for _, item := range items {
+		if req := extractRequest(item); req != nil {
+			if st := req.ExecState(); st != nil {
+				snap := st.Snapshot()
+				total.Attempts += snap.Attempts
+				total.UpstreamAttempts += snap.UpstreamAttempts
+				total.UpstreamRetries += snap.UpstreamRetries
+				total.UpstreamHedges += snap.UpstreamHedges
+				total.NetworkAttempts += snap.NetworkAttempts
+				total.NetworkRetries += snap.NetworkRetries
+				total.NetworkHedges += snap.NetworkHedges
+				total.CacheAttempts += snap.CacheAttempts
+				total.CacheRetries += snap.CacheRetries
+				total.CacheHedges += snap.CacheHedges
+				total.ConsensusSlots += snap.ConsensusSlots
+				total.ConsensusDisputes += snap.ConsensusDisputes
+				total.ConsensusLowParticipants += snap.ConsensusLowParticipants
+				if mode != common.ExecutionHeadersSummary {
+					for _, attempt := range st.UpstreamAttemptLog() {
+						if len(segments) >= maxBatchTraceSegments {
+							truncated++
+							continue
+						}
+						segments = append(segments, formatUpstreamAttempt(attempt))
+					}
+				}
+			}
+		}
+		if rm := lookupResponseMetadata(item); rm != nil && !rm.IsObjectNull(ctx) {
+			withMeta++
+			if rm.FromCache() {
+				fromCache++
+			}
+		}
+		if resp, ok := item.(*common.NormalizedResponse); ok && resp != nil {
+			if ms := resp.Duration().Milliseconds(); ms > maxDurationMs {
+				maxDurationMs = ms
+			}
+		}
+	}
+
+	setInt(w, "X-ERPC-Attempts", total.Attempts)
+	setInt(w, "X-ERPC-Upstream-Attempts", total.UpstreamAttempts)
+	setInt(w, "X-ERPC-Upstream-Retries", total.UpstreamRetries)
+	setInt(w, "X-ERPC-Upstream-Hedges", total.UpstreamHedges)
+	setInt(w, "X-ERPC-Network-Attempts", total.NetworkAttempts)
+	setInt(w, "X-ERPC-Network-Retries", total.NetworkRetries)
+	setInt(w, "X-ERPC-Network-Hedges", total.NetworkHedges)
+	if total.CacheAttempts > 0 || total.CacheRetries > 0 || total.CacheHedges > 0 {
+		setInt(w, "X-ERPC-Cache-Attempts", total.CacheAttempts)
+		setInt(w, "X-ERPC-Cache-Retries", total.CacheRetries)
+		setInt(w, "X-ERPC-Cache-Hedges", total.CacheHedges)
+	}
+	if total.ConsensusSlots > 0 {
+		setInt(w, "X-ERPC-Consensus-Slots", total.ConsensusSlots)
+	}
+	if total.ConsensusDisputes > 0 {
+		setInt(w, "X-ERPC-Consensus-Disputes", total.ConsensusDisputes)
+	}
+	if total.ConsensusLowParticipants > 0 {
+		setInt(w, "X-ERPC-Consensus-Low-Participants", total.ConsensusLowParticipants)
+	}
+
+	if withMeta > 0 {
+		switch fromCache {
+		case 0:
+			w.Header().Set("X-ERPC-Cache", "MISS")
+		case withMeta:
+			w.Header().Set("X-ERPC-Cache", "HIT")
+		default:
+			w.Header().Set("X-ERPC-Cache", "PARTIAL:"+strconv.Itoa(fromCache))
+		}
+	}
+	if maxDurationMs > 0 {
+		setInt64(w, "X-ERPC-Duration", maxDurationMs)
+	}
+	if len(segments) > 0 {
+		w.Header().Set("X-ERPC-Upstreams", strings.Join(segments, ";"))
+		if truncated > 0 {
+			setInt(w, "X-ERPC-Upstreams-Truncated", truncated)
+		}
+	}
+}
+
+// determineResponseStatusCode extracts any error from a response and determines
+// the appropriate HTTP status code. Defaults to 200 for JSON-RPC responses,
+// but transport-level errors (auth, rate limit, not found) get appropriate status codes.
+func determineResponseStatusCode(res interface{}) int {
+	var err error
+	switch v := res.(type) {
+	case *HttpJsonRpcErrorResponse:
+		err = v.Cause
+	case error:
+		err = v
+	default:
+		return http.StatusOK
+	}
+
+	if err == nil {
+		return http.StatusOK
+	}
+
+	// Transport-level errors get appropriate HTTP status codes
+	switch {
+	// 400 Bad Request - malformed requests
+	case common.HasErrorCode(err, common.ErrCodeInvalidUrlPath, common.ErrCodeJsonRpcRequestUnmarshal, common.ErrCodeInvalidRequest):
+		return http.StatusBadRequest
+	// 401 Unauthorized - authentication failures
+	case common.HasErrorCode(err, common.ErrCodeAuthUnauthorized, common.ErrCodeEndpointUnauthorized):
+		return http.StatusUnauthorized
+	// 404 Not Found - resource not found
+	case common.HasErrorCode(err, common.ErrCodeProjectNotFound, common.ErrCodeNetworkNotFound, common.ErrCodeNetworkNotSupported):
+		return http.StatusNotFound
+	// 429 Too Many Requests - rate limiting
+	case common.HasErrorCode(err,
+		common.ErrCodeAuthRateLimitRuleExceeded,
+		common.ErrCodeProjectRateLimitRuleExceeded,
+		common.ErrCodeNetworkRateLimitRuleExceeded,
+		common.ErrCodeEndpointCapacityExceeded):
+		return http.StatusTooManyRequests
+	// 404 Not Found - no upstream could be initialized for this network at all.
+	// Terminal, not transient, so it is a coverage gap rather than a server fault
+	// (see ErrNetworkNoUpstreamsAvailable). Deliberately last: a more specific
+	// verdict already on the cause chain (429 quota) describes the failure better.
+	case common.HasErrorCode(err, common.ErrCodeNetworkNoUpstreamsAvailable):
+		return http.StatusNotFound
+	}
+
+	// All other errors (JSON-RPC application errors) return 200
+	return http.StatusOK
+}
+
+type HttpJsonRpcErrorResponse struct {
+	Jsonrpc string      `json:"jsonrpc"`
+	Id      interface{} `json:"id"`
+	Error   interface{} `json:"error"`
+	Cause   error       `json:"-"`
+	// Request is the originating NormalizedRequest (when available).
+	// Used by setResponseHeaders to emit X-ERPC-* counter/trace headers
+	// on error paths via the request's ExecState.
+	Request *common.NormalizedRequest `json:"-"`
+}
+
+func (r *HttpJsonRpcErrorResponse) MarshalZerologObject(e *zerolog.Event) {
+	if r == nil {
+		return
+	}
+	e.Str("jsonrpc", r.Jsonrpc)
+	e.Interface("id", r.Id)
+	if r.Error != nil {
+		switch v := r.Error.(type) {
+		case *common.ErrJsonRpcExceptionExternal:
+			e.Object("error", v)
+		case map[string]interface{}:
+			e.Interface("error", v)
+		}
+	}
+}
+
+func processErrorBody(logger *zerolog.Logger, startedAt *time.Time, nq *common.NormalizedRequest, origErr error, includeErrorDetails *bool, architectureHint ...common.NetworkArchitecture) interface{} {
+	err := origErr
+
+	// Build the response first, then log with it. Authentication runs before
+	// network resolution, so its caller passes the URL-parsed architecture as a
+	// hint; later errors can derive it from nq.Network().
+	resp := buildErrorResponseBody(nq, err, origErr, includeErrorDetails, architectureHint...)
+
+	// Log the error with the response
+	if !common.IsNull(err) {
+		if nq != nil {
+			nq.RLock()
+		}
+		respMarshaler, _ := resp.(zerolog.LogObjectMarshaler)
+		if common.HasErrorCode(
+			err,
+			common.ErrCodeEndpointExecutionException,
+			common.ErrCodeEndpointClientSideException,
+			common.ErrCodeInvalidUrlPath,
+			common.ErrCodeInvalidRequest,
+			common.ErrCodeAuthUnauthorized,
+			common.ErrCodeAuthRateLimitRuleExceeded,
+			common.ErrCodeJsonRpcRequestUnmarshal,
+			common.ErrCodeProjectNotFound,
+		) {
+			logger.Debug().Err(err).Object("request", nq).Object("response", respMarshaler).Msg("forward request errored with client-side exception")
+		} else if errors.Is(err, context.Canceled) {
+			logger.Debug().Err(err).Object("request", nq).Object("response", respMarshaler).Msg("forward request errored with context cancellation")
+		} else if errors.Is(err, context.DeadlineExceeded) {
+			logger.Debug().Err(err).Object("request", nq).Object("response", respMarshaler).Msg("forward request errored with deadline exceeded")
+		} else {
+			if e, ok := err.(common.StandardError); ok {
+				logger.Warn().Err(err).Object("request", nq).Object("response", respMarshaler).Dur("durationMs", time.Since(*startedAt)).Msgf("failed to forward request: %s", e.DeepestMessage())
+			} else {
+				logger.Warn().Err(err).Object("request", nq).Object("response", respMarshaler).Dur("durationMs", time.Since(*startedAt)).Msgf("failed to forward request: %s", err.Error())
+			}
+		}
+		if nq != nil {
+			nq.RUnlock()
+		}
+	}
+
+	return resp
+}
+
+// buildErrorResponseBody constructs the error response without logging.
+func buildErrorResponseBody(nq *common.NormalizedRequest, err, origErr error, includeErrorDetails *bool, architectureHint ...common.NetworkArchitecture) interface{} {
+	// This is a special attempt to extract execution errors first (e.g. execution reverted):
+	exe := &common.ErrEndpointExecutionException{}
+	if errors.As(err, &exe) {
+		err = exe
+	}
+
+	// To simplify client's life if there's only one upstream error, we can use that as the error
+	// instead of Exhausted error which obfuscates underlying errors.
+	if ex, ok := err.(*common.ErrUpstreamsExhausted); ok {
+		if len(ex.Errors()) == 1 {
+			err = ex.Errors()[0]
+		}
+	}
+
+	// determineResponseStatusCode keys 429/401 off Cause via HasErrorCode, which
+	// walks the whole tree — so Cause must hold the UNPRUNED error.
+	//
+	// TranslateToJsonRpcException below collapses an exhausted bundle to its
+	// most-frequent cause for a readable message. That prune is deliberate and
+	// stays, but it keeps exactly ONE cause, so a status-bearing sibling (429
+	// capacity, 401 unauthorized) sitting alongside plain 5xx is usually dropped
+	// and the response degrades to 200. Reordering cannot fix it: with two
+	// competing statuses, a keep-one prune can preserve at most one. Survival is
+	// the property that matters, so status reads pre-prune and the body reads post.
+	//
+	// Reachable because findUpstreamsExhausted now sees through the
+	// ErrFailsafeRetryExceeded the network retry loop always adds; the previous
+	// direct type assertion missed that wrapper, so the prune never ran here.
+	//
+	// Live instance: OP-Stack "sender is over rate limit" on eth_sendRawTransaction
+	// is marked WithRetryableTowardNetwork(false) to stop futile sequencer failover
+	// — orderCauses then sorts it last and the strict-greater scan drops it. Losing
+	// that 429 makes clients resubmit the transaction instead of backing off.
+	causeForStatus := err
+	err = common.TranslateToJsonRpcException(err)
+	var jsonrpcVersion string = "2.0"
+	var reqId interface{} = nil
+	var method string = ""
+	isSvmRequest := len(architectureHint) > 0 && architectureHint[0] == common.ArchitectureSvm
+	if !isSvmRequest && nq != nil {
+		isSvmRequest = strings.HasPrefix(nq.NetworkId(), "svm:")
+		// Body-routed requests have no URL architecture hint and auth still runs
+		// before network resolution, so fall back to the envelope's own hint
+		// without moving network lookup ahead of authentication.
+		if !isSvmRequest && nq.Network() == nil && (len(architectureHint) == 0 || architectureHint[0] == "") {
+			isSvmRequest = strings.HasPrefix(nq.NetworkIdHint(), "svm:")
+		}
+	}
+	if nq != nil {
+		jrr, _ := nq.JsonRpcRequest()
+		if jrr != nil {
+			jsonrpcVersion = jrr.JSONRPC
+			reqId = jrr.ID
+			method = jrr.Method
+		}
+	}
+	jre := &common.ErrJsonRpcExceptionInternal{}
+	if errors.As(err, &jre) {
+		message := jre.Message
+		wireCode := jre.NormalizedCode()
+		// eRPC's generic capacity code is -32005, but Solana assigns -32005 to
+		// NodeUnhealthy. Local admission limits (auth/project/network/upstream
+		// budgets) never came from a Solana node, so expose them in Solana's
+		// collision-free generic server bucket instead. Keep native upstream
+		// -32005 untouched: it really does mean NodeUnhealthy and its outer error
+		// chain contains none of these local limiter codes.
+		if wireCode == common.JsonRpcErrorCapacityExceeded && isSvmRequest &&
+			common.HasErrorCode(err,
+				common.ErrCodeAuthRateLimitRuleExceeded,
+				common.ErrCodeProjectRateLimitRuleExceeded,
+				common.ErrCodeNetworkRateLimitRuleExceeded,
+				common.ErrCodeUpstreamRateLimitRuleExceeded,
+			) {
+			wireCode = common.JsonRpcErrorNumber(-32000)
+		}
+		errObj := map[string]interface{}{
+			"code":    wireCode,
+			"message": message,
+		}
+		// Append "data" field, ref: https://www.jsonrpc.org/specification#:~:text=A%20Primitive%20or%20Structured%20value%20that%20contains%20additional%20information%20about%20the%20error.
+		if jre.Details["data"] != nil {
+			errObj["data"] = jre.Details["data"]
+		} else if includeErrorDetails != nil && *includeErrorDetails {
+			if method != "eth_call" {
+				// For eth_calls clients expect "data" to be string for revert reason.
+				// TODO Move this logic to "evm" package.
+				errObj["data"] = origErr
+			}
+		}
+
+		return &HttpJsonRpcErrorResponse{
+			Jsonrpc: jsonrpcVersion,
+			Id:      reqId,
+			Error:   errObj,
+			Cause:   causeForStatus,
+			Request: nq,
+		}
+	}
+
+	if _, ok := err.(*common.BaseError); ok {
+		return err
+	} else if serr, ok := err.(common.StandardError); ok {
+		return serr
+	}
+
+	return common.BaseError{
+		Code:    "ErrUnknown",
+		Message: "unexpected server error",
+		Cause:   causeForStatus,
+	}
+}
+
+func handleErrorResponse(
+	httpCtx context.Context,
+	logger *zerolog.Logger,
+	startedAt *time.Time,
+	nq *common.NormalizedRequest,
+	err error,
+	w http.ResponseWriter,
+	encoder sonic.Encoder,
+	writeFatalError func(ctx context.Context, statusCode int, body error),
+	includeErrorDetails *bool,
+	mode common.ExecutionHeadersMode,
+) {
+	resp := processErrorBody(logger, startedAt, nq, err, includeErrorDetails)
+	// Transport defaults to 200 for JSON-RPC, with limited exceptions.
+	// Non-200 codes are reserved for transport/infrastructure level issues,
+	// not JSON-RPC application errors (which stay 200 with error in body).
+	statusCode := http.StatusOK
+	switch {
+	// 400 Bad Request - malformed requests (not valid JSON-RPC)
+	case common.HasErrorCode(err, common.ErrCodeInvalidUrlPath, common.ErrCodeJsonRpcRequestUnmarshal, common.ErrCodeInvalidRequest):
+		statusCode = http.StatusBadRequest
+	// 401 Unauthorized - authentication failures
+	case common.HasErrorCode(err, common.ErrCodeAuthUnauthorized, common.ErrCodeEndpointUnauthorized):
+		statusCode = http.StatusUnauthorized
+	// 404 Not Found - resource not found at HTTP level
+	case common.HasErrorCode(err, common.ErrCodeProjectNotFound, common.ErrCodeNetworkNotFound, common.ErrCodeNetworkNotSupported):
+		statusCode = http.StatusNotFound
+	// 429 Too Many Requests - rate limiting (critical for client retry logic)
+	case common.HasErrorCode(err,
+		common.ErrCodeAuthRateLimitRuleExceeded,
+		common.ErrCodeProjectRateLimitRuleExceeded,
+		common.ErrCodeNetworkRateLimitRuleExceeded,
+		common.ErrCodeEndpointCapacityExceeded):
+		statusCode = http.StatusTooManyRequests
+	// 404 Not Found - no upstream could be initialized for this network at all.
+	// Terminal, not transient, so it is a coverage gap rather than a server fault
+	// (see ErrNetworkNoUpstreamsAvailable). Deliberately last: a more specific
+	// verdict already on the cause chain (429 quota) describes the failure better.
+	case common.HasErrorCode(err, common.ErrCodeNetworkNoUpstreamsAvailable):
+		statusCode = http.StatusNotFound
+	}
+	// Emit X-ERPC-* headers BEFORE WriteHeader — once WriteHeader fires
+	// the header map is sealed. processErrorBody attaches `nq` to the
+	// returned HttpJsonRpcErrorResponse so the counter/trace headers
+	// flow even when the response body is an error.
+	setResponseHeaders(httpCtx, resp, w, mode)
+	w.WriteHeader(statusCode)
+	span := trace.SpanFromContext(httpCtx)
+	span.AddEvent("http.response_write_start")
+	err = encoder.Encode(resp)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			logger.Debug().Err(err).Interface("response", resp).Msgf("skipping error response encoding due to context cancellation")
+		} else {
+			logger.Error().Err(err).Interface("response", resp).Msgf("failed to encode error response")
+		}
+		writeFatalError(httpCtx, http.StatusInternalServerError, err)
+	} else {
+		common.EnrichHTTPServerSpan(httpCtx, statusCode, nil)
+	}
+	span.AddEvent("http.response_write_end",
+		trace.WithAttributes(
+			attribute.Int("response_status", statusCode),
+		),
+	)
+}
+
+func (s *HttpServer) Start(logger *zerolog.Logger) error {
+	// Validate that at least one server is configured
+	if s.serverV4 == nil && s.serverV6 == nil {
+		return fmt.Errorf("you must configure at least one of server.listenV4 or server.listenV6")
+	}
+
+	// Channel to collect errors from server goroutines
+	errChan := make(chan error, 2)
+	serversStarted := 0
+
+	// Start IPv4 server if configured
+	if s.serverV4 != nil && s.serverCfg.ListenV4 != nil && *s.serverCfg.ListenV4 {
+		if s.serverCfg.HttpPortV4 == nil {
+			return fmt.Errorf("server.httpPortV4 is not configured")
+		}
+		addrV4 := fmt.Sprintf("%s:%d", *s.serverCfg.HttpHostV4, *s.serverCfg.HttpPortV4)
+		logger.Info().Msgf("starting IPv4 HTTP server on %s", addrV4)
+
+		// Handle TLS for IPv4 server
+		if s.serverCfg.TLS != nil && s.serverCfg.TLS.Enabled {
+			tlsConfig, err := s.createTLSConfig()
+			if err != nil {
+				return fmt.Errorf("failed to create TLS config: %w", err)
+			}
+			s.serverV4.TLSConfig = tlsConfig
+			logger.Info().Msg("TLS enabled for IPv4 HTTP server")
+		}
+
+		serversStarted++
+		go func() {
+			var err error
+			s.serverV4.Addr = addrV4
+			if s.serverCfg.TLS != nil && s.serverCfg.TLS.Enabled {
+				err = s.serverV4.ListenAndServeTLS(s.serverCfg.TLS.CertFile, s.serverCfg.TLS.KeyFile)
+			} else {
+				err = s.serverV4.ListenAndServe()
+			}
+			if err != nil && err != http.ErrServerClosed {
+				errChan <- fmt.Errorf("IPv4 server error: %w", err)
+			} else {
+				errChan <- nil
+			}
+		}()
+	}
+
+	// Start IPv6 server if configured
+	if s.serverV6 != nil && s.serverCfg.ListenV6 != nil && *s.serverCfg.ListenV6 {
+		if s.serverCfg.HttpPortV6 == nil {
+			return fmt.Errorf("server.httpPortV6 is not configured")
+		}
+		addrV6 := fmt.Sprintf("%s:%d", *s.serverCfg.HttpHostV6, *s.serverCfg.HttpPortV6)
+		logger.Info().Msgf("starting IPv6 HTTP server on %s", addrV6)
+
+		// Handle TLS for IPv6 server
+		if s.serverCfg.TLS != nil && s.serverCfg.TLS.Enabled {
+			tlsConfig, err := s.createTLSConfig()
+			if err != nil {
+				return fmt.Errorf("failed to create TLS config: %w", err)
+			}
+			s.serverV6.TLSConfig = tlsConfig
+			logger.Info().Msg("TLS enabled for IPv6 HTTP server")
+		}
+
+		serversStarted++
+		go func() {
+			var err error
+			s.serverV6.Addr = addrV6
+			if s.serverCfg.TLS != nil && s.serverCfg.TLS.Enabled {
+				err = s.serverV6.ListenAndServeTLS(s.serverCfg.TLS.CertFile, s.serverCfg.TLS.KeyFile)
+			} else {
+				err = s.serverV6.ListenAndServe()
+			}
+			if err != nil && err != http.ErrServerClosed {
+				errChan <- fmt.Errorf("IPv6 server error: %w", err)
+			} else {
+				errChan <- nil
+			}
+		}()
+	}
+
+	// Wait for the first error or all servers to finish
+	for i := 0; i < serversStarted; i++ {
+		if err := <-errChan; err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// createTLSConfig creates a TLS configuration from server config
+func (s *HttpServer) createTLSConfig() (*tls.Config, error) {
+	tlsConfig := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+	}
+
+	// Load certificate and key
+	cert, err := tls.LoadX509KeyPair(s.serverCfg.TLS.CertFile, s.serverCfg.TLS.KeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load TLS certificate and key: %w", err)
+	}
+	tlsConfig.Certificates = []tls.Certificate{cert}
+
+	// Load CA if specified
+	if s.serverCfg.TLS.CAFile != "" {
+		caCert, err := os.ReadFile(s.serverCfg.TLS.CAFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read CA file: %w", err)
+		}
+		caCertPool := x509.NewCertPool()
+		if !caCertPool.AppendCertsFromPEM(caCert) {
+			return nil, fmt.Errorf("failed to parse CA certificate")
+		}
+		tlsConfig.ClientCAs = caCertPool
+		tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+
+	tlsConfig.InsecureSkipVerify = s.serverCfg.TLS.InsecureSkipVerify
+	return tlsConfig, nil
+}
+
+func (s *HttpServer) Shutdown(logger *zerolog.Logger) error {
+	logger.Info().Msg("stopping http servers...")
+
+	s.shutdownWebSockets(logger, 0)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	errChan := make(chan error, 2)
+	serversToShutdown := 0
+
+	// Shutdown IPv4 server if running
+	if s.serverV4 != nil {
+		serversToShutdown++
+		go func() {
+			if err := s.serverV4.Shutdown(ctx); err != nil {
+				errChan <- fmt.Errorf("IPv4 server shutdown error: %w", err)
+			} else {
+				logger.Info().Msg("IPv4 HTTP server stopped")
+				errChan <- nil
+			}
+		}()
+	}
+
+	// Shutdown IPv6 server if running
+	if s.serverV6 != nil {
+		serversToShutdown++
+		go func() {
+			if err := s.serverV6.Shutdown(ctx); err != nil {
+				errChan <- fmt.Errorf("IPv6 server shutdown error: %w", err)
+			} else {
+				logger.Info().Msg("IPv6 HTTP server stopped")
+				errChan <- nil
+			}
+		}()
+	}
+
+	// Wait for all servers to shutdown
+	var lastErr error
+	for i := 0; i < serversToShutdown; i++ {
+		if err := <-errChan; err != nil {
+			lastErr = err
+		}
+	}
+
+	return lastErr
+}
+
+// shutdownWebSockets refuses new WebSocket connections and closes the active
+// ones with GoingAway, giving their in-flight requests up to grace to
+// finish, then waits for subscription cleanup to complete.
+func (s *HttpServer) shutdownWebSockets(logger *zerolog.Logger, grace time.Duration) {
+	s.draining.Store(true)
+
+	var conns []*WsConnection
+	s.activeWsConns.Range(func(_, value interface{}) bool {
+		wsc := value.(*WsConnection)
+		wsc.stop(websocket.CloseGoingAway, "server shutting down", grace)
+		conns = append(conns, wsc)
+		return true
+	})
+	if len(conns) == 0 {
+		return
+	}
+
+	logger.Info().Int("connections", len(conns)).Msg("closing active WebSocket connections...")
+	timeout := time.After(grace + 10*time.Second)
+	for _, wsc := range conns {
+		select {
+		case <-wsc.done:
+		case <-timeout:
+			logger.Warn().Int("connections", len(conns)).Msg("timed out waiting for WebSocket connections to close")
+			return
+		}
+	}
+	logger.Info().Int("connections", len(conns)).Msg("all WebSocket connections closed")
+}
+
+// conditionalGzipWriter wraps ResponseWriter and decides whether to compress
+// once enough body bytes have been observed. Writes (and any explicit status
+// code) are held back until the total body size reaches compressionThreshold,
+// at which point the response is committed as gzip; if the handler finishes or
+// flushes below the threshold, the buffered bytes are sent uncompressed.
+//
+// Buffering across writes (instead of deciding on the first write only) is
+// required because JSON-RPC responses are streamed in multiple small writes:
+// JsonRpcResponse.WriteTo emits the ~22-byte envelope prefix first, so a
+// first-write-only decision would permanently disable compression for every
+// JSON-RPC response regardless of total size (see issue #990).
+//
+// WriteHeader is deferred for the same reason: the JSON-RPC path calls
+// WriteHeader before streaming the body, and Content-Encoding must be set
+// before the header block is flushed to the client.
+type conditionalGzipWriter struct {
+	http.ResponseWriter
+	gzipWriter  *gzip.Writer
+	pool        *util.GzipWriterPool
+	decided     bool
+	compressing bool
+	buf         []byte // body bytes buffered while undecided
+	status      int    // deferred status code from WriteHeader, 0 if none
+}
+
+// Compile-time check that conditionalGzipWriter implements http.Flusher
+var _ http.Flusher = (*conditionalGzipWriter)(nil)
+
+// WriteHeader defers the status code until the compression decision is made,
+// so Content-Encoding can still be set when compression kicks in.
+func (w *conditionalGzipWriter) WriteHeader(statusCode int) {
+	if w.decided {
+		w.ResponseWriter.WriteHeader(statusCode)
+		return
+	}
+	w.status = statusCode
+}
+
+func (w *conditionalGzipWriter) Write(b []byte) (int, error) {
+	// If we've already decided, just pass through
+	if w.decided {
+		if w.compressing {
+			return w.gzipWriter.Write(b)
+		}
+		return w.ResponseWriter.Write(b)
+	}
+
+	// Enough cumulative bytes to justify compression: commit and route this
+	// write through gzip directly (avoids copying large payloads into buf).
+	if len(w.buf)+len(b) >= compressionThreshold {
+		if err := w.decide(true); err != nil {
+			return 0, err
+		}
+		return w.gzipWriter.Write(b)
+	}
+
+	// Still undecided: buffer and wait for more writes.
+	if w.buf == nil {
+		w.buf = make([]byte, 0, compressionThreshold)
+	}
+	w.buf = append(w.buf, b...)
+	return len(b), nil
+}
+
+// decide commits to compressing or not: it sets the relevant headers, sends
+// the deferred status code, and drains buffered bytes to the chosen sink.
+func (w *conditionalGzipWriter) decide(compress bool) error {
+	w.decided = true
+	w.compressing = compress
+
+	if compress {
+		w.ResponseWriter.Header().Del("Content-Length")
+		w.ResponseWriter.Header().Set("Content-Encoding", "gzip")
+		if ct := w.ResponseWriter.Header().Get("Content-Type"); ct == "" {
+			w.ResponseWriter.Header().Set("Content-Type", "application/json")
+		}
+		w.gzipWriter = w.pool.Get(w.ResponseWriter)
+	}
+	if w.status != 0 {
+		w.ResponseWriter.WriteHeader(w.status)
+	}
+
+	var err error
+	if len(w.buf) > 0 {
+		if compress {
+			_, err = w.gzipWriter.Write(w.buf)
+		} else {
+			_, err = w.ResponseWriter.Write(w.buf)
+		}
+		w.buf = nil
+	}
+	return err
+}
+
+// Flush implements http.Flusher interface to support streaming responses.
+// A flush while undecided means the handler wants the (sub-threshold)
+// buffered bytes on the wire now, so the response commits to passthrough.
+func (w *conditionalGzipWriter) Flush() {
+	if !w.decided {
+		_ = w.decide(false)
+	}
+	if w.compressing && w.gzipWriter != nil {
+		_ = w.gzipWriter.Flush()
+	}
+	// Also flush underlying ResponseWriter if it supports it
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Close finalizes the response. If the total body stayed below the threshold,
+// the buffered bytes (and any deferred status code) are sent uncompressed.
+func (w *conditionalGzipWriter) Close() error {
+	if !w.decided {
+		return w.decide(false)
+	}
+	if w.compressing && w.gzipWriter != nil {
+		err := w.gzipWriter.Close()
+		w.pool.Put(w.gzipWriter)
+		return err
+	}
+	return nil
+}
+
+func gzipHandler(next http.Handler) http.Handler {
+	// Pool writers across responses for better performance
+	var gzPool = util.NewGzipWriterPool()
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A WebSocket handshake has no body to compress and must reach the
+		// upgrader with a ResponseWriter that can be hijacked, which the
+		// gzip writer cannot.
+		if isWebSocketUpgradeRequest(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// The response representation depends on Accept-Encoding, so caches
+		// must be told regardless of whether this response ends up compressed.
+		w.Header().Set("Vary", "Accept-Encoding")
+
+		// Check if client accepts gzip encoding
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Create conditional gzip response writer that decides once enough
+		// body bytes have been seen (or the response completes/flushes).
+		gzw := &conditionalGzipWriter{
+			ResponseWriter: w,
+			pool:           gzPool,
+		}
+
+		// Call the next handler with our conditional gzip response writer
+		next.ServeHTTP(gzw, r)
+
+		// Ensure proper cleanup
+		_ = gzw.Close()
+	})
+}
+
+// resolveRealClientIP determines the originating client IP, honoring standard forwarding headers
+// only when the immediate peer is a trusted forwarder. Falls back to remote address.
+func (s *HttpServer) resolveRealClientIP(r *http.Request) string {
+	remoteIP := parseRemoteIP(r.RemoteAddr)
+	if remoteIP == nil {
+		return "n/a"
+	}
+
+	if !s.isTrustedForwarder(remoteIP) {
+		return remoteIP.String()
+	}
+
+	// Iterate over configured trusted IP headers in order and parse as XFF-like list
+	for _, hdr := range s.trustedIPHeaders {
+		if hdr == "" {
+			continue
+		}
+		if v := strings.TrimSpace(r.Header.Get(hdr)); v != "" {
+			ips := parseXForwardedFor(v)
+			if ip := trimRightTrustedAndPick(ips, s.isTrustedForwarder); ip != nil {
+				return ip.String()
+			}
+		}
+	}
+
+	return remoteIP.String()
+}
+
+func (s *HttpServer) isTrustedForwarder(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	if s.trustedForwarderIPs != nil {
+		if _, ok := s.trustedForwarderIPs[ip.String()]; ok {
+			return true
+		}
+	}
+	for i := range s.trustedForwarderNets {
+		if s.trustedForwarderNets[i].Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// no header allowlist; headers are explicitly configured in server.trustedIPHeaders
+
+func parseRemoteIP(remoteAddr string) net.IP {
+	host := remoteAddr
+	if h, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		host = h
+	}
+	// Remove IPv6 brackets if any
+	host = stripAddrDecorations(host)
+	return net.ParseIP(host)
+}
+
+func parseXForwardedFor(xff string) []net.IP {
+	parts := strings.Split(xff, ",")
+	ips := make([]net.IP, 0, len(parts))
+	for _, p := range parts {
+		v := strings.TrimSpace(p)
+		v = stripAddrDecorations(v)
+		// Some implementations might include host:port; strip port if present
+		if h, _, err := net.SplitHostPort(v); err == nil {
+			v = h
+		}
+		if ip := net.ParseIP(v); ip != nil {
+			ips = append(ips, ip)
+		}
+	}
+	return ips
+}
+
+// parseForwardedFor parses RFC 7239 Forwarded header and extracts the sequence of for= IPs
+func parseForwardedFor(fwd string) []net.IP {
+	// Split elements by comma, then params by ';', pick for= value
+	items := strings.Split(fwd, ",")
+	ips := make([]net.IP, 0, len(items))
+	for _, it := range items {
+		params := strings.Split(it, ";")
+		for _, p := range params {
+			p = strings.TrimSpace(p)
+			if len(p) >= 4 && strings.HasPrefix(strings.ToLower(p), "for=") {
+				v := strings.TrimSpace(p[4:])
+				// Remove optional quotes
+				v = strings.Trim(v, "\"")
+				v = stripAddrDecorations(v)
+				// Strip optional :port if present
+				if h, _, err := net.SplitHostPort(v); err == nil {
+					v = h
+				}
+				if ip := net.ParseIP(v); ip != nil {
+					ips = append(ips, ip)
+				}
+			}
+		}
+	}
+	return ips
+}
+
+// trimRightTrustedAndPick removes trailing trusted proxy IPs and returns the nearest untrusted IP (client)
+func trimRightTrustedAndPick(ips []net.IP, isTrusted func(net.IP) bool) net.IP {
+	if len(ips) == 0 {
+		return nil
+	}
+	end := len(ips) - 1
+	for end >= 0 && isTrusted(ips[end]) {
+		end--
+	}
+	if end >= 0 {
+		return ips[end]
+	}
+	return nil
+}
+
+// stripAddrDecorations removes brackets and spaces commonly seen around IPv6 or quoted values
+func stripAddrDecorations(s string) string {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
+		return s[1 : len(s)-1]
+	}
+	return s
+}
+
+// applyForwardHeaders copies the request headers matching the project's
+// forwardHeaders patterns onto nq.
+func applyForwardHeaders(project *PreparedProject, nq *common.NormalizedRequest, headers http.Header) error {
+	if project == nil {
+		return nil
+	}
+	for _, matchKey := range project.Config.ForwardHeaders {
+		for key, values := range headers {
+			matches, err := common.WildcardMatch(matchKey, key)
+			if err != nil {
+				return err
+			}
+			if matches {
+				for _, value := range values {
+					nq.ForwardHeaders.Add(matchKey, value)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// isMethodAllowed applies the project's ignoreMethods / allowMethods
+// (allowMethods wins).
+func isMethodAllowed(project *PreparedProject, method string) (bool, error) {
+	if project == nil {
+		return true, nil
+	}
+	allowed := true
+	for _, m := range project.Config.IgnoreMethods {
+		match, err := common.WildcardMatch(m, method)
+		if err != nil {
+			return false, err
+		}
+		if match {
+			allowed = false
+			break
+		}
+	}
+	for _, m := range project.Config.AllowMethods {
+		match, err := common.WildcardMatch(m, method)
+		if err != nil {
+			return false, err
+		}
+		if match {
+			allowed = true
+			break
+		}
+	}
+	return allowed, nil
+}
+
+// applyRequestDirectives applies network directive defaults and then the
+// client's own directives from headers/query, subject to the project's
+// allowClientDirectives for the resolved user.
+func applyRequestDirectives(project *PreparedProject, nw *Network, nq *common.NormalizedRequest, headers http.Header, queryArgs map[string][]string) {
+	nq.ApplyDirectiveDefaults(nw.Config().DirectiveDefaults)
+	// Configure how to store User-Agent (raw vs simplified) based on project config
+	uaMode := common.UserAgentTrackingModeSimplified
+	if project != nil {
+		if project.Config.UserAgentMode != "" {
+			uaMode = project.Config.UserAgentMode
+		}
+		nq.SetAllowClientDirectiveMatcher(project.clientDirectiveMatcherFor(nq.User()))
+	}
+	nq.EnrichFromHttp(headers, queryArgs, uaMode)
+}
+
+// isAdminMethodBlocked returns true when the admin config's DenyMethods/AllowMethods
+// rules prevent the given method from being handled.
+// DenyMethods is evaluated first; AllowMethods can re-admit a method that was denied.
+func isAdminMethodBlocked(cfg *common.AdminConfig, method string) (bool, error) {
+	blocked := false
+	for _, pattern := range cfg.DenyMethods {
+		match, err := common.WildcardMatch(pattern, method)
+		if err != nil {
+			return false, err
+		}
+		if match {
+			blocked = true
+			break
+		}
+	}
+	if blocked {
+		for _, pattern := range cfg.AllowMethods {
+			match, err := common.WildcardMatch(pattern, method)
+			if err != nil {
+				return false, err
+			}
+			if match {
+				return false, nil
+			}
+		}
+		return true, nil
+	}
+	if len(cfg.AllowMethods) > 0 {
+		for _, pattern := range cfg.AllowMethods {
+			match, err := common.WildcardMatch(pattern, method)
+			if err != nil {
+				return false, err
+			}
+			if match {
+				return false, nil
+			}
+		}
+		return true, nil
+	}
+	return false, nil
+}

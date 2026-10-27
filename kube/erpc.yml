@@ -1,0 +1,159 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: erpc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: erpc
+  namespace: erpc
+spec:
+  selector:
+    matchLabels:
+      app: erpc
+  template:
+    metadata:
+      labels:
+        app: erpc
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "4001"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: main
+        image: "ghcr.io/erpc/erpc:latest"
+        imagePullPolicy: Always
+        command: ["/erpc-server"]
+        resources:
+          requests:
+            memory: "3Gi"
+            cpu: "2" 
+          limits:
+            memory: "3Gi"
+            cpu: "2"
+        env:
+          - name: SOME_ENV_VAR
+            value: "some value"
+        volumeMounts:
+          - name: config-volume
+            mountPath: /erpc.yaml
+            subPath: erpc.yaml
+      volumes:
+      - name: config-volume
+        configMap:
+          name: erpc-config
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: erpc-config
+  namespace: erpc
+data:
+  erpc.yaml: |
+    logLevel: DEBUG
+    database:
+      evmJsonRpcCache:
+        connectors:
+          - id: postgres-cache
+            driver: postgresql
+            postgresql:
+              connectionUri: postgres://postgres:xxxxxxxxxxxxxxxxxxxx@erpc-pg.erpc.svc.cluster.local:5432/erpc
+              table: rpc_cache
+        policies:
+          - network: "*"
+            method: "*"
+            finality: finalized
+            connector: postgres-cache
+    server:
+      httpHostV4: 0.0.0.0
+      httpPort: 4000
+    metrics:
+      enabled: true
+      hostV4: 0.0.0.0
+      port: 4001
+    networks:
+    - architecture: evm
+      evm:
+        chainId: 42161
+      failsafe:
+        hedge:
+          delay: 3000ms
+          maxCount: 2
+    projects:
+      - id: main
+        upstreams:
+        - id: alchemy-main
+          endpoint: alchemy://xxxxxxxxxxxxxxxxxxxx
+          rateLimitBudget: global
+          failsafe:
+            timeout:
+              duration: 5s
+            retry: 
+              maxAttempts: 3
+              delay: 1s
+              backoffMaxDelay: 10s
+              backoffFactor: 0.3
+              jitter: 200ms
+        - id: blast-42161
+          endpoint: https://arbitrum-one.blastapi.io/xxxxxxxxxxxxxxxxxxxx
+          rateLimitBudget: global
+          failsafe:
+            timeout:
+              duration: 5s
+            retry: 
+              maxAttempts: 3
+              delay: 1s
+              backoffMaxDelay: 10s
+              backoffFactor: 0.3
+              jitter: 200ms
+        - id: quicknode-42161
+          endpoint: https://xxxxxxxxxxxxxxxxxxxx.arbitrum-mainnet.quiknode.pro/xxxxxxxxxxxxxxxxxxxx/
+          rateLimitBudget: global
+          failsafe:
+            timeout:
+              duration: 5s
+            retry: 
+              maxAttempts: 3
+              delay: 1s
+              backoffMaxDelay: 10s
+              backoffFactor: 0.3
+              jitter: 200ms
+    rateLimiters:
+      budgets:
+      - id: global
+        rules:
+        - method: '*'
+          maxCount: 10000000
+          period: 1m
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: erpc
+  namespace: erpc
+spec:
+  selector:
+    app: erpc
+  ports:
+  - name: http-jsonrpc
+    port: 80
+    targetPort: 4000
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  labels:
+    release: monitoring
+  name: erpc
+  namespace: erpc
+spec:
+  podMetricsEndpoints:
+  - interval: 10s
+    port: http
+    scrapeTimeout: 5s
+  selector:
+    matchLabels:
+      app: erpc

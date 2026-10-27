@@ -1,0 +1,962 @@
+---
+title: Upstreams
+description: Add any RPC endpoint — Alchemy, a self-hosted node, a gRPC feed — and eRPC figures out what it can serve, heals it when it breaks, and routes around it when it can't.
+---
+
+import { AISection, ConfigTabs, LLMsTxtLink, PromptExample, SourceLink } from "../../../components";
+
+<LLMsTxtLink />
+
+# Upstreams
+
+Point eRPC at any RPC endpoint and it handles the rest: auto-detects chain ID,
+starts a background health poller, blocks archive queries from reaching pruned
+full nodes, and heals broken providers back into rotation automatically. When
+you need a manual kill switch, one admin call cordons an upstream instantly —
+no config change, no restart.
+
+## Quick taste
+
+Illustrative, not a tuned production config — a minimal upstream definition:
+
+<ConfigTabs
+  path="projects[].upstreams[]"
+  focusYaml="4-5"
+  focusTs="4-5"
+  yaml={`projects:
+  - id: main
+    upstreams:
+      - # chain ID auto-detected; state poller starts automatically.
+        # http(s) and ws(s) schemes are supported; use ws:// or wss://
+        # for WebSocket upstreams (required for eth_subscribe support).
+        endpoint: https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY`}
+  ts={`projects: [{
+  id: "main",
+  upstreams: [{
+    // chain ID auto-detected; state poller starts automatically
+    endpoint: "https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY",
+  }],
+}]`}
+/>
+
+## Agent reference
+
+Copy one of these prompts into your AI agent session (Claude Code, Cursor, …) — each one
+points the agent at this page's machine-readable reference so it can do the work correctly:
+
+<PromptExample
+	n={1}
+	title="add and tune a new upstream from scratch"
+	defaultOpen
+	prompt={`I want to add a new RPC upstream to my eRPC project — a self-hosted archive node
+plus a QuickNode fallback. Wire them up in my eRPC config with the right block-availability
+windows, a shared upstreamDefaults for failsafe timeouts and rateLimitAutoTune, and
+ignoreMethods for filter methods my nodes don't support. Read the full reference first:
+https://docs.erpc.cloud/config/projects/upstreams.llms.txt`}
+/>
+
+<PromptExample
+	n={2}
+	title="audit my upstream routing and fix block-window gaps"
+	prompt={`Audit the upstreams in my eRPC config: check that every full/pruned node has an
+explicit evm.blockAvailability.lower.latestBlockMinus set (not the deprecated nodeType
+field), that archive nodes have no lower bound, and that no upstream uses allowMethods
+without a matching ignoreMethods. Flag any gotchas and apply fixes. Reference:
+https://docs.erpc.cloud/config/projects/upstreams.llms.txt`}
+/>
+
+<PromptExample
+	n={3}
+	title="debug why an upstream keeps getting skipped"
+	prompt={`Requests to one of my upstreams in my eRPC config are returning ErrUpstreamRequestSkipped
+with reason ErrUpstreamMethodIgnored. Walk me through the shouldSkip pipeline and help
+me figure out whether the problem is ignoreMethods, allowMethods injection, or a
+use-upstream directive mismatch. Reference:
+https://docs.erpc.cloud/config/projects/upstreams.llms.txt`}
+/>
+
+<PromptExample
+	n={4}
+	title="add a gRPC cache upstream scoped to read methods only"
+	prompt={`I have an internal gRPC cache service I want to wire into my eRPC project as a
+high-priority upstream that only handles eth_getLogs, eth_getBlockByNumber,
+eth_getBlockByHash, eth_getTransactionByHash, and eth_getTransactionReceipt. It should
+get a high scoreMultipliers.overall so eRPC prefers it, a tight per-upstream timeout
+failsafe, and explicit blockAvailability bounds matching the cache window. Config is
+in my eRPC config. Reference:
+https://docs.erpc.cloud/config/projects/upstreams.llms.txt`}
+/>
+
+<PromptExample
+	n={5}
+	title="configure rateLimitBudget and auto-tune for a paid vendor"
+	prompt={`I want to add a rate-limit budget for my Alchemy upstream in my eRPC config and enable
+rateLimitAutoTune so eRPC backs off when error rate climbs above 10% and ramps back up
+on healthy minutes. Also set a per-network scoreMultipliers.overall of 0.2 so Alchemy
+is used as a fallback rather than the primary path. Reference:
+https://docs.erpc.cloud/config/projects/upstreams.llms.txt`}
+/>
+
+<AISection title="Upstreams — full agent reference">
+
+### How it works
+
+**Config-time pipeline.** When eRPC loads a project, each upstream in `upstreams[]`
+first runs `ApplyDefaults` against `upstreamDefaults` — only-if-unset for scalar
+fields; all-or-nothing for `tags`, `failsafe`, and `routing`; per-field merge for
+EVM sub-fields; wholesale-then-per-field for SVM sub-fields — then `SetDefaults` fills
+remaining gaps: deriving an `id` if empty,
+defaulting `type` to `evm` **only when it was omitted** (so an SVM upstream must say
+`type: svm`), injecting `ignoreMethods: ["*"]` when `allowMethods` is set
+without an explicit `ignoreMethods`. Endpoints using a vendor shorthand
+(`alchemy://KEY`, `drpc://KEY`, and 20+ other prefixes) are converted into provider
+configs at this stage; the rest of the upstream block travels as a `"*"` override.
+(<SourceLink file="common/defaults.go" lines="1152-1241" />)
+
+**Runtime bootstrap.** Every upstream registers as a named background `BootstrapTask`
+(`upstream/<id>`) so service startup never blocks. The initializer retries with
+exponential backoff (3 s → 130 s, factor 1.5) unless the task returns a `TaskFatal`
+error. Bootstrap calls `eth_chainId`, stores the detected value, derives
+`networkId = evm:<chainId>`, and starts the EVM state poller. A chain ID mismatch
+against a configured `evm.chainId` is fatal (no retry). A state-poller startup
+failure is not fatal — the upstream registers and availability checks fail-open
+until the poller recovers. (<SourceLink file="upstream/registry.go" lines="95-104" />)
+
+**Request path.** Before forwarding, `shouldSkip` runs in order: shadow upstreams
+skip real traffic → `evm.skipWhenSyncing` with a syncing poller → `ShouldHandleMethod`
+(ignore → allow with wildcard patterns, result cached per method forever) →
+`use-upstream` directive matching (upstream ID first, then tags for purely-positive
+patterns). Block-availability gating is deliberately deferred to the network layer
+so a "block slightly ahead" is classified retryable rather than short-circuited.
+(<SourceLink file="upstream/upstream.go" lines="1505-1548" />)
+
+**Block availability.** An upstream can declare the block window it serves via
+`evm.blockAvailability`. Bounds can be relative to the chain tip (`latestBlockMinus`),
+relative to the detected earliest block (`earliestBlockPlus`), or fixed (`exactBlock`).
+When a request targets a block outside the window, eRPC skips the upstream and tries
+the next rather than failing the request. The network layer turns an unavailable-block
+skip into `ErrUpstreamBlockUnavailable`, retryable when the block is within 128 blocks
+of the tip (configurable via `networks[].evm.maxRetryableBlockDistance`).
+(<SourceLink file="erpc/networks.go" lines="1919-1987" />)
+
+Set it once for a whole project under `upstreamDefaults` instead of repeating it on
+every upstream — useful when a pool is uniformly pruned (e.g. nodes started with a
+retention window). An upstream that declares its own `blockAvailability` **or** the
+deprecated `maxAvailableRecentBlocks` keeps its own value; the project default only
+fills upstreams that declare neither, and it takes precedence over the 128-block
+window otherwise derived from `nodeType: full`.
+(<SourceLink file="common/defaults.go" lines="2029-2042" />)
+
+```yaml
+projects:
+  - id: main
+    upstreamDefaults:
+      evm:
+        blockAvailability:
+          lower:
+            latestBlockMinus: 604800 # serve only the most recent ~604800 blocks
+```
+
+When every upstream skips the block, the client receives a JSON-RPC error with code
+`-32014` ("block not available") rather than a generic internal error, so a pruned
+range is distinguishable from eRPC itself failing.
+(<SourceLink file="common/json_rpc.go" lines="1715-1740" />)
+
+Every upstream must agree. If one of them instead timed out or returned a server
+error, that upstream never answered, so the request falls back to a generic
+retryable error rather than claiming the block is definitively absent.
+(<SourceLink file="common/json_rpc.go" lines="1588-1606" />)
+
+**Cordoning.** Cordon state lives on the health tracker as an explicit flag — it is
+NOT a rolling-window metric and survives window rotation and idle eviction. Admin
+RPCs via the [Admin API](/operation/admin): `erpc_cordonUpstream`,
+`erpc_uncordonUpstream`, `erpc_listCordoned`. The selection-policy engine exposes
+`cordonedReason` to the JS policy; the default policy's `removeCordoned()` step
+drops cordoned upstreams from routing. (<SourceLink file="health/tracker.go" lines="793-849" />)
+
+**HTTP client and proxy pools.** Each HTTP upstream gets a pre-warmed `http.Transport`
+with up to 256 idle connections per host (unlimited active), TCP keepalive at 15-second
+intervals, and a 60-second end-to-end call timeout. Proxy pools let you route outbound
+traffic through SOCKS5 or HTTP proxies, round-robined by an atomic counter.
+
+Fixed transport parameters (not user-configurable; same values for direct and proxy transports):
+
+| Parameter | Value |
+|---|---|
+| `MaxIdleConns` | `1024` |
+| `MaxIdleConnsPerHost` | `256` |
+| `MaxConnsPerHost` | `0` (unlimited) — prevents connection queuing under high RPS / high latency |
+| `IdleConnTimeout` | `90s` |
+| `ResponseHeaderTimeout` | `30s` |
+| `TLSHandshakeTimeout` | `10s` |
+| `ExpectContinueTimeout` | `1s` |
+| `http.Client.Timeout` (end-to-end) | `60s` |
+| Dial timeout | `10s` |
+| TCP keepalive interval | `15s` |
+
+(<SourceLink file="clients/http_json_rpc_client.go" lines="109-128" />; proxy transports: <SourceLink file="clients/proxy_pool_registry.go" lines="82-98" />)
+
+### Config schema
+
+All paths relative to `projects[*]`. "Default" = value after `SetDefaults`/`ApplyDefaults`.
+
+| Field | Type | Default | Behavior / footguns |
+|---|---|---|---|
+| `upstreams[*].id` | string | Derived: native-scheme endpoint → `<hostname>-<N>`; non-native → `<scheme>-<N>`; if `vendorName` set → `<vendorName>-<N>` (<SourceLink file="common/defaults.go" lines="1596-1615" />) | Used in task names, metrics labels, `use-upstream` matching, admin cordon RPCs. |
+| `upstreams[*].type` | `UpstreamType` | `"evm"` when omitted (<SourceLink file="common/defaults.go" lines="1715-1718" />) | `evm` and `svm` are both supported at runtime. The `evm+<vendor>` shorthand schemes are normalized to `"evm"` at defaults time. **Footgun**: `svm` is never inferred — an upstream serving Solana that omits `type` silently becomes an EVM upstream and fails to bootstrap. Always write `type: svm` explicitly. |
+| `upstreams[*].endpoint` | string | `""` (required) | Native schemes: `http://`, `https://`, `ws://`, `wss://`, `grpc://`, `grpc+bds://`. Non-native (e.g. `alchemy://KEY`) converts the upstream into a provider. `ws://`/`wss://` create a persistent WebSocket client (auto-reconnect, keepalive) that serves regular requests and `eth_subscribe` — see [WebSocket](/operation/websocket). Redacted in JSON/YAML output. |
+| `upstreams[*].tags` | `[]string` | nil; all-or-nothing inheritance from `upstreamDefaults.tags` (<SourceLink file="common/defaults.go" lines="1505-1510" />) | `<dim>:<value>` convention. Matched by `use-upstream` and policy stdlib. **Footgun**: one tag on the upstream drops ALL defaults tags. |
+| `upstreams[*].vendorName` | string | `""`; at runtime filled by URL pattern match or `guessVendorName()` | When non-empty, forces name-lookup only — `OwnsUpstream` URL matching is skipped. Mismatch silently applies the wrong error normalizer. No warning is logged. |
+| `upstreams[*].ignoreMethods` | `[]string` | nil; **forced to `["*"]` when `allowMethods` set and `ignoreMethods` nil** (<SourceLink file="common/defaults.go" lines="1706-1712" />) | Evaluated first in `ShouldHandleMethod`. Glob wildcards + `\|` OR + `&` AND + `!` NOT. Result cached per method forever. |
+| `upstreams[*].allowMethods` | `[]string` | nil | Evaluated after `ignoreMethods`; a match forces support to true. Setting this alone implicitly blocks all other methods via injected `ignoreMethods: ["*"]`. |
+| `upstreams[*].autoIgnoreUnsupportedMethods` | `*bool` | nil (no global default); `true` for repository-provider upstreams (<SourceLink file="thirdparty/repository.go" lines="89-91" />) | When true, `ErrCodeEndpointUnsupported` reply triggers `IgnoreMethod` (appends to `IgnoreMethods`; permanent for process lifetime). |
+| `upstreams[*].failsafe[]` | `[]*FailsafeConfig` | nil; deep-copied from `upstreamDefaults.failsafe` when absent (all-or-nothing) | Per-entry `matchMethod` defaults to `"*"`. Match priority: method+finality &gt; method &gt; finality &gt; catch-all. `consensus` rejected at upstream scope. |
+| `upstreams[*].rateLimitBudget` | string | `""` | References `rateLimiters.budgets[].id`. Checked before each `Forward`; trips `ErrUpstreamRateLimitRuleExceeded`. |
+| `upstreams[*].rateLimitCountMode` | `"request"` \| `"credit"` | `"request"` | How the upstream's `rateLimitBudget` counts a call. `"request"` charges a flat 1 hit; `"credit"` charges the request's resolved vendor credit-unit cost (same table as `X-ERPC-Credits`), so a heavy `eth_getLogs` drains the budget faster than a cheap `eth_blockNumber` — a `0`-CU method consumes nothing. Uses the pre-flight table estimate (real cost isn't known until after the call). In `"credit"` the budget is one pool shared by all methods rather than a counter per method. The referenced budget must not define its own `creditUnits` or rule-level `countMode`, which is a second cost source for the same counter and fails validation; budgets outside the upstream scope use those instead. |
+| `upstreams[*].creditUnits` | `map[string]int64` | `nil` | Per-method credit-unit overrides for the cost accounting behind `X-ERPC-Credits` (`server.costHeaders`) and `rateLimitCountMode: credit`, merged over the vendor's built-in `CreditUnitsProvider` table (`"*"` = fallback for unlisted methods). Usually set once per provider via `providers[].settings.creditUnits` instead of per upstream. |
+| `upstreams[*].rateLimitAutoTune.enabled` | `*bool` | `true` (<SourceLink file="common/defaults.go" lines="2490-2492" />) | Auto-created when `rateLimitBudget != ""`. |
+| `upstreams[*].rateLimitAutoTune.adjustmentPeriod` | Duration | `1m` (<SourceLink file="common/defaults.go" lines="2493-2495" />) | Tuning cadence. |
+| `upstreams[*].rateLimitAutoTune.errorRateThreshold` | float64 | `0.1` (<SourceLink file="common/defaults.go" lines="2496-2498" />) | Error-rate trigger for decrease. |
+| `upstreams[*].rateLimitAutoTune.increaseFactor` | float64 | `1.05` (<SourceLink file="common/defaults.go" lines="2499-2501" />) | Multiplier on healthy periods. |
+| `upstreams[*].rateLimitAutoTune.decreaseFactor` | float64 | `0.95` (<SourceLink file="common/defaults.go" lines="2502-2504" />) | Multiplier on unhealthy periods. |
+| `upstreams[*].rateLimitAutoTune.minBudget` | int | `0` | Floor for tuned budget. |
+| `upstreams[*].rateLimitAutoTune.maxBudget` | int | `100000` (<SourceLink file="common/defaults.go" lines="2505-2507" />) | Ceiling for tuned budget. |
+| `upstreams[*].jsonRpc.supportsBatch` | `*bool` | nil (false) | Enables outbound JSON-RPC batching in the HTTP client. |
+| `upstreams[*].jsonRpc.batchMaxSize` | int | `0` | Max requests per batch. `0` with `supportsBatch: true` fires instantly on first queued request — use a value ≥ 2 to actually coalesce. |
+| `upstreams[*].jsonRpc.batchMaxWait` | Duration | `0` | `time.AfterFunc(0, ...)` fires immediately; set a non-zero value (e.g. `10ms`) to coalesce. |
+| `upstreams[*].jsonRpc.enableGzip` | `*bool` | nil (false) | Compresses outbound request body. Client always sends `Accept-Encoding: gzip` and decompresses responses regardless. |
+| `upstreams[*].jsonRpc.headers` | `map[string]string` | nil | Static headers on every outbound request. Applied via `Header.Set` (overwrites defaults for matching keys). |
+| `upstreams[*].jsonRpc.proxyPool` | string | `""` | References `proxyPools[].id`. Error at startup if pool not found. |
+| `upstreams[*].grpc.headers` | `map[string]string` | nil | Applied as gRPC metadata on every outbound request. |
+| `upstreams[*].shadow.enabled` | bool | `false` | Registers into `networkShadowUpstreams`; never serves real traffic; receives async mirrored traffic post-response. |
+| `upstreams[*].shadow.sampleRate` | `*float64` | nil → effective `1.0` | Probability a real response triggers a mirror to this upstream. |
+| `upstreams[*].shadow.ignoreFields` | `map[string][]string` | nil | Per-method response fields ignored during shadow comparison. |
+| `upstreams[*].routing` | object | nil; cloned wholesale from `upstreamDefaults.routing` when absent (all-or-nothing) | Routing hints for the selection-policy engine. |
+| `upstreams[*].routing.scoreMultipliers[].overall` | `*float64` | unset = 1 | Scales the upstream's final score. `2` = twice as preferred. |
+| `upstreams[*].routing.scoreMultipliers[].errorRate` / `respLatency` / `throttledRate` / `blockHeadLag` / `finalizationLag` / `misbehaviors` | `*float64` | unset = inherit preset | Per-dimension weight overrides for `sortByScore`. `0` removes contribution. |
+| `upstreams[*].routing.scoreLatencyQuantile` | float64 | `0` → policy default p70 | Which response-time quantile feeds the score. |
+| `upstreams[*].routing.probe` | `"on"` \| `"off"` | `""` → `on` | `off` opts this upstream out of probe-excluded shadow-mirror traffic. |
+| `upstreams[*].evm.chainId` | int64 | `0` → auto-detected via `eth_chainId` at bootstrap | Mismatch against detected value is **fatal** (no retry). Must be `0` for vendor-shorthand endpoints. |
+| `upstreams[*].evm.statePollerInterval` | Duration | `30s` (<SourceLink file="common/defaults.go" lines="1718-1724" />) | Background latest/finalized poll cadence. Non-zero required. |
+| `upstreams[*].evm.statePollerDebounce` | Duration | `0` → inferred from chain block time | Minimum spacing between forced polls. |
+| `upstreams[*].evm.skipWhenSyncing` | `*bool` | `false` (<SourceLink file="common/defaults.go" lines="1766-1772" />) | Skip requests with `ErrUpstreamSyncing` while the poller reports syncing state. |
+| `upstreams[*].evm.skipSyncingCheck` | `*bool` | `false` | Disable `eth_syncing` polling for this upstream and hard-set syncing state to `NotSyncing`. Use for nodes that always return a syncing object (e.g. Pharos/Antora) even when fully caught up, which would otherwise cause permanent circuit-breaker false positives. |
+| `upstreams[*].evm.blockAvailability.lower` / `.upper` | object | nil = unbounded side | Each bound sets exactly one of `exactBlock`, `latestBlockMinus`, `earliestBlockPlus`. Cross-bound validation: `latestBlockMinus` lower value must be ≥ upper value. |
+| `upstreams[*].evm.blockAvailability.{lower,upper}.latestBlockMinus` | `*int64` | nil | Bound = latest − N. Recomputed on each check from state poller. |
+| `upstreams[*].evm.blockAvailability.{lower,upper}.earliestBlockPlus` | `*int64` | nil | Bound = detected earliest block + N via probe. Earliest `0` before detection computes `0+N`. |
+| `upstreams[*].evm.blockAvailability.{lower,upper}.exactBlock` | `*int64` | nil | Fixed block bound. `probe` and `updateRate` must be unset/zero. |
+| `upstreams[*].evm.blockAvailability.{lower,upper}.probe` | enum | `""` → `blockHeader` | One of `blockHeader`, `eventLogs`, `callState`, `traceData`. Only relevant for `earliestBlockPlus`. |
+| `upstreams[*].evm.blockAvailability.{lower,upper}.updateRate` | Duration | `0` = freeze at first evaluation | Recompute cadence for `earliestBlockPlus` bounds. Ignored for `latestBlockMinus`. |
+| `upstreams[*].evm.nodeType` | enum | `""` → `"unknown"` | **Deprecated.** `full` synthesizes `blockAvailability.lower.latestBlockMinus: 128` if no explicit `blockAvailability` is set. Migrate to explicit `blockAvailability`. |
+| `upstreams[*].evm.maxAvailableRecentBlocks` | int64 | `0` | **Deprecated.** Synthesized as `blockAvailability.lower.latestBlockMinus: N` when `blockAvailability` is nil. Migrate to explicit `blockAvailability`. |
+| `upstreams[*].evm.getLogsAutoSplittingRangeThreshold` | int64 | `0` | Proactive `eth_getLogs` range splitting at upstream scope. Details in [getLogs splitting](/reference/evm/getlogs-splitting). |
+| `upstreams[*].evm.traceFilterAutoSplittingRangeThreshold` | int64 | `0` | Same for `trace_filter` / `arbtrace_filter`. |
+| `upstreams[*].evm.integrity.eth_getBlockReceipts.enabled` | bool | `false` | Per-upstream receipt integrity checking. |
+| `upstreams[*].evm.integrity.eth_getBlockReceipts.checkLogIndexStrictIncrements` | `*bool` | nil | Sub-check: verify log indices strictly increment within a block. |
+| `upstreams[*].evm.integrity.eth_getBlockReceipts.checkLogsBloom` | `*bool` | nil | Sub-check: verify logs bloom filter consistency. |
+| `upstreams[*].evm.getLogsMaxAllowedRange` / `getLogsMaxAllowedAddresses` / `getLogsMaxAllowedTopics` / `getLogsSplitOnError` / `getLogsMaxBlockRange` | int64 / int64 / int64 / `*bool` / int64 | all zero/nil | **Deprecated and ignored at runtime.** Tagged `json:"-"` so invisible in JSON config dumps. A WARN is logged at registration if any `maxAllowed*` value `> 0` or `getLogsSplitOnError != nil`. Migrate to `networks[*].evm.*` equivalents. (<SourceLink file="upstream/registry.go" lines="107-118" />) |
+| `upstreams[*].evm.queryShim.*` | object | all zero/nil | MIP-16 `eth_query*` shim: `enabled` and `allowedMethods` (this upstream may serve the shim's sub-requests for those methods), `maxBlocksPerPage` (default `1000`) and `maxPageDuration` (default `10s`), the page budget. The old `concurrency`, `maxBlockRange`, `maxLimit` and `defaultLimit` fields are gone: MIP-16 pages by `target` and budget, with no `limit` or `cursor`. See the [method handlers reference](/reference/evm/method-handlers). |
+| `upstreams[*].svm.cluster` | string | `""`; inherited from `upstreamDefaults.svm.cluster` | The cluster this upstream serves. Must match the network-level `svm.cluster` for the upstream to be eligible for that network. Unlike the network side, cluster **is** inherited here — on an upstream it only says "which cluster do I serve", and a pool homogeneous across one cluster is the common case. |
+| `upstreams[*].svm.chain` | string | `""` → treated as `"solana"`; inherited from `upstreamDefaults.svm.chain` | Which SVM chain this upstream serves. Must match the network-level `svm.chain`. |
+| `upstreams[*].svm.checkGenesisHash` | bool | `false` | Opts an **unknown** `(chain, cluster)` pair into `getGenesisHash` validation at bootstrap. Known Solana clusters (`mainnet-beta`, `devnet`, `testnet`) are always validated regardless of this flag: a mismatch **or a fetch failure** fails the upstream, catching nodes mis-pointed at the wrong cluster and refusing to register one that could not be verified. For unknown clusters the same check (with no table comparison) runs only when this flag is set, so private and local clusters with no published genesis hash still work. |
+| `upstreamDefaults` | `*UpstreamConfig` | nil | Project-level template. Gets its own `SetDefaults(nil)` first. Each upstream runs `ApplyDefaults` then `SetDefaults`. |
+| `proxyPools[*].id` | string | required | Pool name referenced by `upstreams[*].jsonRpc.proxyPool`. |
+| `proxyPools[*].urls` | `[]string` | required, min 1 | Proxy URLs. Accepted schemes: `http://`, `https://`, `socks5://` (case-insensitive prefix check — `socks4://` rejected at startup). |
+| `networks[*].evm.enforceBlockAvailability` | `*bool` | nil → enabled by default | Network-level override for block availability enforcement. |
+| `networks[*].evm.maxRetryableBlockDistance` | `*int64` | nil → `128` | Block-ahead distance within which `ErrUpstreamBlockUnavailable` is retryable vs terminal. |
+
+**`upstreamDefaults` inheritance semantics — scalar vs composite fields differ critically:**
+
+- **Scalar fields** (`endpoint`, `type`, `vendorName`, `rateLimitBudget`, `autoIgnoreUnsupportedMethods`): inherited individually when the upstream's own value is zero.
+- **`tags`**: all-or-nothing — if the upstream declares even one tag, no defaults tags are inherited.
+- **`failsafe`**: all-or-nothing — any `failsafe` entry on the upstream means none from defaults apply.
+- **`routing`**: all-or-nothing — same rule.
+- **EVM sub-fields** (`statePollerInterval`, `statePollerDebounce`, `maxAvailableRecentBlocks`, auto-splitting thresholds, `integrity`): per-field merge when both sides are non-nil.
+- **SVM sub-fields** (`chain`, `cluster`, `checkGenesisHash`): an upstream with no `svm` block inherits `upstreamDefaults.svm` **wholesale** (copied, not pointer-shared); one with a partial block fills only its empty fields. This is the field set that lets a homogeneous pool declare `chain`/`cluster` once instead of repeating it per upstream.
+- **`jsonRpc`**: shallow-copied from defaults only when the upstream has no `jsonRpc` block at all; even `jsonRpc: {}` blocks inheritance.
+
+**Block-availability bound kinds and probe types** (for `earliestBlockPlus` bounds):
+
+| Probe | Method called | Use when |
+|---|---|---|
+| `blockHeader` (default) | `eth_getBlockByNumber` | Uniform data availability; most nodes |
+| `eventLogs` | `eth_getLogs` (requires ≥1 log) | Log-only archives with pruned state |
+| `callState` | `eth_getBalance` | State-availability gates on archive nodes |
+| `traceData` | `trace_block` / `debug_traceBlockByHash` / `trace_replayBlockTransactions` | Gating trace/debug method routing |
+
+### Worked examples
+
+All patterns below are distilled from real production fleets; comments explain the
+non-obvious choices.
+
+**1. Full node + archive node pool with explicit block windows.** Route recent
+blocks to a cheap full node and archive queries to a dedicated archive node. In
+production, internal nodes run at a 5-second state-poller cadence for tight head
+tracking, and `latestBlockMinus: 0` on the upper bound prevents the cache upstream
+from serving stale-head responses:
+
+<ConfigTabs
+  path="projects[].upstreams[]"
+  yaml={`projects:
+  - id: main
+    upstreams:
+      - id: full-node
+        endpoint: https://rpc.example.com
+        evm:
+          chainId: 1
+          statePollerInterval: 5000ms
+          blockAvailability:
+            # eRPC only sends this upstream blocks it can actually serve
+            lower:
+              latestBlockMinus: 128
+            upper:
+              # latestBlockMinus: 0 = "no blocks beyond current head" —
+              # prevents sending future/reorg blocks to a lagging node
+              latestBlockMinus: 0
+              probe: blockHeader
+      - id: archive-node
+        endpoint: https://archive.rpc.example.com
+        evm:
+          chainId: 1
+          # no lower bound = unbounded archive (serves any historical block)
+          statePollerInterval: 10s`}
+  ts={`import { createConfig } from "@erpc-cloud/config";
+
+export default createConfig({
+  projects: [{
+    id: "main",
+    upstreams: [
+      {
+        id: "full-node",
+        endpoint: "https://rpc.example.com",
+        evm: {
+          chainId: 1,
+          statePollerInterval: "5000ms",
+          blockAvailability: {
+            lower: { latestBlockMinus: 128 },
+            // latestBlockMinus: 0 = cap at current head; prevents stale-head responses
+            upper: { latestBlockMinus: 0, probe: "blockHeader" },
+          },
+        },
+      },
+      {
+        id: "archive-node",
+        endpoint: "https://archive.rpc.example.com",
+        evm: { chainId: 1, statePollerInterval: "10s" },
+      },
+    ],
+  }],
+});`}
+/>
+
+**2. gRPC cache upstream scoped to read methods only.** Internal deployments wire a
+gRPC cache service as a high-priority upstream that only handles cacheable read
+methods. The cache gets a high `scoreMultipliers.overall` (3.5×) so the selection
+engine prefers it; `earliestBlockPlus` + `updateRate` keeps the lower bound
+re-evaluated hourly as the cache fills:
+
+<ConfigTabs
+  path="projects[].upstreams[]"
+  yaml={`projects:
+  - id: main
+    upstreams:
+      - id: grpc-cache
+        # gRPC cache connector — high score so selection engine prefers it
+        endpoint: grpc://cache.internal.svc.cluster.local:8033
+        vendorName: internal-cache
+        routing:
+          scoreMultipliers:
+            - network: ""
+              method: ""
+              # 3.5× score: cache hits should almost always be tried first
+              overall: 3.5
+        evm:
+          chainId: 42161
+          statePollerInterval: 1000ms
+          blockAvailability:
+            lower:
+              # probe re-runs every 5s so bounds reflect actual cache fill
+              earliestBlockPlus: 0
+              probe: blockHeader
+              updateRate: 5s
+            upper:
+              latestBlockMinus: 0
+              probe: blockHeader
+        # only serve the methods the cache actually holds
+        ignoreMethods:
+          - "*"
+        allowMethods:
+          - eth_getLogs
+          - eth_getBlockByHash
+          - eth_getBlockReceipts
+          - eth_getBlockByNumber
+          - eth_getTransactionByHash
+          - eth_getTransactionReceipt
+        failsafe:
+          - matchMethod: "*"
+            timeout:
+              # tight cap: cache reads must be fast or it's not worth it
+              duration: 1s
+              quantile: 0.8
+              minDuration: 200ms
+              maxDuration: 1s
+            hedge:
+              # race a second cache read quickly — latency is stable enough
+              # for static-style floor here (50ms)
+              quantile: 0.9
+              maxCount: 1
+              minDelay: 50ms
+              maxDelay: 100ms`}
+  ts={`import { createConfig } from "@erpc-cloud/config";
+
+export default createConfig({
+  projects: [{
+    id: "main",
+    upstreams: [{
+      id: "grpc-cache",
+      endpoint: "grpc://cache.internal.svc.cluster.local:8033",
+      vendorName: "internal-cache",
+      routing: {
+        scoreMultipliers: [{ network: "", method: "", overall: 3.5 }],
+      },
+      evm: {
+        chainId: 42161,
+        statePollerInterval: "1000ms",
+        blockAvailability: {
+          lower: { earliestBlockPlus: 0, probe: "blockHeader", updateRate: "5s" },
+          upper: { latestBlockMinus: 0, probe: "blockHeader" },
+        },
+      },
+      ignoreMethods: ["*"],
+      allowMethods: [
+        "eth_getLogs", "eth_getBlockByHash", "eth_getBlockReceipts",
+        "eth_getBlockByNumber", "eth_getTransactionByHash", "eth_getTransactionReceipt",
+      ],
+      failsafe: [{
+        matchMethod: "*",
+        timeout: { duration: "1s", quantile: 0.8, minDuration: "200ms", maxDuration: "1s" },
+        hedge: { quantile: 0.9, maxCount: 1, minDelay: "50ms", maxDelay: "100ms" },
+      }],
+    }],
+  }],
+});`}
+/>
+
+**3. Vendor provider as deprioritized fallback with rate-limit auto-tune.** Paid
+vendors like Alchemy are expensive at volume. Production configs set
+`scoreMultipliers.overall: 0.2` to deprioritize them behind cheaper nodes, and
+pair a `rateLimitBudget` with `rateLimitAutoTune` so eRPC backs off automatically
+when the vendor starts throttling (decreaseFactor 0.7 cuts budget aggressively on
+errors; increaseFactor 1.1 recovers slowly):
+
+<ConfigTabs
+  path="projects[].upstreams[]"
+  yaml={`projects:
+  - id: main
+    upstreams:
+      - id: alchemy-mainnet
+        endpoint: https://eth-mainnet.g.alchemy.com/v2/\${ALCHEMY_KEY}
+        vendorName: alchemy
+        evm:
+          chainId: 1
+          statePollerInterval: 10s
+        rateLimitBudget: alchemy-global
+        rateLimitAutoTune:
+          enabled: true
+          adjustmentPeriod: 30s
+          # start backing off once 10% of requests are errors
+          errorRateThreshold: 0.1
+          # recover slowly (×1.1 per period), cut fast (×0.7)
+          increaseFactor: 1.1
+          decreaseFactor: 0.7
+          minBudget: 1
+          maxBudget: 100000
+        routing:
+          scoreMultipliers:
+            - network: ""
+              method: ""
+              # 0.2× score: use Alchemy only when cheaper upstreams are unavailable
+              overall: 0.2
+
+rateLimiters:
+  budgets:
+    - id: alchemy-global
+      rules:
+        - method: "*"
+          maxCount: 500
+          period: 1s`}
+  ts={`import { createConfig } from "@erpc-cloud/config";
+
+export default createConfig({
+  projects: [{
+    id: "main",
+    upstreams: [{
+      id: "alchemy-mainnet",
+      endpoint: "https://eth-mainnet.g.alchemy.com/v2/\${ALCHEMY_KEY}",
+      vendorName: "alchemy",
+      evm: { chainId: 1, statePollerInterval: "10s" },
+      rateLimitBudget: "alchemy-global",
+      rateLimitAutoTune: {
+        enabled: true,
+        adjustmentPeriod: "30s",
+        errorRateThreshold: 0.1,
+        increaseFactor: 1.1,
+        decreaseFactor: 0.7,
+        minBudget: 1,
+        maxBudget: 100000,
+      },
+      routing: {
+        scoreMultipliers: [{ network: "", method: "", overall: 0.2 }],
+      },
+    }],
+  }],
+  rateLimiters: {
+    budgets: [{
+      id: "alchemy-global",
+      rules: [{ method: "*", maxCount: 500, period: "1s" }],
+    }],
+  },
+});`}
+/>
+
+**4. Per-upstream method failsafe tiers with `upstreamDefaults`.** Production fleets
+share a single `upstreamDefaults.failsafe` slice across all upstreams. Heavy methods
+(`eth_getLogs`, `eth_getBlockReceipts`) get a wide timeout with a high quantile floor
+to avoid cutting off big-range subgraph backfills; light getters get a tight cap to
+encourage fast failover. Individual upstreams that need special treatment (like a fast
+internal gRPC reader) override the whole `failsafe` slice — all-or-nothing:
+
+<ConfigTabs
+  path="projects[].upstreamDefaults"
+  yaml={`projects:
+  - id: main
+    upstreamDefaults:
+      # shared across all upstreams; one upstream with its own failsafe[] inherits none of this
+      autoIgnoreUnsupportedMethods: false
+      ignoreMethods:
+        - eth_newFilter
+        - eth_newBlockFilter
+        - eth_newPendingTransactionFilter
+        - eth_getFilterChanges
+        - eth_getFilterLogs
+        - eth_uninstallFilter
+      evm:
+        getLogsAutoSplittingRangeThreshold: 5000
+      rateLimitAutoTune:
+        enabled: true
+        adjustmentPeriod: 30s
+        errorRateThreshold: 0.1
+        increaseFactor: 1.1
+        decreaseFactor: 0.7
+        minBudget: 1
+        maxBudget: 100000
+      failsafe:
+        - matchMethod: "eth_getLogs|eth_getBlockReceipts"
+          timeout:
+            # 2s floor: big-range queries legitimately take seconds on archive nodes
+            duration: 15s
+            quantile: 0.9
+            minDuration: 2s
+            maxDuration: 15s
+          hedge: null
+          retry: null
+        - matchMethod: "eth_get*"
+          timeout:
+            # 200ms floor: light point-lookups should be fast
+            duration: 5s
+            quantile: 0.9
+            minDuration: 200ms
+            maxDuration: 5s
+          hedge: null
+          retry: null
+        - matchMethod: "*"
+          timeout:
+            duration: 60s
+            quantile: 0.8
+            minDuration: 500ms
+            maxDuration: 60s
+          hedge: null
+          retry: null
+
+    upstreams:
+      - id: eth-reader
+        endpoint: grpc://reader.internal.svc.cluster.local:50051
+        vendorName: internal-reader
+        evm:
+          chainId: 1
+        ignoreMethods: ["*"]
+        allowMethods:
+          - eth_getBlockByNumber
+          - eth_getLogs
+          - eth_getTransactionByHash
+          - eth_getTransactionReceipt
+        rateLimitBudget: reader-global
+        rateLimitAutoTune:
+          enabled: true
+          minBudget: 10
+          maxBudget: 10000
+          # very sensitive: trip at 1% errors, recover slowly (0.98×)
+          errorRateThreshold: 0.01
+          decreaseFactor: 0.98
+          increaseFactor: 1.1
+          adjustmentPeriod: 30s
+        failsafe:
+          # Overrides upstreamDefaults entirely — tight cap so network-level
+          # retry races cheaper upstreams instead of bouncing back to the reader
+          - matchMethod: "*"
+            timeout:
+              duration: 500ms
+              quantile: 0.8
+              minDuration: 100ms
+              maxDuration: 500ms
+            retry:
+              maxAttempts: 1`}
+  ts={`import { createConfig } from "@erpc-cloud/config";
+
+export default createConfig({
+  projects: [{
+    id: "main",
+    upstreamDefaults: {
+      autoIgnoreUnsupportedMethods: false,
+      ignoreMethods: [
+        "eth_newFilter", "eth_newBlockFilter", "eth_newPendingTransactionFilter",
+        "eth_getFilterChanges", "eth_getFilterLogs", "eth_uninstallFilter",
+      ],
+      evm: { getLogsAutoSplittingRangeThreshold: 5000 },
+      rateLimitAutoTune: {
+        enabled: true, adjustmentPeriod: "30s", errorRateThreshold: 0.1,
+        increaseFactor: 1.1, decreaseFactor: 0.7, minBudget: 1, maxBudget: 100000,
+      },
+      failsafe: [
+        {
+          matchMethod: "eth_getLogs|eth_getBlockReceipts",
+          timeout: { duration: "15s", quantile: 0.9, minDuration: "2s", maxDuration: "15s" },
+          hedge: null, retry: null,
+        },
+        {
+          matchMethod: "eth_get*",
+          timeout: { duration: "5s", quantile: 0.9, minDuration: "200ms", maxDuration: "5s" },
+          hedge: null, retry: null,
+        },
+        {
+          matchMethod: "*",
+          timeout: { duration: "60s", quantile: 0.8, minDuration: "500ms", maxDuration: "60s" },
+          hedge: null, retry: null,
+        },
+      ],
+    },
+    upstreams: [{
+      id: "eth-reader",
+      endpoint: "grpc://reader.internal.svc.cluster.local:50051",
+      vendorName: "internal-reader",
+      evm: { chainId: 1 },
+      ignoreMethods: ["*"],
+      allowMethods: [
+        "eth_getBlockByNumber", "eth_getLogs",
+        "eth_getTransactionByHash", "eth_getTransactionReceipt",
+      ],
+      rateLimitBudget: "reader-global",
+      rateLimitAutoTune: {
+        enabled: true, minBudget: 10, maxBudget: 10000,
+        errorRateThreshold: 0.01, decreaseFactor: 0.98,
+        increaseFactor: 1.1, adjustmentPeriod: "30s",
+      },
+      // Overrides upstreamDefaults entirely — tight cap so network-level
+      // retry races cheaper upstreams instead of bouncing back to the reader
+      failsafe: [{
+        matchMethod: "*",
+        timeout: { duration: "500ms", quantile: 0.8, minDuration: "100ms", maxDuration: "500ms" },
+        retry: { maxAttempts: 1 },
+      }],
+    }],
+  }],
+});`}
+/>
+
+**5. Per-chain `getLogsAutoSplittingRangeThreshold` overrides.** High-throughput
+chains like Arbitrum and Sei have providers that reject `eth_getLogs` queries over
+large block ranges. Production configs set a tighter threshold on those chains'
+upstreams (1 000 for Arbitrum, 500 for Sei) while leaving the default 5 000 in
+`upstreamDefaults.evm` for chains with more forgiving providers:
+
+<ConfigTabs
+  path="projects[].upstreams[].evm"
+  yaml={`projects:
+  - id: main
+    upstreamDefaults:
+      evm:
+        # generous default for most chains
+        getLogsAutoSplittingRangeThreshold: 5000
+
+    upstreams:
+      - id: arbitrum-mainnet-node
+        endpoint: https://rpc.example.com
+        evm:
+          chainId: 42161
+          # Arbitrum providers reject ranges >1000 blocks for heavy contracts
+          getLogsAutoSplittingRangeThreshold: 1000
+          statePollerInterval: 5000ms
+          blockAvailability:
+            upper:
+              latestBlockMinus: 0
+              probe: blockHeader
+
+      - id: sei-mainnet-node
+        endpoint: https://sei.rpc.example.com
+        evm:
+          chainId: 1329
+          # Sei's high block rate makes large ranges expensive for providers
+          getLogsAutoSplittingRangeThreshold: 500
+          statePollerInterval: 5000ms`}
+  ts={`import { createConfig } from "@erpc-cloud/config";
+
+export default createConfig({
+  projects: [{
+    id: "main",
+    upstreamDefaults: {
+      evm: { getLogsAutoSplittingRangeThreshold: 5000 },
+    },
+    upstreams: [
+      {
+        id: "arbitrum-mainnet-node",
+        endpoint: "https://rpc.example.com",
+        evm: {
+          chainId: 42161,
+          // Arbitrum providers reject ranges >1000 blocks for heavy contracts
+          getLogsAutoSplittingRangeThreshold: 1000,
+          statePollerInterval: "5000ms",
+          blockAvailability: { upper: { latestBlockMinus: 0, probe: "blockHeader" } },
+        },
+      },
+      {
+        id: "sei-mainnet-node",
+        endpoint: "https://sei.rpc.example.com",
+        evm: {
+          chainId: 1329,
+          // Sei's high block rate makes large ranges expensive for providers
+          getLogsAutoSplittingRangeThreshold: 500,
+          statePollerInterval: "5000ms",
+        },
+      },
+    ],
+  }],
+});`}
+/>
+
+**6. A Solana upstream pool with `upstreamDefaults.svm`.** `type: svm` must be explicit on
+every upstream — it is never inferred from the endpoint or from the network. `chain` and
+`cluster` are the two fields that decide network eligibility, and unlike the network side
+they *are* inheritable, so a pool homogeneous across one cluster declares them once. Each
+SVM upstream gets its own slot/health poller automatically:
+
+<ConfigTabs
+  path="projects[].upstreams[]"
+  focusYaml="4-8,11,15,19-21"
+  focusTs="3-6,9,12,15-17"
+  yaml={`projects:
+  - id: main
+    upstreamDefaults:
+      # type is NOT inferred — declaring it here covers the whole pool
+      type: svm
+      svm:
+        # cluster IS inherited on upstreams (it is network identity only on networks)
+        cluster: mainnet-beta
+    upstreams:
+      - id: solana-labs-mainnet
+        endpoint: https://api.mainnet-beta.solana.com
+      - id: helius-mainnet
+        endpoint: https://mainnet.helius-rpc.com/?api-key=\${HELIUS_KEY}
+      # a fork lives in its own network; checkGenesisHash opts the unknown
+      # (chain, cluster) pair into bootstrap verification
+      - id: fogo-mainnet
+        endpoint: https://mainnet.fogo.io
+        svm:
+          chain: fogo
+          cluster: mainnet
+          checkGenesisHash: true`}
+  ts={`projects: [{
+  id: "main",
+  upstreamDefaults: {
+    // type is NOT inferred — declaring it here covers the whole pool
+    type: "svm",
+    // cluster IS inherited on upstreams (it is network identity only on networks)
+    svm: { cluster: "mainnet-beta" },
+  },
+  upstreams: [
+    { id: "solana-labs-mainnet", endpoint: "https://api.mainnet-beta.solana.com" },
+    { id: "helius-mainnet", endpoint: "https://mainnet.helius-rpc.com/?api-key=\${HELIUS_KEY}" },
+    // a fork lives in its own network; checkGenesisHash opts the unknown
+    // (chain, cluster) pair into bootstrap verification
+    {
+      id: "fogo-mainnet",
+      endpoint: "https://mainnet.fogo.io",
+      svm: { chain: "fogo", cluster: "mainnet", checkGenesisHash: true },
+    },
+  ],
+}]`}
+/>
+
+### Request/response behavior
+
+- `shouldSkip` runs before every `Forward` call. Skip reasons surface as
+  `ErrUpstreamRequestSkipped` (HTTP 406) wrapping the underlying reason:
+  `ErrUpstreamShadowing`, `ErrUpstreamSyncing`, `ErrUpstreamMethodIgnored`,
+  `ErrUpstreamNotAllowed`. (<SourceLink file="upstream/upstream.go" lines="1505-1548" />)
+- Block-availability failures produce `ErrUpstreamBlockUnavailable` (HTTP 503).
+  The network layer classifies them retryable iff `block > latest > 0` and
+  `distance ≤ maxRetryableBlockDistance` (default 128); beyond that they are
+  wrapped as `ErrUpstreamRequestSkipped` to stop retries.
+  (<SourceLink file="erpc/networks.go" lines="1862-1881" />)
+- Computed bounds with finite min &gt; max (e.g. `earliestBlockPlus` before
+  detection completes) log a WARN and fail open — the upstream serves any block
+  rather than incorrectly rejecting all of them.
+  (<SourceLink file="upstream/upstream.go" lines="1199-1210" />)
+- `eth_chainId` detection retries forever on transport errors; non-numeric chainId
+  or configured-vs-detected mismatch is `TaskFatal` — the upstream stops retrying
+  permanently. (<SourceLink file="upstream/upstream.go" lines="1419-1455" />)
+- Cordon state is an explicit flag on the health tracker (NOT a metric). It survives
+  rolling-window rotation and idle-sweep eviction; only `Reset()` (test/admin) clears
+  it. `erpc_listCordoned` only reports wildcard (`"*"`) scope cordons — method-scoped
+  cordons are not listed. (<SourceLink file="health/tracker.go" lines="598-615" />)
+
+### Best practices
+
+- **Declare block windows explicitly.** Use `evm.blockAvailability.lower.latestBlockMinus: 128`
+  for pruned full nodes rather than the deprecated `nodeType: full` — the explicit form
+  is visible in config dumps and survives future refactors.
+- **Never rely on `allowMethods` alone.** Setting `allowMethods` without `ignoreMethods`
+  silently injects `ignoreMethods: ["*"]`, blocking everything else. When you want a
+  partial allow-list alongside a partial ignore-list, set both fields explicitly.
+- **List all tags on each upstream when mixing with defaults.** One tag on an upstream
+  drops the entire `upstreamDefaults.tags` slice — there is no additive inheritance.
+  Enumerate every intended tag per upstream explicitly.
+- **Set `batchMaxWait` to a non-zero value.** `batchMaxWait: 0` fires the batch
+  immediately via `time.AfterFunc(0, ...)` — effectively the same as no batching.
+  Use at least `10ms` to allow real coalescing.
+- **Use `rateLimitBudget` + `rateLimitAutoTune` together.** Auto-tune adjusts the
+  effective budget based on observed error rate (10% threshold, 1-minute cadence by
+  default). Without a budget, the auto-tuner is never created.
+- **Cordon instead of removing.** For emergency isolation — provider outage, billing
+  alarm — call `erpc_cordonUpstream` via the Admin API. The cordon state survives
+  metric-window rotation and does not need a config change or restart.
+- **Pick the right `earliestBlockPlus` probe for your archive node.** Most nodes use
+  `blockHeader` (default). Use `traceData` only when the upstream has separate pruning
+  boundaries for trace methods; `eventLogs` when log indices are available further back
+  than state; `callState` when gating on historical balance/storage availability.
+
+### Edge cases & gotchas
+
+1. **`ws://`/`wss://` pass config validation but fail at client creation** with
+   "websocket client not implemented yet" and retry forever. Use `http://`/`https://` instead.
+2. **`allowMethods` without `ignoreMethods`** silently blocks all other methods via an
+   injected `ignoreMethods: ["*"]`. To allow specific methods while keeping defaults,
+   use `ignoreMethods` with explicit patterns instead.
+3. **All-or-nothing tags inheritance**: one tag on an upstream drops all
+   `upstreamDefaults.tags`. List every intended tag explicitly on each upstream.
+4. **`vendorName` typo** returns `nil` from vendor lookup silently — the upstream runs
+   as a bare endpoint without error normalization. No warning is logged.
+5. **Repeated `Cordon` calls** update the reason but not the start timestamp (duration
+   accounting survives reason edits). Changing reason creates a new gauge series; old
+   series stays at 1 until a matching uncordon.
+6. **`erpc_listCordoned` only reports wildcard (`"*"`) scope cordons** — method-scoped
+   cordons are not listed.
+7. **Uncordoning a method-scoped cordon does NOT clear a wildcard cordon** — `IsCordoned`
+   checks `"*"` first.
+8. **`maxAvailableRecentBlocks` and `blockAvailability` set simultaneously**: the
+   back-compat synthesis fires only when `blockAvailability == nil`; explicit
+   `blockAvailability` silently wins.
+9. **Lower-bound re-poll race**: within 10 blocks of the pruning boundary a fresh poll
+   runs; if the chain advanced, `firstAvailable` moves up and a block that was valid may
+   flip to unavailable mid-check.
+10. **`batchMaxWait: 0` fires instantly** — `time.AfterFunc(0, ...)` schedules the flush
+    before additional requests can join. Set at least `10ms` to coalesce.
+11. **`batchMaxSize: 0` with `supportsBatch: true`** means the batch fires immediately on
+    the first queued request because `0 >= 0`. Use a value ≥ 2 to actually coalesce.
+12. **Proxy URL scheme validation** is a case-insensitive prefix check, not URL parsing.
+    `socks4://` and other schemes fail at startup even though they are syntactically valid URLs.
+13. **`UniqueUpstreamKey` is order-unstable with ≥2 `jsonRpc.headers`** — Go map
+    iteration is randomized, so two calls may produce different keys and re-create the
+    client on each call.
+14. **Negative or zero block numbers pass block-availability checks** — extracted block
+    ≤ 0 is treated as "block not present in request" and the check is skipped (fail-open).
+15. **Method-support results are cached forever per process.** `ShouldHandleMethod` caches
+    per method name; later edits to Ignore/Allow lists don't invalidate existing entries.
+    Only `IgnoreMethod` explicitly writes a `false` entry for its own case.
+16. **State-poller bootstrap failure does NOT block registration** — upstream registers
+    and serves; availability checks that need latest-block data error/fail-open until the
+    poller recovers in background.
+17. **`earliestBlockPlus` before detection completes computes `0 + N`.** If the probe
+    hasn't run yet, earliest = 0, so bound = N. If N > latest, this can produce an
+    invalid range (min > max) that triggers the fail-open WARN path.
+18. **Forwarded headers are NOT sent on batch requests.** `req.ForwardHeaders` is consulted
+    only in `sendSingleRequest`; callers relying on bearer-token forwarding must not use
+    batching for those requests.
+19. **Duplicate JSON-RPC IDs within a batch window flush the current batch.** If a second
+    request arrives with the same `id` as one already queued, the pending batch fires
+    immediately and the new request starts a fresh batch. This preserves ID-to-response
+    mapping correctness but reduces batch efficiency for clients that reuse IDs.
+    (<SourceLink file="clients/http_json_rpc_client.go" lines="255-261" />)
+20. **`ErrUpstreamMalformedResponse` is retryable.** Raised when a batch response body is
+    neither a JSON array nor a JSON object. Because it is not in the non-retryable
+    allowlist, eRPC retries on another upstream. If all upstreams return malformed
+    responses the request ends as `ErrUpstreamsExhausted`. HTTP status code on propagation
+    is 400 (method-level), but the JSON-RPC wire response to the caller is still HTTP 200.
+21. **`type` is not inferred from the endpoint.** A Solana endpoint without `type: svm`
+    defaults to `evm`, and bootstrap then tries `eth_chainId` against it. Set `type: svm`
+    on the upstream or on `upstreamDefaults`.
+22. **An SVM upstream whose `svm.chain`/`svm.cluster` do not match the network's is not
+    eligible for it.** There is no fuzzy match — an upstream with `cluster: mainnet-beta`
+    never serves the `svm:testnet` network. Remember `chain: ""` means `solana`, so an
+    upstream omitting `chain` cannot serve a `chain: fogo` network.
+23. **Genesis-hash validation is fail-closed for known clusters.** For Solana
+    `mainnet-beta`/`devnet`/`testnet`, both a hash mismatch **and** a `getGenesisHash`
+    fetch failure fail the upstream — eRPC refuses to register one it could not verify.
+    `checkGenesisHash` only affects *unknown* `(chain, cluster)` pairs.
+24. **SVM upstreams are cordoned by their own state poller.** Beyond manual and
+    breaker-driven cordons, a failing `getHealth` or a shred-insert lag above 100 slots
+    removes an SVM upstream from selection until it recovers. See
+    [SVM slot tracking & health](/reference/svm/slot-tracking).
+
+### Observability
+
+| Metric | Type | Labels | When it fires |
+|---|---|---|---|
+| `erpc_upstream_request_total` | counter | project, vendor, network, upstream, category, attempt, composite, finality, user, agent_name | Every attempt including hedges |
+| `erpc_upstream_request_errors_total` | counter | project, vendor, network, upstream, category, error, severity, composite, finality, user, agent_name | Attempt errors except skipped/missing-data/cancelled |
+| `erpc_upstream_request_skipped_total` | counter | project, vendor, network, upstream, category, finality, user, agent_name | `ErrUpstreamRequestSkipped` returned |
+| `erpc_upstream_request_missing_data_error_total` | counter | project, vendor, network, upstream, category, finality, user, agent_name | `ErrCodeEndpointMissingData` response |
+| `erpc_upstream_request_empty_response_total` | counter | project, vendor, network, upstream, category, finality, user, agent_name | Successful but emptyish result |
+| `erpc_upstream_response_size_bytes` | histogram | project, network, category, finality | Decoded result size of successful responses (buckets 4 KiB … 100 MiB) |
+| `erpc_upstream_attempt_outcome_total` | counter | project, network, upstream, category, outcome, is_hedge, is_retry, finality | Once per attempt at classification |
+| `erpc_upstream_selection_total` | counter | project, network, upstream, category, reason, finality | Once per attempt start; reason = primary/retry/hedge |
+| `erpc_upstream_breaker_state_change_total` | counter | project, upstream, transition | Breaker state transition |
+| `erpc_upstream_cordoned` | gauge | project, vendor, network, upstream, category, reason | 1 on cordon, 0 on uncordon |
+| `erpc_upstream_cordon_event_total` | counter | project, network, upstream, action | Edge transitions (cordon/uncordon) only |
+| `erpc_upstream_cordon_duration_seconds` | histogram (1 s … 86 400 s) | project, network, upstream | Observed on each uncordon |
+| `erpc_upstream_stale_upper_bound_total` | counter | project, vendor, network, upstream, category, confidence | Block above upper bound or not yet finalized |
+| `erpc_upstream_stale_lower_bound_total` | counter | project, vendor, network, upstream, category, confidence | Block below lower bound / outside pruning window |
+
+### Source code entry points
+
+- [`upstream/upstream.go:L136`](https://github.com/erpc/erpc/blob/main/upstream/upstream.go#L136) — `Upstream` type: construction, bootstrap, `detectFeatures`, `Forward` hot path, `shouldSkip`, `ShouldHandleMethod`, block-availability assertions, cordon pass-throughs.
+- [`upstream/registry.go:L95`](https://github.com/erpc/erpc/blob/main/upstream/registry.go#L95) — `UpstreamsRegistry`: background bootstrap tasks, per-network upstream maps + atomic snapshots, `PrepareUpstreamsForNetwork` wait algorithm, shadow registration.
+- [`common/defaults.go:L1152`](https://github.com/erpc/erpc/blob/main/common/defaults.go#L1152) — `ApplyDefaults` (upstreamDefaults inheritance) + `SetDefaults` chain (id derivation, `allowMethods`→`ignoreMethods` injection, EVM defaults, legacy `nodeType`→`blockAvailability` synthesis, vendor shorthand conversion).
+- [`erpc/networks.go:L1919`](https://github.com/erpc/erpc/blob/main/erpc/networks.go#L1919) — `checkUpstreamBlockAvailability`, `resolveEnforceBlockAvailability`, `handleBlockSkip` — single enforcement point for block availability at network layer.
+- [`health/tracker.go:L793`](https://github.com/erpc/erpc/blob/main/health/tracker.go#L793) — cordon state storage, `Cordon`/`Uncordon`/`IsCordoned`/`CordonedReason`, idle-sweep protection.
+- [`clients/http_json_rpc_client.go:L109`](https://github.com/erpc/erpc/blob/main/clients/http_json_rpc_client.go#L109) — `GenericHttpJsonRpcClient` transport construction, batch aggregation, gzip pools, error normalization.
+- [`clients/proxy_pool_registry.go:L23`](https://github.com/erpc/erpc/blob/main/clients/proxy_pool_registry.go#L23) — `ProxyPool` round-robin selection via atomic counter.
+- [`upstream/upstream_block_availability_test.go`](https://github.com/erpc/erpc/blob/main/upstream/upstream_block_availability_test.go) — exhaustive availability edge cases: negative/zero blocks, reorgs, pruning races, poll-count assertions.
+
+### Related pages
+
+- [Selection policies](/config/projects/selection-policies) — how upstreams are scored and ordered for each request.
+- [Rate limiters](/config/rate-limiters) — budget-based throttling bound to upstream IDs.
+- [Failsafe](/config/failsafe/retry) — per-upstream retry, hedge, timeout, and circuit-breaker config.
+- [Matcher / use-upstream](/config/matcher) — directive that pins a request to a specific upstream or tag.
+- [Admin API](/operation/admin) — cordon/uncordon RPCs and listing cordoned upstreams.
+- [getLogs splitting](/reference/evm/getlogs-splitting) — auto-splitting thresholds for `eth_getLogs` and `trace_filter`.
+- [SVM slot tracking & health](/reference/svm/slot-tracking) — the per-upstream Solana slot/health poller and its cordoning behavior.
+- [SVM commitment & finality](/reference/svm/commitment) — how requests are normalized before they reach an SVM upstream.
+- [Survive provider outages](/use-cases/survive-provider-outages) — how upstreams + failsafe combine to keep requests flowing.
+
+</AISection>

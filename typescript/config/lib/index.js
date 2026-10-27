@@ -1,0 +1,195 @@
+"use strict";
+var __defProp = Object.defineProperty;
+var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
+var __getOwnPropNames = Object.getOwnPropertyNames;
+var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
+var __copyProps = (to, from, except, desc) => {
+  if (from && typeof from === "object" || typeof from === "function") {
+    for (let key of __getOwnPropNames(from))
+      if (!__hasOwnProp.call(to, key) && key !== except)
+        __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
+  }
+  return to;
+};
+var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
+
+// src/index.ts
+var index_exports = {};
+__export(index_exports, {
+  ArchitectureEvm: () => ArchitectureEvm,
+  ArchitectureSvm: () => ArchitectureSvm,
+  AuthTypeJwt: () => AuthTypeJwt,
+  AuthTypeNetwork: () => AuthTypeNetwork,
+  AuthTypeSecret: () => AuthTypeSecret,
+  AuthTypeSiwe: () => AuthTypeSiwe,
+  CacheEmptyBehaviorAllow: () => CacheEmptyBehaviorAllow,
+  CacheEmptyBehaviorIgnore: () => CacheEmptyBehaviorIgnore,
+  CacheEmptyBehaviorOnly: () => CacheEmptyBehaviorOnly,
+  ConsensusDisputeBehaviorAcceptMostCommonValidResult: () => ConsensusDisputeBehaviorAcceptMostCommonValidResult,
+  ConsensusDisputeBehaviorOnlyBlockHeadLeader: () => ConsensusDisputeBehaviorOnlyBlockHeadLeader,
+  ConsensusDisputeBehaviorPreferBlockHeadLeader: () => ConsensusDisputeBehaviorPreferBlockHeadLeader,
+  ConsensusDisputeBehaviorReturnError: () => ConsensusDisputeBehaviorReturnError,
+  ConsensusLowParticipantsBehaviorAcceptMostCommonValidResult: () => ConsensusLowParticipantsBehaviorAcceptMostCommonValidResult,
+  ConsensusLowParticipantsBehaviorOnlyBlockHeadLeader: () => ConsensusLowParticipantsBehaviorOnlyBlockHeadLeader,
+  ConsensusLowParticipantsBehaviorPreferBlockHeadLeader: () => ConsensusLowParticipantsBehaviorPreferBlockHeadLeader,
+  ConsensusLowParticipantsBehaviorReturnError: () => ConsensusLowParticipantsBehaviorReturnError,
+  DataFinalityStateFinalized: () => DataFinalityStateFinalized,
+  DataFinalityStateRealtime: () => DataFinalityStateRealtime,
+  DataFinalityStateUnfinalized: () => DataFinalityStateUnfinalized,
+  DataFinalityStateUnknown: () => DataFinalityStateUnknown,
+  EvalScopeNetwork: () => EvalScopeNetwork,
+  EvalScopeNetworkFinality: () => EvalScopeNetworkFinality,
+  EvalScopeNetworkMethod: () => EvalScopeNetworkMethod,
+  EvalScopeNetworkMethodFinality: () => EvalScopeNetworkMethodFinality,
+  EvmNodeTypeArchive: () => EvmNodeTypeArchive,
+  EvmNodeTypeFull: () => EvmNodeTypeFull,
+  EvmNodeTypeUnknown: () => EvmNodeTypeUnknown,
+  EvmSyncingStateNotSyncing: () => EvmSyncingStateNotSyncing,
+  EvmSyncingStateSyncing: () => EvmSyncingStateSyncing,
+  EvmSyncingStateUnknown: () => EvmSyncingStateUnknown,
+  FINALIZED: () => FINALIZED,
+  NETWORK: () => NETWORK,
+  NETWORK_FINALITY: () => NETWORK_FINALITY,
+  NETWORK_METHOD: () => NETWORK_METHOD,
+  NETWORK_METHOD_FINALITY: () => NETWORK_METHOD_FINALITY,
+  REALTIME: () => REALTIME,
+  RateLimitCountModeCredit: () => RateLimitCountModeCredit,
+  RateLimitCountModeRequest: () => RateLimitCountModeRequest,
+  RateLimitPeriodDay: () => RateLimitPeriodDay,
+  RateLimitPeriodHour: () => RateLimitPeriodHour,
+  RateLimitPeriodMinute: () => RateLimitPeriodMinute,
+  RateLimitPeriodMonth: () => RateLimitPeriodMonth,
+  RateLimitPeriodSecond: () => RateLimitPeriodSecond,
+  RateLimitPeriodWeek: () => RateLimitPeriodWeek,
+  RateLimitPeriodYear: () => RateLimitPeriodYear,
+  ScopeNetwork: () => ScopeNetwork,
+  ScopeUpstream: () => ScopeUpstream,
+  UNFINALIZED: () => UNFINALIZED,
+  UNKNOWN: () => UNKNOWN,
+  UpstreamTypeEvm: () => UpstreamTypeEvm,
+  UpstreamTypeSvm: () => UpstreamTypeSvm,
+  createConfig: () => createConfig
+});
+module.exports = __toCommonJS(index_exports);
+
+// src/generated.ts
+var UpstreamTypeEvm = "evm";
+var EvmNodeTypeUnknown = "unknown";
+var EvmNodeTypeFull = "full";
+var EvmNodeTypeArchive = "archive";
+var EvmSyncingStateUnknown = 0;
+var EvmSyncingStateSyncing = 1;
+var EvmSyncingStateNotSyncing = 2;
+var UpstreamTypeSvm = "svm";
+var RateLimitCountModeRequest = "request";
+var RateLimitCountModeCredit = "credit";
+var ConsensusLowParticipantsBehaviorReturnError = "returnError";
+var ConsensusLowParticipantsBehaviorAcceptMostCommonValidResult = "acceptMostCommonValidResult";
+var ConsensusLowParticipantsBehaviorPreferBlockHeadLeader = "preferBlockHeadLeader";
+var ConsensusLowParticipantsBehaviorOnlyBlockHeadLeader = "onlyBlockHeadLeader";
+var ConsensusDisputeBehaviorReturnError = "returnError";
+var ConsensusDisputeBehaviorAcceptMostCommonValidResult = "acceptMostCommonValidResult";
+var ConsensusDisputeBehaviorPreferBlockHeadLeader = "preferBlockHeadLeader";
+var ConsensusDisputeBehaviorOnlyBlockHeadLeader = "onlyBlockHeadLeader";
+var RateLimitPeriodSecond = 0;
+var RateLimitPeriodMinute = 1;
+var RateLimitPeriodHour = 2;
+var RateLimitPeriodDay = 3;
+var RateLimitPeriodWeek = 4;
+var RateLimitPeriodMonth = 5;
+var RateLimitPeriodYear = 6;
+var EvalScopeNetwork = "network";
+var EvalScopeNetworkMethod = "network-method";
+var EvalScopeNetworkFinality = "network-finality";
+var EvalScopeNetworkMethodFinality = "network-method-finality";
+var AuthTypeSecret = "secret";
+var AuthTypeJwt = "jwt";
+var AuthTypeSiwe = "siwe";
+var AuthTypeNetwork = "network";
+var DataFinalityStateFinalized = 0;
+var DataFinalityStateUnfinalized = 1;
+var DataFinalityStateRealtime = 2;
+var DataFinalityStateUnknown = 3;
+var CacheEmptyBehaviorIgnore = 0;
+var CacheEmptyBehaviorAllow = 1;
+var CacheEmptyBehaviorOnly = 2;
+var ArchitectureEvm = "evm";
+var ArchitectureSvm = "svm";
+var ScopeNetwork = "network";
+var ScopeUpstream = "upstream";
+
+// src/constants.ts
+var NETWORK = EvalScopeNetwork;
+var NETWORK_METHOD = EvalScopeNetworkMethod;
+var NETWORK_FINALITY = EvalScopeNetworkFinality;
+var NETWORK_METHOD_FINALITY = EvalScopeNetworkMethodFinality;
+var REALTIME = 1 << 0;
+var UNFINALIZED = 1 << 1;
+var FINALIZED = 1 << 2;
+var UNKNOWN = 1 << 3;
+
+// src/index.ts
+var createConfig = (cfg) => {
+  return cfg;
+};
+// Annotate the CommonJS export names for ESM import in node:
+0 && (module.exports = {
+  ArchitectureEvm,
+  ArchitectureSvm,
+  AuthTypeJwt,
+  AuthTypeNetwork,
+  AuthTypeSecret,
+  AuthTypeSiwe,
+  CacheEmptyBehaviorAllow,
+  CacheEmptyBehaviorIgnore,
+  CacheEmptyBehaviorOnly,
+  ConsensusDisputeBehaviorAcceptMostCommonValidResult,
+  ConsensusDisputeBehaviorOnlyBlockHeadLeader,
+  ConsensusDisputeBehaviorPreferBlockHeadLeader,
+  ConsensusDisputeBehaviorReturnError,
+  ConsensusLowParticipantsBehaviorAcceptMostCommonValidResult,
+  ConsensusLowParticipantsBehaviorOnlyBlockHeadLeader,
+  ConsensusLowParticipantsBehaviorPreferBlockHeadLeader,
+  ConsensusLowParticipantsBehaviorReturnError,
+  DataFinalityStateFinalized,
+  DataFinalityStateRealtime,
+  DataFinalityStateUnfinalized,
+  DataFinalityStateUnknown,
+  EvalScopeNetwork,
+  EvalScopeNetworkFinality,
+  EvalScopeNetworkMethod,
+  EvalScopeNetworkMethodFinality,
+  EvmNodeTypeArchive,
+  EvmNodeTypeFull,
+  EvmNodeTypeUnknown,
+  EvmSyncingStateNotSyncing,
+  EvmSyncingStateSyncing,
+  EvmSyncingStateUnknown,
+  FINALIZED,
+  NETWORK,
+  NETWORK_FINALITY,
+  NETWORK_METHOD,
+  NETWORK_METHOD_FINALITY,
+  REALTIME,
+  RateLimitCountModeCredit,
+  RateLimitCountModeRequest,
+  RateLimitPeriodDay,
+  RateLimitPeriodHour,
+  RateLimitPeriodMinute,
+  RateLimitPeriodMonth,
+  RateLimitPeriodSecond,
+  RateLimitPeriodWeek,
+  RateLimitPeriodYear,
+  ScopeNetwork,
+  ScopeUpstream,
+  UNFINALIZED,
+  UNKNOWN,
+  UpstreamTypeEvm,
+  UpstreamTypeSvm,
+  createConfig
+});
+//# sourceMappingURL=index.js.map

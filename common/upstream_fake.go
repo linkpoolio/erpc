@@ -1,0 +1,349 @@
+package common
+
+import (
+	"context"
+	"math"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/rs/zerolog"
+)
+
+var _ EvmStatePoller = &FakeEvmStatePoller{}
+var _ Upstream = &FakeUpstream{}
+var _ EvmUpstream = &FakeUpstream{}
+var _ HealthTracker = &FakeHealthTracker{}
+
+type FakeUpstream struct {
+	id                 string
+	config             *UpstreamConfig
+	network            Network
+	networkIDOverride  string // set via WithFakeUpstreamNetworkID; "" → fall back to default
+	evmStatePoller     EvmStatePoller
+	cordoned           bool
+	lastCordonedReason string
+	cordonMu           sync.RWMutex
+	tracker            HealthTracker
+	stateProvenBlock   atomic.Int64
+}
+
+func NewFakeUpstream(id string, opts ...func(*FakeUpstream)) Upstream {
+	u := &FakeUpstream{
+		id: id,
+		config: &UpstreamConfig{
+			Id: id,
+		},
+		tracker: &FakeHealthTracker{},
+	}
+
+	for _, opt := range opts {
+		opt(u)
+	}
+
+	return u
+}
+
+func WithEvmStatePoller(evmStatePoller EvmStatePoller) func(*FakeUpstream) {
+	return func(u *FakeUpstream) {
+		u.evmStatePoller = evmStatePoller
+	}
+}
+
+// WithTags sets the upstream's config tags (used by consensus
+// requiredParticipants quotas, selection-policy tag filters, etc.).
+func WithTags(tags ...string) func(*FakeUpstream) {
+	return func(u *FakeUpstream) {
+		u.config.Tags = tags
+	}
+}
+
+// WithGrpcConfig sets the upstream's grpc config block (headers, etc.). Used by
+// client tests that exercise grpc.headers handling.
+func WithGrpcConfig(cfg *GrpcUpstreamConfig) func(*FakeUpstream) {
+	return func(u *FakeUpstream) {
+		u.config.Grpc = cfg
+	}
+}
+
+// WithFakeUpstreamNetworkID overrides the network ID this fake reports.
+// Tests that exercise per-network indexing (e.g.
+// `tracker.GetUpstreamMetrics`'s `upstreamsByNetwork` lookup) need
+// upstreams on DIFFERENT networks to validate the per-network scope.
+// Default (no override) keeps the historical "evm:123" string so
+// existing tests aren't affected.
+func WithFakeUpstreamNetworkID(networkID string) func(*FakeUpstream) {
+	return func(u *FakeUpstream) {
+		u.networkIDOverride = networkID
+	}
+}
+
+func (u *FakeUpstream) Id() string {
+	return u.id
+}
+
+func (u *FakeUpstream) VendorName() string {
+	return u.config.VendorName
+}
+
+func (u *FakeUpstream) Config() *UpstreamConfig {
+	return u.config
+}
+
+func (u *FakeUpstream) IgnoreMethod(method string) {
+	// No-op for testing
+}
+
+func (u *FakeUpstream) Logger() *zerolog.Logger {
+	return &zerolog.Logger{}
+}
+
+func (u *FakeUpstream) EvmGetChainId(context.Context) (string, error) {
+	return "123", nil
+}
+
+func (u *FakeUpstream) NetworkId() string {
+	if u.networkIDOverride != "" {
+		return u.networkIDOverride
+	}
+	return "evm:123"
+}
+
+func (u *FakeUpstream) NetworkLabel() string {
+	if u.networkIDOverride != "" {
+		return u.networkIDOverride
+	}
+	return "evm:123"
+}
+
+func (u *FakeUpstream) SetNetwork(network Network) {
+	u.network = network
+}
+
+func (u *FakeUpstream) Network() Network {
+	return u.network
+}
+
+func (u *FakeUpstream) EvmSyncingState() EvmSyncingState {
+	return EvmSyncingStateUnknown
+}
+
+func (u *FakeUpstream) Vendor() Vendor {
+	return nil
+}
+
+func (u *FakeUpstream) Tracker() HealthTracker {
+	return u.tracker
+}
+
+func (u *FakeUpstream) SupportsNetwork(ctx context.Context, networkId string) (bool, error) {
+	return true, nil
+}
+
+func (u *FakeUpstream) EvmIsBlockFinalized(ctx context.Context, blockNumber int64, forceFresh bool) (bool, error) {
+	return false, nil
+}
+
+func (u *FakeUpstream) EvmStatePoller() EvmStatePoller {
+	return u.evmStatePoller
+}
+
+func (u *FakeUpstream) Forward(ctx context.Context, nq *NormalizedRequest, skipSyncingCheck, isHedgeAttempt bool) (*NormalizedResponse, error) {
+	return nil, nil
+}
+
+func (u *FakeUpstream) Cordon(method string, reason string) {
+	u.cordonMu.Lock()
+	defer u.cordonMu.Unlock()
+	u.cordoned = true
+	u.lastCordonedReason = reason
+}
+
+// ShouldHandleMethod honors the upstream config's IgnoreMethods (glob patterns);
+// everything else is handled. Mirrors the concrete upstream's default-allow
+// behavior for tests.
+func (u *FakeUpstream) ShouldHandleMethod(method string) (bool, error) {
+	if u.config != nil {
+		for _, ig := range u.config.IgnoreMethods {
+			if m, err := WildcardMatch(ig, method); err == nil && m {
+				return false, nil
+			}
+		}
+	}
+	return true, nil
+}
+
+func (u *FakeUpstream) Uncordon(method string, reason string) {
+	u.cordonMu.Lock()
+	defer u.cordonMu.Unlock()
+	u.cordoned = false
+	u.lastCordonedReason = ""
+}
+
+func (u *FakeUpstream) CordonedReason() (string, bool) {
+	u.cordonMu.RLock()
+	defer u.cordonMu.RUnlock()
+	return u.lastCordonedReason, u.cordoned
+}
+
+func (u *FakeUpstream) EvmAssertBlockAvailability(ctx context.Context, forMethod string, confidence AvailbilityConfidence, forceFreshIfStale bool, blockNumber int64) (bool, error) {
+	return true, nil
+}
+
+func (u *FakeUpstream) EvmStateProvenBlock() int64 { return u.stateProvenBlock.Load() }
+func (u *FakeUpstream) EvmSetStateProvenBlock(n int64) {
+	for {
+		cur := u.stateProvenBlock.Load()
+		if n <= cur || u.stateProvenBlock.CompareAndSwap(cur, n) {
+			return
+		}
+	}
+}
+
+func (u *FakeUpstream) EvmEffectiveLatestBlock() int64 {
+	if u.evmStatePoller == nil {
+		return 0
+	}
+	return u.evmStatePoller.LatestBlock()
+}
+
+func (u *FakeUpstream) EvmEffectiveFinalizedBlock() int64 {
+	if u.evmStatePoller == nil {
+		return 0
+	}
+	return u.evmStatePoller.FinalizedBlock()
+}
+
+func (u *FakeUpstream) EvmBlockAvailabilityBounds() (int64, int64) {
+	cfg := u.Config()
+	if cfg == nil || cfg.Evm == nil || cfg.Evm.BlockAvailability == nil {
+		return math.MinInt64, math.MaxInt64
+	}
+	minVal, maxVal := int64(math.MinInt64), int64(math.MaxInt64)
+	if cfg.Evm.BlockAvailability.Lower != nil && cfg.Evm.BlockAvailability.Lower.ExactBlock != nil {
+		minVal = *cfg.Evm.BlockAvailability.Lower.ExactBlock
+	}
+	if cfg.Evm.BlockAvailability.Upper != nil && cfg.Evm.BlockAvailability.Upper.ExactBlock != nil {
+		maxVal = *cfg.Evm.BlockAvailability.Upper.ExactBlock
+	}
+	return minVal, maxVal
+}
+
+type FakeEvmStatePoller struct {
+	latestBlockNumber    int64
+	finalizedBlockNumber int64
+}
+
+func NewFakeEvmStatePoller(latestBlockNumber int64, finalizedBlockNumber int64) EvmStatePoller {
+	return &FakeEvmStatePoller{
+		latestBlockNumber:    latestBlockNumber,
+		finalizedBlockNumber: finalizedBlockNumber,
+	}
+}
+
+func (p *FakeEvmStatePoller) EvmBlockNumber(ctx context.Context) (int64, error) {
+	return p.latestBlockNumber, nil
+}
+
+func (p *FakeEvmStatePoller) Bootstrap(ctx context.Context) error {
+	return nil
+}
+
+func (p *FakeEvmStatePoller) FinalizedBlock() int64 {
+	return p.finalizedBlockNumber
+}
+
+func (p *FakeEvmStatePoller) EarliestBlock(probe EvmAvailabilityProbeType) int64 {
+	return 0
+}
+
+func (p *FakeEvmStatePoller) PollEarliestBlockNumber(ctx context.Context, probe EvmAvailabilityProbeType, staleness time.Duration) (int64, error) {
+	return 0, nil
+}
+
+func (p *FakeEvmStatePoller) IsBlockFinalized(blockNumber int64) (bool, error) {
+	return blockNumber <= p.finalizedBlockNumber, nil
+}
+
+func (p *FakeEvmStatePoller) IsObjectNull() bool {
+	return false
+}
+
+func (p *FakeEvmStatePoller) LatestBlock() int64 {
+	return p.latestBlockNumber
+}
+
+func (p *FakeEvmStatePoller) Poll(ctx context.Context) error {
+	return nil
+}
+
+func (p *FakeEvmStatePoller) PollFinalizedBlockNumber(ctx context.Context) (int64, error) {
+	return p.finalizedBlockNumber, nil
+}
+
+func (p *FakeEvmStatePoller) PollLatestBlockNumber(ctx context.Context) (int64, error) {
+	return p.latestBlockNumber, nil
+}
+
+func (p *FakeEvmStatePoller) SetNetworkConfig(config *NetworkConfig) {
+	// No-op for testing
+}
+
+func (p *FakeEvmStatePoller) SetSyncingState(state EvmSyncingState) {
+	// No-op for testing
+}
+
+func (p *FakeEvmStatePoller) SuggestFinalizedBlock(blockNumber int64) {
+	p.finalizedBlockNumber = blockNumber
+}
+
+func (p *FakeEvmStatePoller) SuggestLatestBlock(blockNumber int64) {
+	p.latestBlockNumber = blockNumber
+}
+
+func (p *FakeEvmStatePoller) SyncingState() EvmSyncingState {
+	return EvmSyncingStateUnknown
+}
+
+func (p *FakeEvmStatePoller) GetDiagnostics() *EvmStatePollerDiagnostics {
+	return &EvmStatePollerDiagnostics{
+		Enabled:        true,
+		LatestBlock:    p.latestBlockNumber,
+		FinalizedBlock: p.finalizedBlockNumber,
+		SyncingState:   EvmSyncingStateUnknown.String(),
+	}
+}
+
+// FakeHealthTracker is a no-op implementation of HealthTracker for testing
+type FakeHealthTracker struct {
+	MisbehaviorRecorded     bool
+	MisbehaviorCount        int
+	LastMisbehaviorMethod   string
+	LastMisbehaviorFinality DataFinalityState
+	mu                      sync.Mutex
+}
+
+func (t *FakeHealthTracker) RecordUpstreamMisbehavior(up Upstream, method string, finality DataFinalityState) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.MisbehaviorRecorded = true
+	t.MisbehaviorCount++
+	t.LastMisbehaviorMethod = method
+	t.LastMisbehaviorFinality = finality
+}
+
+func (t *FakeHealthTracker) RecordUpstreamRequest(up Upstream, method string, finality DataFinalityState) {
+	// No-op for testing
+}
+
+func (t *FakeHealthTracker) RecordUpstreamFailure(up Upstream, method string, finality DataFinalityState, err error) {
+	// No-op for testing
+}
+
+func (t *FakeHealthTracker) Cordon(upstream Upstream, method string, reason string) {
+	// No-op for testing
+}
+
+func (t *FakeHealthTracker) Uncordon(upstream Upstream, method string, reason string) {
+	// No-op for testing
+}

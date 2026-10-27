@@ -1,0 +1,798 @@
+---
+title: Authentication
+description: Lock down every request with a token, JWT, wallet signature, or IP allowlist — and bind each identity to its own rate-limit budget.
+---
+
+import { LLMsTxtLink, AISection, ConfigTabs, SourceLink, PromptExample } from "../../components";
+
+<LLMsTxtLink />
+
+# Authentication
+
+Every request eRPC receives can be checked before it ever touches an upstream. Stack as many strategies as you need — static token, signed JWT, Ethereum wallet signature, or IP allowlist — and the first one that passes wins. Tie each identity directly to a rate-limit budget so power users and free-tier callers never share the same quota.
+
+## Quick taste
+
+Illustrative, not a tuned production config — one secret token, one budget:
+
+<ConfigTabs
+  path="projects[].auth"
+  focusYaml="3-10"
+  focusTs="3-10"
+  yaml={`projects:
+  - id: main
+    auth:
+      strategies:
+        - type: secret
+          # bind this identity to its own rate-limit budget
+          rateLimitBudget: backend-tier
+          secret:
+            id: backend
+            value: \${MY_SECRET_VALUE}`}
+  ts={`projects: [{
+  id: "main",
+  auth: {
+    strategies: [{
+      type: "secret",
+      // bind this identity to its own rate-limit budget
+      rateLimitBudget: "backend-tier",
+      secret: {
+        id: "backend",
+        value: process.env.MY_SECRET_VALUE,
+      },
+    }],
+  },
+}]`}
+/>
+
+## Agent reference
+
+Copy one of these prompts into your AI agent session (Claude Code, Cursor, …) — each one
+points the agent at this page's machine-readable reference so it can do the work correctly:
+
+<PromptExample
+	n={1}
+	title="lock down my project with a static token"
+	defaultOpen
+	prompt={`Add a secret-token auth strategy to my eRPC project so that only callers
+who supply the correct token in X-ERPC-Secret-Token (or ?secret=) can reach any
+upstream. Bind the token to an existing rate-limit budget so the backend tier gets
+its own quota. Work with my existing eRPC config. Read the full reference first:
+https://docs.erpc.cloud/config/auth.llms.txt`}
+/>
+
+<PromptExample
+	n={2}
+	title="set up JWT auth with per-user rate-limit tiers"
+	prompt={`Configure eRPC to verify signed JWT bearer tokens (RS256) for my
+public-facing project. Different token tiers should get different rate-limit
+budgets — embed the budget ID in the token's rlm claim so a single strategy
+handles all users without separate config entries. Include key rotation via
+kid so I can add a new key without downtime. Work with my existing eRPC config. Reference:
+https://docs.erpc.cloud/config/auth.llms.txt`}
+/>
+
+<PromptExample
+	n={3}
+	title="migrate to database auth without a redeploy"
+	prompt={`Replace my static secret strategy in my eRPC config with a database
+strategy backed by PostgreSQL so I can add and revoke API keys in the database
+without redeploying eRPC. Enable fail-open with an emergency rate-limit budget
+so the RPC endpoint stays reachable if the auth DB goes down. Reference:
+https://docs.erpc.cloud/config/auth.llms.txt`}
+/>
+
+<PromptExample
+	n={4}
+	title="debug why callers are getting 401 or no-strategy-matched"
+	prompt={`I'm seeing 401 responses and "no auth strategy matched" errors in my
+eRPC logs. Walk through the credential-extraction priority order and strategy
+matching logic to explain why my config in my eRPC config might be failing, and
+suggest fixes. Reference: https://docs.erpc.cloud/config/auth.llms.txt`}
+/>
+
+<PromptExample
+	n={5}
+	title="add IP allowlist as a credential-less fallback"
+	prompt={`My internal services call eRPC without any token. Add a network
+strategy that allowlists my private CIDR ranges and localhost so they get
+through, while still requiring a secret token for all other callers. Each
+internal IP should get its own User.Id in metrics (ipAsUser mode). Work with my existing eRPC config. Reference: https://docs.erpc.cloud/config/auth.llms.txt`}
+/>
+
+<AISection title="Authentication — full agent reference">
+
+### How it works
+
+At startup, three independent `AuthRegistry` instances can be created: one per project (consumer traffic at `projects[*].auth`), one for the admin API (`admin.auth`), and one for the healthcheck endpoint (`healthCheck.auth`). If a project has no auth config, its registry is nil and all requests are allowed. If `admin.auth` is nil, the admin endpoint hard-errors — configure `admin.auth` to protect it.
+
+For each HTTP request, eRPC extracts credential signals from query params and headers in a fixed priority order, then calls `AuthRegistry.Authenticate`. The registry iterates strategies in declaration order, skipping any whose type does not match the credential type and any filtered out by method rules. The first strategy that both matches and succeeds wins; its returned `User{Id, RateLimitBudget}` is attached to the request for downstream rate-limiting and observability.
+
+**HTTP credential extraction order (first match wins):**
+1. `?token=` — deprecated alias for `?secret=` → `AuthTypeSecret`
+2. `?secret=` → `AuthTypeSecret`
+3. `X-ERPC-Secret-Token` header → `AuthTypeSecret`
+4. `Authorization: Basic` (password part of base64 `user:pass`) → `AuthTypeSecret`
+5. `Authorization: Bearer <token>` → `AuthTypeJwt`
+6. `?jwt=` → `AuthTypeJwt`
+7. `?signature=` + `?message=` → `AuthTypeSiwe`
+8. `X-Siwe-Message` + `X-Siwe-Signature` headers → `AuthTypeSiwe`
+9. No credential present → `AuthTypeNetwork` (fallback)
+
+**Additional secret locations (opt-in).** When none of 1–4 supplied a secret, eRPC also looks, in this order, at `?apikey=` (`apikeyQuery`), the `X-Api-Key` / `apikey` header (`apikeyHeader`), and — only when a [domain alias](/config/server) preselects project, architecture **and** chain so the path is not used for routing — a single path segment (`path`: `https://rpc.example.com/<secret>`; `/admin`, `/healthcheck` and `/metrics` are never treated as secrets). A `secret` or `database` strategy only accepts a secret found there when it lists the location in its `additionalLocations`; without it (the default) such a secret is ignored. These locations do **not** change the credential type either: a request that only carries one of them still reaches a `network` strategy, so existing setups behave as before.
+
+The `forwardedClientId` strategy does not take part in this order: it is offered every request that carries its configured header (whatever credential type was extracted), in declaration order like any other strategy.
+
+gRPC metadata uses a parallel order without query-param equivalents: `x-erpc-secret-token`, then `authorization: Basic`, `authorization: Bearer`, then `x-siwe-message`+`x-siwe-signature`, then network fallback. gRPC has no `?token=` / `?secret=` / `?jwt=` equivalents — query params are not available in gRPC metadata.
+
+**Method filtering.** Every strategy accepts `ignoreMethods` and `allowMethods` wildcard lists. `ignoreMethods` is evaluated first; `allowMethods` overrides it. The canonical pattern for restricting a strategy to one method is `ignoreMethods: ["*"]` plus `allowMethods: ["eth_getLogs"]`.
+
+**Rate-limit budget cascade.** A `common.User{Id, RateLimitBudget}` is returned from each strategy. Budget priority: (1) per-user budget from the strategy result (database record field, JWT claim, or strategy-level `rateLimitBudget`); (2) strategy-level `AuthStrategyConfig.rateLimitBudget`; (3) no budget → all requests pass. In `acquireRateLimitPermit`, the user's budget (if non-empty) overrides the strategy-level budget.
+
+#### secret strategy
+
+The simplest backend-to-backend gate. The client sends the token as `?secret=VALUE` or the `X-ERPC-Secret-Token` header. `Authorization: Basic` is also accepted; only the password field is used — the username is silently discarded. `?apikey=`, `X-Api-Key` / `apikey` headers and, on a fully aliased domain, the path (`/<secret>`) are accepted too when listed in `additionalLocations` (`apikeyQuery`, `apikeyHeader`, `path`; see above).
+
+A secret in the URL (query or path) ends up in the access logs of every proxy and load balancer on the way and in browser history; prefer headers where clients support them. eRPC replaces it with `REDACTED` / `/REDACTED` in the `http.url` span attribute and the CORS metrics' path label.
+
+Authenticate: exact equality match (`ap.Secret.Value != s.cfg.Value`). Returns `ErrAuthUnauthorized` on mismatch. No timing-safe compare — plain Go string inequality. For public internet deployments, prefer `database` or `jwt`.
+
+#### jwt strategy
+
+Verifies a signed JWT bearer token. Supports RSA, EC, and HMAC keys with optional `kid`-based rotation. Rate-limit budget tiers can be embedded in any JWT claim, enabling per-user rate limiting without separate strategy entries.
+
+Authenticate flow: `ParseUnverified` (kid extraction) → algorithm allowlist → key lookup by kid or type-compatibility → full `Parse` (signature + temporal claims) → issuer/audience/required claims → extract `sub` as `User.Id` → extract budget claim.
+
+**Critical footgun**: when `verificationKeys` is nil or empty, `s.keys` is empty, key lookup finds nothing, and every JWT is rejected with `"no suitable verification key found"`. An empty key map is deny-all, not allow-all.
+
+#### siwe strategy
+
+Verifies an EIP-4361 Sign-In-With-Ethereum message and signature. The recovered Ethereum address (lowercase) becomes `User.Id`. Requires an explicit `allowedDomains` list — an empty or absent list rejects all SIWE requests.
+
+Authenticate flow: parse EIP-4361 message → EIP-191 signature verification → domain allowlist → `ValidNow()` temporal check → return `User{Id: strings.ToLower(address)}`.
+
+Both raw and base64-encoded message forms are accepted. SIWE requires both `?signature=` AND `?message=` together — supplying only one causes silent fallthrough to network-strategy extraction.
+
+#### network strategy
+
+Authorizes requests by client IP address against an allowlist of exact IPs and CIDR ranges. This is the credential-less fallback — any request arriving without a recognizable token, JWT, or SIWE payload receives `AuthTypeNetwork` and is routed here if configured.
+
+Authenticate: reads `req.ClientIP()` (proxy-resolved by HTTP ingress). Checks localhost → exact IP list → CIDR list. First match wins. `ipAsUser=false` (default): all IPs in a CIDR range share one identity (`cidr.String()`). `ipAsUser=true`: each IP gets its own identity (`clientIP.String()`).
+
+#### forwardedClientId strategy
+
+For deployments where eRPC sits behind an API gateway or reverse proxy that already authenticates callers (API keys, OAuth, mTLS, …) and forwards the authenticated client's id in a request header. eRPC trusts that header as the `User.Id` without verifying any credential itself, so per-client rate-limit budgets, `allowMethods`/`ignoreMethods` scoping and the `user` metric label all work without duplicating the gateway's key store in eRPC.
+
+**Security model.** Anyone who can reach eRPC directly and set the header can claim any id. Only enable this strategy when every request reaches eRPC through a proxy that **strips or overwrites** the header on incoming client requests, and keep eRPC itself off the public network. Defense in depth:
+- `allowedProxies` — only trust the header when the direct TCP peer (the socket's remote address, not the `X-Forwarded-For`-resolved client IP) is one of these IPs/CIDRs.
+- `allowedIds` — reject any id not in the list; also bounds the cardinality of the `user` label.
+- A header with more than one value is rejected (the proxy appended instead of overwriting, so a client-supplied copy might come first). Ids must be 1–256 visible ASCII characters without commas.
+
+Supports: any HTTP or WebSocket request carrying the configured header (WebSocket uses the upgrade request's headers). gRPC is not supported. The strategy is never active unless it is configured — a request carrying the header against a project without this strategy is unaffected.
+
+Compared to the project-level `trustUserIdHeader` (identity for metrics/logs only, never authenticates), `forwardedClientId` **authenticates**: the request is admitted because the header is present, and the strategy's `rateLimitBudget`/`allowClientDirectives` apply.
+
+#### database strategy
+
+Looks up an API key against a connector-backed store (PostgreSQL, DynamoDB, Redis, memory, or gRPC). Includes an in-process Ristretto positive cache (default 1h TTL), a hardcoded 5-second negative cache for invalid/disabled keys, singleflight deduplication for concurrent misses, configurable retry/backoff, and a connector-down circuit-breaker with optional fail-open.
+
+Authenticate fast paths (in evaluation order):
+1. Positive Ristretto cache hit → return cached `User` immediately.
+2. Negative Ristretto cache hit → return `ErrAuthUnauthorized` immediately.
+3. Connector-down fast path (`tryFastFailOpen`) → return emergency user if fail-open enabled.
+4. Singleflight deduplicated DB lookup → parse JSON → cache or negative-cache.
+
+**DB record format:**
+```json
+{
+  "userId":          "string (required)",
+  "enabled":         true,
+  "rateLimitBudget": "budget-id (optional)"
+}
+```
+`enabled: false` → `ErrAuthUnauthorized` + 5-second negative-cache entry. Missing `userId` → auth error. Missing `enabled` → treated as `true`.
+
+**Connector-down circuit-breaker** (added after 2026-05-13 production incident). The strategy tracks `connectorDown bool` and `connectorDownSince int64`. On transport/timeout/not-ready errors, `markConnectorDown()` sets the latch. While down, `tryFastFailOpen()` bypasses singleflight and the DB entirely — returning the emergency user (if `failOpen.enabled=true`) or rejecting immediately. One probe per second is elected via CAS to run the real DB path. A successful probe calls `markConnectorUp()`.
+
+### Config schema
+
+**Auth attachment points**
+
+| YAML path | Type | Default | Notes |
+|---|---|---|---|
+| `projects[*].auth` | `*AuthConfig` | `nil` (allow-all) | Consumer auth per project. Nil = allow-all. <SourceLink file="common/config.go" lines="509" /> |
+| `admin.auth` | `*AuthConfig` | `nil` | Admin endpoint auth. Nil = admin endpoint always returns error. <SourceLink file="common/config.go" lines="249" /> |
+| `healthCheck.auth` | `*AuthConfig` | `nil` | Healthcheck auth. Nil = unguarded. Do NOT set `rateLimitBudget` on healthcheck strategies — healthcheck auth registry has no rate-limiter registry and will panic. <SourceLink file="erpc/http_server.go" lines="201-205" /> |
+
+**`AuthConfig`**
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `auth.strategies` | `[]*AuthStrategyConfig` | `nil` (allow-all) | Ordered list. First strategy that matches credential type + method filter and authenticates successfully wins. <SourceLink file="common/config.go" lines="2444" /> |
+
+**`AuthStrategyConfig` — common fields**
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `strategies[*].type` | `string` | Inferred from sub-config block | `"secret"`, `"jwt"`, `"siwe"`, `"network"`, `"database"`, `"forwardedClientId"`. Block presence force-overwrites `type` for secret/database/jwt/siwe/forwardedClientId. For network, only `type: "network"` triggers auto-creation; the network block does not overwrite type. <SourceLink file="common/defaults.go" lines="2636-2666" /> |
+| `strategies[*].ignoreMethods` | `[]string` | `nil` | Wildcard patterns (supports `*`, `\|`, `&`, `!`). Applied before `allowMethods`. <SourceLink file="auth/authorizer.go" lines="86-98" /> |
+| `strategies[*].allowMethods` | `[]string` | `nil` | Overrides `ignoreMethods`; any matching allow re-enables the strategy for that method. <SourceLink file="auth/authorizer.go" lines="100-113" /> |
+| `strategies[*].rateLimitBudget` | `string` | `""` | Strategy-level budget ID. Overridden by per-user budget when non-empty. <SourceLink file="auth/authorizer.go" lines="119-127" /> |
+
+**`secret` strategy — `SecretStrategyConfig`**
+
+YAML prefix: `auth.strategies[*].secret`
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `secret.id` | `string` | `""` | Returned as `User.Id` on success. May be empty. <SourceLink file="common/config.go" lines="2461" /> |
+| `secret.value` | `string` | required | Exact token to match. Plain string equality (not timing-safe). Redacted in JSON/YAML marshal. <SourceLink file="auth/strategy_secret.go" lines="24" /> |
+| `secret.rateLimitBudget` | `string` | `""` | Attached to returned `User.RateLimitBudget` if non-empty. <SourceLink file="auth/strategy_secret.go" lines="29-31" /> |
+| `secret.additionalLocations` | `SecretLocation[]` | `[]` | Also accept the secret from `apikeyQuery` (`?apikey=`), `apikeyHeader` (`X-Api-Key` / `apikey`) and/or `path` (`/<secret>` on a fully aliased domain). Unknown values fail validation. |
+
+Supports: `AuthTypeSecret`, or a payload carrying a secret from one of its `additionalLocations`. `SetDefaults`: no-op.
+
+**`jwt` strategy — `JwtStrategyConfig`**
+
+YAML prefix: `auth.strategies[*].jwt`
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `jwt.verificationKeys` | `map[string]string` | `nil` | Map of `kid → keyData`. Value is PEM string, `"file:///path"`, or bare HMAC secret bytes. Empty map = ALL JWTs rejected (deny-all, not allow-all). <SourceLink file="auth/jwks.go" /> |
+| `jwt.verificationJwksUrl` | `string` | `""` | Absolute HTTP(S) URL returning a standard JWKS document (`{"keys":[...]}`). Fetched at startup and refreshed in the background. Static `verificationKeys` override JWKS entries with the same `kid`. Non-HTTP(S) or host-less values fail startup validation. <SourceLink file="common/validation.go" /> |
+| `jwt.verificationJwksRefreshInterval` | `Duration` | `1h` when JWKS URL set | Background JWKS refresh interval. <SourceLink file="common/defaults.go" /> |
+| `jwt.verificationJwksTlsInsecureSkipVerify` | `bool` | `false` | Skip TLS certificate verification when fetching the JWKS URL. **Do not enable in production** — intended for local development with self-signed certificates only. <SourceLink file="auth/jwks.go" /> |
+| `jwt.allowedAlgorithms` | `[]string` | `nil` (any algorithm) | e.g. `["RS256","ES256"]`. Prevents algorithm-confusion attacks. <SourceLink file="auth/strategy_jwt.go" /> |
+| `jwt.allowedIssuers` | `[]string` | `nil` (any issuer) | Exact match against `iss` claim. Non-empty list + missing `iss` → error. <SourceLink file="auth/strategy_jwt.go" /> |
+| `jwt.allowedAudiences` | `[]string` | `nil` (any audience) | Exact match against `aud` claim as scalar string. Array-form `aud` JWT claim always fails the cast. <SourceLink file="auth/strategy_jwt.go" /> |
+| `jwt.requiredClaims` | `[]string` | `nil` | Claim names that must be present (any value). <SourceLink file="auth/strategy_jwt.go" /> |
+| `jwt.claimMatchers` | `map[string][]string` | `nil` | Map of `claimName → allowedValues`. Every key is an AND condition; within each key's value list any match passes (OR). Claim value may be a string, string array, or SCIM-style `[{"value":"..."}]`. Missing or empty claim → error. Omitting `claimMatchers` skips the check (backward-compatible). <SourceLink file="auth/strategy_jwt.go" /> |
+| `jwt.rateLimitBudgetClaimName` | `string` | `"rlm"` (set by SetDefaults) | JWT claim name from which `User.RateLimitBudget` is extracted. Missing claim → empty budget (no rate-limit). Non-string value → silent no-op. To suppress, use a claim name never present in tokens. <SourceLink file="common/defaults.go" lines="2749-2751" /> |
+
+Supports: `AuthTypeJwt` only. `SetDefaults`: sets `rateLimitBudgetClaimName = "rlm"` if empty.
+
+**`siwe` strategy — `SiweStrategyConfig`**
+
+YAML prefix: `auth.strategies[*].siwe`
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `siwe.allowedDomains` | `[]string` | `nil` (deny-all) | Exact match against EIP-4361 `domain` field. Empty list = all SIWE rejected. Must supply at least one domain. <SourceLink file="auth/strategy_siwe.go" lines="59-67" /> |
+| `siwe.rateLimitBudget` | `string` | `""` | Attached to `User.RateLimitBudget` if non-empty. <SourceLink file="auth/strategy_siwe.go" lines="53-55" /> |
+
+Supports: `AuthTypeSiwe` only. `SetDefaults`: no-op.
+
+**`forwardedClientId` strategy — `ForwardedClientIdStrategyConfig`**
+
+YAML prefix: `auth.strategies[*].forwardedClientId`
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `forwardedClientId.header` | `string` | `"X-Client-Id"` | Request header carrying the client id (case-insensitive). Must be a valid header name. Its trimmed value becomes `User.Id`. <SourceLink file="auth/strategy_forwarded_client_id.go" /> |
+| `forwardedClientId.allowedIds` | `[]string` | `nil` (any id) | If set, ids outside the list are rejected with `ErrAuthUnauthorized`. <SourceLink file="auth/strategy_forwarded_client_id.go" /> |
+| `forwardedClientId.allowedProxies` | `[]string` | `nil` (any peer) | IPs/CIDRs of the proxy allowed to set the header, matched against the direct TCP peer address. Invalid entries fail startup validation. <SourceLink file="auth/strategy_forwarded_client_id.go" /> |
+| `forwardedClientId.rateLimitBudget` | `string` | `""` | Attached to `User.RateLimitBudget` if non-empty. Combine with a `perUser` rule to give every forwarded client its own quota. <SourceLink file="auth/strategy_forwarded_client_id.go" /> |
+
+Supports: any payload carrying the configured header (independent of the extracted credential type). `SetDefaults`: sets `header = "X-Client-Id"` if empty; `type: forwardedClientId` auto-creates the block and the block forces `type`.
+
+**`network` strategy — `NetworkStrategyConfig`**
+
+YAML prefix: `auth.strategies[*].network`
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `network.allowedIPs` | `[]string` | `nil` | Exact IPv4/IPv6 addresses. Invalid IP → startup error. <SourceLink file="auth/strategy_network.go" lines="26-33" /> |
+| `network.allowedCIDRs` | `[]string` | `nil` | CIDR ranges. Invalid CIDR → startup error. <SourceLink file="auth/strategy_network.go" lines="35-44" /> |
+| `network.allowLocalhost` | `bool` | `false` | When true, any loopback address (`127.0.0.1`, `::1`) is allowed unconditionally before IP/CIDR checks. `User.Id = clientIP.String()`. <SourceLink file="auth/strategy_network.go" lines="63-71" /> |
+| `network.trustedProxies` | `[]string` | `nil` | **NO-OP**. Never read by NetworkStrategy. Use `server.trustedIPForwarders` / `server.trustedIPHeaders` for X-Forwarded-For unwrapping. <SourceLink file="auth/strategy_network.go" lines="47-49" /> |
+| `network.rateLimitBudget` | `string` | `""` | Attached to `User.RateLimitBudget` for all matching IPs. <SourceLink file="auth/strategy_network.go" lines="65-68" /> |
+| `network.ipAsUser` | `bool` | `false` | For CIDR matches: false → `User.Id = cidr.String()` (all IPs in range share one identity); true → `User.Id = clientIP.String()` (per-IP identity). Localhost and exact-IP matches always use `clientIP.String()`. <SourceLink file="auth/strategy_network.go" lines="63-93" /> |
+
+Supports: `AuthTypeNetwork` only (credential-less fallback). `SetDefaults`: no-op.
+
+**`database` strategy — `DatabaseStrategyConfig`**
+
+YAML prefix: `auth.strategies[*].database`
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `database.connector` | `*ConnectorConfig` | auto-created | Drivers: `postgresql`, `dynamodb`, `redis`, `memory`, `grpc`. Connector id defaults to `"auth-<driver>"`. <SourceLink file="common/defaults.go" lines="2676-2678" /> |
+| `database.maxWait` | `Duration` | `1s` | Per-request context timeout for the full DB lookup (singleflight + retries). <SourceLink file="common/defaults.go" lines="2718-2720" /> |
+| `database.additionalLocations` | `SecretLocation[]` | `[]` | Also accept the secret from `apikeyQuery` (`?apikey=`), `apikeyHeader` (`X-Api-Key` / `apikey`) and/or `path` (`/<secret>` on a fully aliased domain). Unknown values fail validation. |
+| `database.cache.ttl` | `*time.Duration` | `1h` | Positive-cache TTL in Ristretto. <SourceLink file="common/defaults.go" lines="2691-2694" /> |
+| `database.cache.maxSize` | `*int64` | `10000` | Max positive-cache entries. <SourceLink file="common/defaults.go" lines="2696-2699" /> |
+| `database.cache.maxCost` | `*int64` | `1073741824` (1 GiB) | Ristretto MaxCost for positive cache. <SourceLink file="common/defaults.go" lines="2701-2704" /> |
+| `database.cache.numCounters` | `*int64` | `100000` | Ristretto NumCounters (also reused for negative cache). <SourceLink file="common/defaults.go" lines="2706-2709" /> |
+| `database.retry.maxAttempts` | `int` | `3` | Max DB lookup attempts. <SourceLink file="common/defaults.go" lines="2726-2728" /> |
+| `database.retry.baseBackoff` | `Duration` | `100ms` | Exponential backoff base; each attempt uses `baseBackoff << (attempt-1)`. <SourceLink file="common/defaults.go" lines="2729-2731" /> |
+| `database.failOpen.enabled` | `bool` | `false` | When true, DB errors grant an emergency user instead of rejecting. The connector-down circuit-breaker fast path also respects this flag. <SourceLink file="auth/strategy_database.go" lines="519-530" /> |
+| `database.failOpen.userId` | `string` | `"emergency-failopen"` | `User.Id` for all fail-open authenticated requests. Flows into Prometheus labels and log fields. <SourceLink file="common/defaults.go" lines="2738-2740" /> |
+| `database.failOpen.rateLimitBudget` | `string` | `""` | `User.RateLimitBudget` applied to fail-open traffic. <SourceLink file="auth/strategy_database.go" lines="526-528" /> |
+
+Negative cache: hardcoded 5-second TTL, 1 MiB MaxCost. Not configurable. Disabled/invalid keys stay rejected up to 5 seconds after change.
+
+**`database` strategy `Supports`**: accepts `AuthTypeSecret` (token delivered via header/query), `AuthTypeDatabase`, and a payload carrying a secret from one of its `additionalLocations` (`apikeyQuery`, `apikeyHeader`, `path`). The `AuthTypeDatabase` enum value is never set by any current HTTP or gRPC payload extractor — it is reserved for future or programmatic use. <SourceLink file="auth/strategy_database.go" lines="118-120" />
+
+**database connector error classification** — determines whether `connectorDown` latch is set ([`auth/strategy_database.go:L487-L517`](https://github.com/erpc/erpc/blob/main/auth/strategy_database.go#L487-L517)):
+
+| Error | Label | Sets connectorDown? |
+|---|---|---|
+| `data.ErrConnectorNotReady` | `db_not_ready` | yes |
+| `context.DeadlineExceeded`, substring `"deadline exceeded"` or `"timeout"` | `db_timeout` | yes |
+| substrings: `"connection refused"`, `"connection reset"`, `"broken pipe"`, `"no route to host"`, `"EOF"`, `"use of closed network connection"` | `db_connection` | yes |
+| `ErrRecordNotFound` | *(treated separately; not error-classified)* | no — marks connector UP |
+| everything else (parse errors, Postgres `53300` "too many connections", syntax errors) | `db_query_error` | no |
+
+**`getWithRetries` abort conditions** ([`auth/strategy_database.go:L367-L417`](https://github.com/erpc/erpc/blob/main/auth/strategy_database.go#L367-L417)):
+- `ErrRecordNotFound` → abort immediately (DB is healthy; no retry needed).
+- `data.ErrConnectorNotReady` → abort immediately (connector's own reconnect loop handles recovery).
+- Context done → abort immediately.
+- Any other error → retry with `baseBackoff << (attempt-1)` up to `maxAttempts`.
+
+**Connector failsafe wrapping.** Auth-scope connectors support the same `failsafeForGets` and `failsafeForSets` wrapping as cache-scope connectors (`ConnectorConfig.failsafeForGets[*]` and `failsafeForSets[*]`). Each entry is a `FailsafeConfig` with fields `matchMethod` (default `"*"`), `matchFinality`, `retry`, `circuitBreaker`, `timeout`, `hedge`, and `consensus`. <SourceLink file="common/config.go" lines="349-350" />
+
+**PostgreSQL auth-scope defaults** (`connector.postgresql.*`):
+
+| Field | Auth-scope default | Notes |
+|---|---|---|
+| `table` | `"erpc_auth"` | Differs from cache (`"erpc_json_rpc_cache"`) and shared-state (`"erpc_shared_state"`) scopes. <SourceLink file="common/defaults.go" lines="1028-1029" /> |
+| `minConns` | `1` | Differs from cache scope (4). <SourceLink file="common/defaults.go" lines="1034-1036" /> |
+| `maxConns` | `4` | Differs from cache scope (32). <SourceLink file="common/defaults.go" lines="1041-1043" /> |
+| `initTimeout` | `5s` | <SourceLink file="common/defaults.go" lines="1048-1050" /> |
+| `getTimeout` | `1s` | <SourceLink file="common/defaults.go" lines="1051-1053" /> |
+| `setTimeout` | `2s` | <SourceLink file="common/defaults.go" lines="1054-1056" /> |
+
+**Memory connector** (`connector.memory.*`):
+
+| Field | Auth-scope default | Notes |
+|---|---|---|
+| `maxItems` | `100000` | Ristretto item count limit. <SourceLink file="common/defaults.go" lines="936-938" /> |
+| `maxTotalSize` | `"1GB"` | Max total size of values. <SourceLink file="common/defaults.go" lines="939-941" /> |
+| `emitMetrics` | `nil` (disabled) | When `true`, a background goroutine emits Ristretto metrics to Prometheus every 30 seconds. Must be explicitly set to `true` to enable. <SourceLink file="data/memory.go" lines="71" /> |
+
+**DynamoDB auth-scope defaults** (`connector.dynamodb.*`):
+
+| Field | Auth-scope default | Notes |
+|---|---|---|
+| `table` | `"erpc_auth"` | Differs from cache scope. <SourceLink file="common/defaults.go" lines="1068-1069" /> |
+| `region` | `""` | AWS region. Required unless resolved from environment/instance profile. <SourceLink file="common/config.go" lines="430" /> |
+| `endpoint` | `""` | Custom endpoint URL (for local DynamoDB or LocalStack). <SourceLink file="common/config.go" lines="431" /> |
+| `auth` | `nil` | AWS credential config; see `AwsAuthConfig` table below. <SourceLink file="common/config.go" lines="432" /> |
+| `partitionKeyName` | `"groupKey"` | <SourceLink file="common/defaults.go" lines="1074-1076" /> |
+| `rangeKeyName` | `"requestKey"` | <SourceLink file="common/defaults.go" lines="1077-1079" /> |
+| `reverseIndexName` | `"idx_requestKey_groupKey"` | GSI name. <SourceLink file="common/defaults.go" lines="1080-1082" /> |
+| `ttlAttributeName` | `"ttl"` | <SourceLink file="common/defaults.go" lines="1083-1085" /> |
+| `initTimeout` | `5s` | SDK init timeout. <SourceLink file="common/defaults.go" lines="1086-1088" /> |
+| `getTimeout` | `1s` | Per-get operation timeout. <SourceLink file="common/defaults.go" lines="1089-1091" /> |
+| `setTimeout` | `2s` | Per-set operation timeout. <SourceLink file="common/defaults.go" lines="1092-1094" /> |
+| `maxRetries` | `0` | Max DynamoDB SDK retries. Zero means use SDK default (typically 3). <SourceLink file="common/config.go" lines="440" /> |
+| `statePollInterval` | `5s` | Interval for polling DynamoDB connection state. <SourceLink file="common/defaults.go" lines="1095-1097" /> |
+| `lockRetryInterval` | `0` | **Footgun**: zero means busy-spin retries; set to e.g. `100ms` in production. <SourceLink file="common/config.go" lines="442" /> |
+
+**`AwsAuthConfig`** (used by `connector.dynamodb.auth`):
+
+| Field | Default | Notes |
+|---|---|---|
+| `mode` | `""` (SDK default chain) | Valid values: `"file"` (reads credentials file), `"env"` (reads `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`), `"secret"` (uses `accessKeyID`/`secretAccessKey` fields directly). Empty = AWS SDK default chain (env → shared credentials file → EC2 instance profile). <SourceLink file="common/config.go" lines="479-485" /> |
+| `credentialsFile` | `""` | Path to AWS credentials file (used when `mode="file"`). |
+| `profile` | `""` | AWS named profile. Only meaningful when `mode="file"` — passed to `credentials.NewSharedCredentials`. Ignored for `mode="env"`, `mode="secret"`, and the SDK default chain. <SourceLink file="data/dynamodb.go" lines="177-187" /> |
+| `accessKeyID` | `""` | AWS access key ID (used when `mode="secret"`). |
+| `secretAccessKey` | `""` | AWS secret access key (used when `mode="secret"`). Redacted in JSON marshal. <SourceLink file="common/config.go" lines="487-495" /> |
+
+**Redis auth-scope defaults** (`connector.redis.*`):
+
+| Field | Auth-scope default | Notes |
+|---|---|---|
+| `uri` | `""` | Full Redis URI (e.g., `redis://user:pass@host:6379/0`). Mutually exclusive with `addr` — providing both causes a startup error. When set, `addr`/`username`/`password`/`db` are ignored entirely. <SourceLink file="common/defaults.go" lines="946-950" /> |
+| `addr` | `""` | Redis `host:port`. Folded into `uri` and cleared by `SetDefaults`. Port defaults to `6379` when missing. After folding, `addr` is set to `""`. <SourceLink file="common/defaults.go" lines="978-1015" /> |
+| `username` | `""` | Redis username. Folded into `uri` and cleared (same as `addr`). `json:"-"` does NOT apply to username; only password is marshal-suppressed. |
+| `password` | `""` | Redis password. Folded into `uri` and cleared. Tagged `json:"-"` — never marshalled to JSON output. <SourceLink file="common/config.go" lines="386" /> |
+| `db` | `0` | Redis database index. Folded into `uri` path and cleared. Always appended as `"/<db>"` even for index 0. |
+| `connPoolSize` | `8` | Connection pool size. <SourceLink file="common/defaults.go" lines="955-957" /> |
+| `initTimeout` | `5s` | <SourceLink file="common/defaults.go" lines="958-960" /> |
+| `getTimeout` | `1s` | <SourceLink file="common/defaults.go" lines="961-963" /> |
+| `setTimeout` | `3s` | <SourceLink file="common/defaults.go" lines="964-966" /> |
+| `lockRetryInterval` | `500ms` | <SourceLink file="common/defaults.go" lines="967-969" /> |
+| `tls` | `nil` | Optional TLS config with sub-fields `enabled` (bool), `certFile`, `keyFile`, `caFile`, `insecureSkipVerify`. When `tls.enabled=true` and `addr` is set, `SetDefaults` sets the URI scheme to `rediss://`. When `uri` is provided with `rediss://` scheme, `tls.*` fields are merged onto the baseline TLS config. <SourceLink file="data/redis.go" lines="149-179" /> |
+
+**gRPC connector** (`connector.grpc.*`):
+
+| Field | Auth-scope default | Notes |
+|---|---|---|
+| `servers` | `nil` | Explicit server addresses. <SourceLink file="common/config.go" lines="356" /> |
+| `bootstrap` | `""` | xDS bootstrap for server discovery. Appended to `servers`. <SourceLink file="data/grpc.go" lines="83-98" /> |
+| `headers` | `nil` | Static headers on all outbound gRPC requests. |
+| `getTimeout` | `100ms` | Much tighter than other drivers. <SourceLink file="common/defaults.go" lines="927-929" /> |
+
+### Worked examples
+
+All patterns below are distilled from real production fleets; comments explain the
+non-obvious choices.
+
+**1. Production database auth with fail-open and extended cache TTL.** The customer-facing
+edge fleet uses PostgreSQL-backed dynamic API keys. The cache TTL was raised from 5s to 1m
+after a 2026-05-13 incident where transient pgbouncer disruption caused a reconnect storm
+across all 32 replicas simultaneously — lower query rate means transient errors are far less
+likely to cascade. Trade-off: revoked/disabled keys take up to 1m to stop working:
+
+<ConfigTabs
+  path="projects[].auth.strategies[]"
+  yaml={`- type: database
+  database:
+    connector:
+      id: auth-postgresql
+      driver: postgresql
+      postgresql:
+        connectionUri: \${DATABASE_URL}
+        # table defaults to "erpc_auth" at auth scope (differs from cache scope)
+    cache:
+      # Raised from 5s to 1m to cut the Postgres query rate ~12× and prevent
+      # connector reconnect storms under transient pgbouncer disruptions.
+      # Trade-off: revoked keys stay valid for up to 1 minute.
+      ttl: 1m
+    failOpen:
+      # Keep traffic flowing under an emergency budget if the auth DB goes down;
+      # the connector-down circuit-breaker limits real DB probes to ~1/second.
+      enabled: true
+      userId: emergency-failopen
+      # Cap emergency traffic so a DB outage can't become a free-for-all
+      rateLimitBudget: emergency-tier`}
+  ts={`{
+  type: "database",
+  database: {
+    connector: {
+      id: "auth-postgresql",
+      driver: "postgresql",
+      postgresql: {
+        connectionUri: process.env.DATABASE_URL,
+        // table defaults to "erpc_auth" at auth scope (differs from cache scope)
+      },
+    },
+    cache: {
+      // Raised from 5s to 1m to cut Postgres query rate ~12× and prevent
+      // connector reconnect storms under transient pgbouncer disruptions.
+      // Trade-off: revoked keys stay valid for up to 1 minute.
+      ttl: "1m",
+    },
+    failOpen: {
+      // Keep traffic flowing under an emergency budget if the auth DB goes down;
+      // connector-down circuit-breaker limits real DB probes to ~1/second.
+      enabled: true,
+      userId: "emergency-failopen",
+      // Cap emergency traffic so a DB outage can't become a free-for-all
+      rateLimitBudget: "emergency-tier",
+    },
+  },
+}`}
+/>
+
+**2. Admin endpoint secret.** All production deployments share a single secret strategy on
+the admin scope; the token is injected from an environment variable at deploy time. Note:
+`admin.auth` being nil hard-errors the endpoint with no useful error code — always configure
+it even in internal-only deployments:
+
+<ConfigTabs
+  path="admin.auth.strategies[]"
+  yaml={`# admin.auth — nil = admin always returns 500, not 401
+admin:
+  auth:
+    strategies:
+      - type: secret
+        secret:
+          # admin endpoints only need identity; no rate-limit budget required
+          value: \${ADMIN_SECRET_TOKEN}`}
+  ts={`// admin.auth — nil = admin always returns 500, not 401
+admin: {
+  auth: {
+    strategies: [{
+      type: "secret",
+      secret: {
+        // admin endpoints only need identity; no rate-limit budget required
+        value: process.env.ADMIN_SECRET_TOKEN,
+      },
+    }],
+  },
+},`}
+/>
+
+**3. Multi-secret staging setup with per-identity budgets.** The staging environment uses
+multiple named secrets bound to the same rate-limit budget — useful for smoke-testing
+different client identities without a database. Each `id` surfaces separately in Prometheus
+labels so you can see per-client RPS in dashboards:
+
+<ConfigTabs
+  path="projects[].auth.strategies[]"
+  yaml={`- type: secret
+  secret:
+    id: client-a
+    value: \${CLIENT_A_TOKEN}
+    # each secret gets its own budget so one client can't starve others
+    rateLimitBudget: edge-tier-60krpm-total-unlimited-per-ip
+- type: secret
+  secret:
+    id: client-b
+    value: \${CLIENT_B_TOKEN}
+    rateLimitBudget: edge-tier-60krpm-total-unlimited-per-ip`}
+  ts={`{
+  type: "secret",
+  secret: {
+    id: "client-a",
+    value: process.env.CLIENT_A_TOKEN,
+    // each secret gets its own budget so one client can't starve others
+    rateLimitBudget: "edge-tier-60krpm-total-unlimited-per-ip",
+  },
+},
+{
+  type: "secret",
+  secret: {
+    id: "client-b",
+    value: process.env.CLIENT_B_TOKEN,
+    rateLimitBudget: "edge-tier-60krpm-total-unlimited-per-ip",
+  },
+},`}
+/>
+
+**4. Network strategy as credential-less fallback for internal services.** The staging
+deployment allows all internal traffic via CIDR while still accepting named secrets for
+external test callers. The `network` strategy must come first — it matches any request
+with no credential, so placing it later would shadow secrets on credential-less paths:
+
+<ConfigTabs
+  path="projects[].auth.strategies[]"
+  yaml={`# Place network strategy FIRST — it is the credential-less fallback;
+# any request without a token, JWT, or SIWE payload lands here.
+- type: network
+  network:
+    allowedCIDRs: ["10.0.0.0/8", "172.16.0.0/12"]
+    allowLocalhost: true
+    # ipAsUser: true gives each IP its own User.Id in Prometheus labels
+    ipAsUser: true
+    rateLimitBudget: internal-tier
+# External callers still use named secrets
+- type: secret
+  secret:
+    id: external-service
+    value: \${EXTERNAL_SECRET_TOKEN}
+    rateLimitBudget: external-tier`}
+  ts={`// Place network strategy FIRST — it is the credential-less fallback;
+// any request without a token, JWT, or SIWE payload lands here.
+{
+  type: "network",
+  network: {
+    allowedCIDRs: ["10.0.0.0/8", "172.16.0.0/12"],
+    allowLocalhost: true,
+    // ipAsUser: true gives each IP its own User.Id in Prometheus labels
+    ipAsUser: true,
+    rateLimitBudget: "internal-tier",
+  },
+},
+{
+  type: "secret",
+  secret: {
+    id: "external-service",
+    value: process.env.EXTERNAL_SECRET_TOKEN,
+    rateLimitBudget: "external-tier",
+  },
+},`}
+/>
+
+**5. JWT with per-user rate-limit tiers and key rotation.** Embed the budget ID in the
+token's `rlm` claim so a single strategy entry handles thousands of users. Rotate signing
+keys by adding a new `kid` entry — old tokens continue to verify against the old key until
+they naturally expire. Always set `allowedAlgorithms` to prevent algorithm-confusion attacks:
+
+<ConfigTabs
+  path="projects[].auth.strategies[]"
+  yaml={`- type: jwt
+  jwt:
+    verificationKeys:
+      # Add a new kid here when rotating; keep the old entry until tokens expire
+      rsa-2024: "file:///etc/erpc/public-2024.pem"
+      rsa-2025: "file:///etc/erpc/public-2025.pem"
+    # ALWAYS restrict algorithms — omitting this allows algorithm-confusion attacks
+    allowedAlgorithms: ["RS256"]
+    allowedIssuers: ["https://auth.myapp.com"]
+    allowedAudiences: ["https://rpc.myapp.com"]
+    # Extract User.RateLimitBudget from this JWT claim; missing claim = no budget
+    rateLimitBudgetClaimName: rlm`}
+  ts={`{
+  type: "jwt",
+  jwt: {
+    verificationKeys: {
+      // Add a new kid here when rotating; keep the old entry until tokens expire
+      "rsa-2024": "file:///etc/erpc/public-2024.pem",
+      "rsa-2025": "file:///etc/erpc/public-2025.pem",
+    },
+    // ALWAYS restrict algorithms — omitting allows algorithm-confusion attacks
+    allowedAlgorithms: ["RS256"],
+    allowedIssuers: ["https://auth.myapp.com"],
+    allowedAudiences: ["https://rpc.myapp.com"],
+    // Extract User.RateLimitBudget from this JWT claim; missing claim = no budget
+    rateLimitBudgetClaimName: "rlm",
+  },
+}`}
+/>
+
+**6. Behind an API gateway that authenticates callers and forwards their id.** The gateway
+validates the caller's API key, strips any client-supplied `X-Client-Id`, and sets it to the
+authenticated consumer's name. eRPC trusts it only from the gateway's address range and gives
+each forwarded client its own quota via a `perUser` budget rule:
+
+<ConfigTabs
+  path="projects[].auth.strategies[]"
+  yaml={`# ONLY safe when the gateway strips/overwrites X-Client-Id on incoming
+# requests and eRPC is not reachable without going through it.
+- type: forwardedClientId
+  forwardedClientId:
+    header: X-Client-Id
+    # direct TCP peer must be the gateway (not the X-Forwarded-For client IP)
+    allowedProxies: ["10.20.0.0/16"]
+    # optional: reject ids the gateway should never send
+    allowedIds: ["client-a", "client-b"]
+    # pair with a perUser rule so every client id gets its own quota
+    rateLimitBudget: per-client`}
+  ts={`// ONLY safe when the gateway strips/overwrites X-Client-Id on incoming
+// requests and eRPC is not reachable without going through it.
+{
+  type: "forwardedClientId",
+  forwardedClientId: {
+    header: "X-Client-Id",
+    // direct TCP peer must be the gateway (not the X-Forwarded-For client IP)
+    allowedProxies: ["10.20.0.0/16"],
+    // optional: reject ids the gateway should never send
+    allowedIds: ["client-a", "client-b"],
+    // pair with a perUser rule so every client id gets its own quota
+    rateLimitBudget: "per-client",
+  },
+},`}
+/>
+
+**7. API key in the URL path for clients that only accept a URL.** Some wallets and SDKs
+take a single RPC URL and cannot set headers. On a domain alias that pins project,
+architecture and chain, `https://eth.rpc.example.com/<secret>` authenticates with the
+`secret` (or `database`) strategy that lists `path` in `additionalLocations`:
+
+<ConfigTabs
+  path="server.aliasing + projects[].auth.strategies[]"
+  yaml={`server:
+  aliasing:
+    rules:
+      # all three are preselected, so the path is free to carry the secret
+      - matchDomain: "eth.rpc.example.com"
+        serveProject: main
+        serveArchitecture: evm
+        serveChain: "1"
+projects:
+  - id: main
+    auth:
+      strategies:
+        - type: secret
+          secret:
+            id: wallet-app
+            value: \${WALLET_APP_SECRET}
+            additionalLocations: [path]`}
+  ts={`server: {
+  aliasing: {
+    rules: [{
+      // all three are preselected, so the path is free to carry the secret
+      matchDomain: "eth.rpc.example.com",
+      serveProject: "main",
+      serveArchitecture: "evm",
+      serveChain: "1",
+    }],
+  },
+},
+projects: [{
+  id: "main",
+  auth: {
+    strategies: [{
+      type: "secret",
+      secret: { id: "wallet-app", value: process.env.WALLET_APP_SECRET, additionalLocations: ["path"] },
+    }],
+  },
+}]`}
+/>
+
+### Request/response behavior
+
+- A successful auth attaches `User{Id, RateLimitBudget}` to the request; `User.Id` flows into log context and Prometheus labels on every downstream metric. [<SourceLink file="auth/registry.go" lines="74-76" />]
+- `ErrAuthUnauthorized` → HTTP 401. Carries `{strategy}` in `Details`; JWT parse denials also set `{reason}` (`token_expired` / `invalid_signature`) via `AuthUnauthorizedReason`, and `Message` is derived from that reason. [<SourceLink file="common/errors.go" lines="548-615" />]
+- `ErrAuthRateLimitRuleExceeded` → HTTP 429. Carries `{projectId, strategy, budget, rule, userId, clientIp}` in `Details`. The `rule` value is formatted as `"method:<rpc_method>"`. [<SourceLink file="common/errors.go" lines="545-568" />]
+- If no strategy's `Supports` returns true (e.g., a JWT token arrives but only `network` is configured), the response is `"no auth strategy matched"` — not a per-strategy auth failure. [<SourceLink file="auth/registry.go" lines="46-96" />]
+- For admin scope, when `adminCfg != nil` but `adminAuthRegistry == nil`, `AdminAuthenticate` returns a plain `fmt.Errorf` with no typed error code → HTTP 200 (not 401/500). When `adminCfg` is nil, the path returns `ErrAuthUnauthorized` → HTTP 401. [<SourceLink file="erpc/admin.go" lines="26-30" />]
+- `erpc_rate_limits_total` fires for auth-level budget exhaustion with `origin="auth"` and `auth="<type>:<index>"` (e.g. `"secret:0"`, `"database:1"`). [<SourceLink file="auth/authorizer.go" lines="137" />]
+- `ErrAuthRateLimitRuleExceeded` is auth-scope only — it fires when the auth-strategy-level rate-limit budget is exceeded. It does NOT fire for upstream/network rate-limit budgets (those produce `ErrProjectRateLimitRuleExceeded` or `ErrNetworkRateLimitRuleExceeded`). Retryability: `U:no` (upstreams will not retry), `N:yes` (network propagates 429 to caller). [<SourceLink file="common/errors.go" lines="545-568" />]
+- **gRPC required metadata**: `x-erpc-project` (required; missing → `codes.InvalidArgument "missing metadata"`), `x-erpc-chain-id` (required), `x-erpc-architecture` (optional, defaults to `"evm"`). [<SourceLink file="erpc/grpc_server.go" lines="138-145" />]
+
+### Best practices
+
+- **Use `database` for user-facing APIs** — dynamic key management without redeploys, per-user rate-limit budgets via the DB record's `rateLimitBudget` field, and the built-in cache means sub-millisecond auth on cache hits.
+- **Always set `allowedAlgorithms` on `jwt`** — leaving it nil accepts any algorithm, opening the door to algorithm-confusion attacks (e.g., RS256 public key forged as HS256 secret).
+- **Always list at least one `allowedDomains` on `siwe`** — an empty or absent list silently rejects every SIWE request with no config-level indication.
+- **Never set `rateLimitBudget` on a `healthCheck.auth` strategy** — the healthcheck auth registry is created with a nil rate-limiter registry; reaching the budget-acquisition path causes a nil pointer panic.
+- **Enable `failOpen` with a capped emergency budget on `database`** — a DB outage should not make your RPC endpoint unreachable; the circuit-breaker bounds probe load to ~1 query/second per replica.
+- **DynamoDB `lockRetryInterval` defaults to `0`** — zero means busy-spin retries during lock contention; set to `100ms` or higher in production to avoid rapid API calls and unexpected cost.
+- **Pin `forwardedClientId` to the proxy with `allowedProxies`** — the header is a claim, not a credential; make sure only the proxy that strips/overwrites it can deliver it, and consider `allowedIds` to bound the `user` label cardinality.
+- **Use `secret` only for private, server-side callers** — the plain string comparison is not timing-safe; for browser-reachable endpoints, prefer `jwt` or `database`.
+
+### Edge cases & gotchas
+
+1. **No strategies = allow-all.** `AuthRegistry.Authenticate` returns `nil, nil` when the strategy list is empty. All requests pass. Auth is opt-in.
+2. **network strategy is the credential-less fallback.** Requests without any recognizable credential get `AuthTypeNetwork`. If no network strategy is configured and only a `secret` strategy exists, credential-less requests get "no auth strategy matched", not "invalid secret".
+3. **secret and database both consume `AuthTypeSecret`.** If both are configured, declaration order determines which runs first. To use only database, omit the secret strategy.
+4. **JWT `allowedAudiences` only supports scalar `aud`.** The implementation casts `claims["aud"]` to `string`. Tokens with `"aud": ["a","b"]` (array form) always fail the cast and are rejected even if a matching audience is in the array.
+5. **SIWE `allowedDomains` nil/empty = deny-all.** Visual appearance of `siwe: {}` gives no indication it is a blanket deny.
+6. **`network.trustedProxies` is an intentional no-op.** Configure `server.trustedIPForwarders` / `server.trustedIPHeaders` instead.
+7. **Healthcheck auth cannot use `rateLimitBudget`.** The healthcheck auth registry is created with `rateLimitersRegistry = nil`. Setting a budget on a healthcheck strategy reaches a nil pointer dereference at `acquireRateLimitPermit`.
+8. **secret uses non-constant-time comparison.** Plain `!=` is timing-side-channel vulnerable for public internet exposures.
+9. **Database negative cache TTL is hardcoded at 5 seconds.** Not configurable. Re-enabled keys are rejected for up to 5 seconds.
+10. **Connector-down probe is per-process.** One probe/second per replica, no cross-replica coordination.
+11. **type inference conflict.** Setting multiple sub-config blocks (e.g. both `secret:` and `jwt:`) in one strategy entry causes the last-evaluated block to silently overwrite `type`. Evaluation order: `secret → database → jwt → siwe → forwardedClientId`. Never set multiple sub-config blocks in one strategy entry.
+12. **`Authorization: Basic` username is silently discarded.** Only the password field is used as the secret value. `alice:mysecret` and `bob:mysecret` are treated identically.
+13. **JWT requires keys.** Configure `verificationKeys` and/or `verificationJwksUrl`. With neither, startup validation fails. An empty resolved key map rejects every JWT (deny-all, not allow-all).
+14. **SIWE requires both signature and message together.** Missing either one causes silent fallthrough to network-strategy payload extraction.
+15. **`?token=` query param is deprecated.** Alias for `?secret=`. Continues to work but may be removed; use `?secret=` or `X-ERPC-Secret-Token` header in new implementations.
+16. **Redis `addr`/`username`/`password`/`db` are cleared after `SetDefaults`.** After initialization only `uri` is set. Config exports show only the URI (with credentials URL-encoded in it).
+17. **DynamoDB `lockRetryInterval` defaults to `0`.** Zero = busy-spin during lock contention. Set to a non-zero value (e.g. `100ms`) in production.
+18. **database.cache, database.retry, and database.failOpen are always auto-created.** Caching is always on with 1h TTL unless `ttl` is explicitly changed. There is no config to disable caching by omitting the block.
+19. **`type: "network"` auto-creates the `network {}` sub-struct; the converse is asymmetric.** Adding a `network:` block does NOT overwrite `type` — unlike `secret`/`database`/`jwt`/`siwe` which force-overwrite `type` when their sub-block is present.
+20. **When `admin.auth` is nil the admin endpoint hard-errors with HTTP 500.** `AdminAuthenticate` returns a plain `fmt.Errorf` (no typed error code) → HTTP 200 wire, not 401. Configure `admin.auth` to protect it properly.
+21. **`database` strategy also accepts `AuthTypeDatabase` in `Supports`.** The enum value `AuthTypeDatabase` exists but is never produced by any current HTTP or gRPC payload extractor. It is reserved for future or programmatic injection. In practice, database auth is triggered via `AuthTypeSecret` credentials (header/query token). [<SourceLink file="auth/strategy_database.go" lines="118-120" />]
+22. **Singleflight scope is per API key.** The singleflight group inside `DatabaseStrategy` uses the raw API key string as the deduplication key. Concurrent requests with the same API key during a cache miss are coalesced into a single DB lookup. Requests with different API keys run in parallel. [<SourceLink file="auth/strategy_database.go" lines="173-178" />]
+23. **`AuthConfig` is shared across all three scopes.** The same `AuthConfig` type is used for `projects[*].auth`, `admin.auth`, and `healthCheck.auth`. All five strategy types can be configured in any scope. The only scope-specific hazard is `healthCheck.auth` — the healthcheck auth registry is created with a nil `rateLimitersRegistry`, so setting `rateLimitBudget` on any healthcheck strategy causes a nil pointer panic.
+24. **Redis `addr`/`username`/`password`/`db` are cleared after `SetDefaults`.** After initialization, only `uri` is set; all discrete fields are zeroed. Config exports show only the URI (with credentials URL-encoded in it). Because `password` has `json:"-"`, a JSON export shows the URI but not the password field. [<SourceLink file="common/defaults.go" lines="1012-1015" />]
+25. **Admin auth registry DOES support rate-limit budgets.** Unlike the healthcheck scope, the admin `AuthRegistry` is created with the same `rateLimitersRegistry` as projects. Rate-limit budgets on admin auth strategies are applied when configured.
+26. **`verificationJwksUrl` must be absolute HTTP(S).** Non-empty values are parsed at startup; scheme must be `http` or `https` and a host is required. Scheme-less hosts, `file://`, and other schemes fail validation even when static `verificationKeys` are also set. [<SourceLink file="common/validation.go" />]
+
+27. **JWT `jwt.Parse` failures are classified into `AuthUnauthorizedReason`.** Bad signatures → `invalid_signature` / "invalid signature"; expired tokens (`ValidationErrorExpired`) → `token_expired` / "token expired". If both bits are set, signature wins — claims (including `exp`) are untrusted without a valid sig. Other `ValidationError` flags keep the jwt library text without a `reason` detail. Classification lives in auth (not `common`) to avoid importing `golang-jwt` into `common`. [<SourceLink file="auth/strategy_jwt.go" />, <SourceLink file="common/errors.go" lines="548-615" />]
+28. **`forwardedClientId` trusts a header.** It authenticates whoever can set the header. A proxy that *appends* to the header rather than overwriting it yields two values, which the strategy rejects; a proxy that passes a client-supplied header through untouched is a full auth bypass. The id is used verbatim in logs, metric labels and `perUser` rate-limit keys.
+29. **Additional secret locations never shadow `network`.** `?apikey=`, `X-Api-Key`/`apikey` and the `/<secret>` path leave the credential type as `network` when nothing else was supplied. With `[network, secret]` and a caller from an allowed IP, `network` wins (declaration order) and the key is not used for identity; put `secret`/`database` first if the key should decide the identity.
+30. **Path secrets need a fully aliased domain.** If the alias leaves any of project/architecture/chain to the path, the single segment is routing (`/main`, `/1`, a network alias) and is never read as a secret.
+
+### Observability
+
+| Metric | Type | Labels | When it fires |
+|---|---|---|---|
+| `erpc_auth_failed_total` | counter | `project`, `network`, `strategy`, `reason`, `agent_name` | Database strategy only. Reason values: `missing_secret`, `empty_secret`, `cached_unknown_api_key`, `db_fail_open_fast_path`, `db_not_ready`, `db_timeout`, `db_connection`, `db_query_error`, `invalid_api_key`, `disabled_key`, `db_record_parse_error`, `db_record_missing_user_id`, `internal_error`. |
+| `erpc_rate_limits_total` | counter | `project`, `network`, `vendor`, `upstream`, `category`, `finality`, `user`, `agent_name`, `budget`, `scope`, `auth`, `origin` | When auth-level rate-limit budget is exhausted. `origin="auth"`, `auth="<type>:<index>"` (e.g. `"secret:0"`, `"database:1"`). |
+
+**Log messages (database strategy):**
+
+| Level | Message | Key fields |
+|---|---|---|
+| `warn` | `"database connector marked DOWN; subsequent requests will fast-path to fail-open until next probe succeeds"` | `connectorId` |
+| `warn` | `"database connector marked UP; resuming normal auth flow"` | `connectorId` |
+| `warn` | `"singleflight error; fail-open enabled, granting emergency user"` | `userId`, `err` |
+| `warn` | `"database authentication lookup failed; retrying"` | `driver`, `connectorId`, `attempt`, `backoff`, `err` |
+| `error` | `"database query failed during authentication"` | `apiKey`, `driver`, `connectorId`, `err` |
+| `error` | `"auth DB error; fail-open enabled, granting emergency user"` | `userId` |
+| `info` | `"initialized API key cache for database authentication strategy"` | `ttl`, `negTtl`, `maxSize`, `maxCost`, `numCounters` |
+| `debug` | `"API key found in cache"` / `"not found in cache"` | `apiKey` |
+| `debug` | `"API key found in negative cache"` | `apiKey` |
+| `debug` | `"cached API key data"` | `apiKey`, `ttl` |
+| `debug` | `"user authenticated successfully"` | `apiKey`, `userId`, `budget` |
+| `debug` | `"invalidated API key cache entry"` | `apiKey` |
+
+No dedicated auth trace spans — auth runs inline inside the HTTP handler goroutine within the OTel request span.
+
+### Source code entry points
+
+- [`auth/registry.go:L46-L96`](https://github.com/erpc/erpc/blob/main/auth/registry.go#L46-L96) — `AuthRegistry.Authenticate`: first-win loop, error accumulation
+- [`auth/authorizer.go:L83-L157`](https://github.com/erpc/erpc/blob/main/auth/authorizer.go#L83-L157) — `shouldApplyToMethod`, `acquireRateLimitPermit`, budget cascade
+- [`auth/http.go`](https://github.com/erpc/erpc/blob/main/auth/http.go) — `NewPayloadFromHttp`: credential extraction priority order, additional secret locations, `PathSegmentSecret`
+- [`auth/strategy_database.go:L271-L357`](https://github.com/erpc/erpc/blob/main/auth/strategy_database.go#L271-L357) — connector-down circuit-breaker, probe election, fail-open
+- [`auth/strategy_jwt.go:L100-L116`](https://github.com/erpc/erpc/blob/main/auth/strategy_jwt.go#L100-L116) — JWT key selection (kid lookup + type-compatibility scan)
+- [`auth/strategy_siwe.go:L22-L67`](https://github.com/erpc/erpc/blob/main/auth/strategy_siwe.go#L22-L67) — SIWE signature verification + domain allowlist
+- [`auth/strategy_forwarded_client_id.go`](https://github.com/erpc/erpc/blob/main/auth/strategy_forwarded_client_id.go) — ForwardedClientIdStrategy: header lookup, proxy pinning, id validation, `allowedIds`
+- [`auth/strategy_network.go:L47-L93`](https://github.com/erpc/erpc/blob/main/auth/strategy_network.go#L47-L93) — NetworkStrategy: localhost/IP/CIDR checks, `ipAsUser` mode
+- [`common/config.go:L2433-L2534`](https://github.com/erpc/erpc/blob/main/common/config.go#L2433-L2534) — all auth config type declarations
+- [`common/defaults.go:L2611-L2761`](https://github.com/erpc/erpc/blob/main/common/defaults.go#L2611-L2761) — SetDefaults for all auth types
+- [`auth/strategy_database_test.go`](https://github.com/erpc/erpc/blob/main/auth/strategy_database_test.go) — circuit-breaker, probe election, fail-open, `classifyDbError` label tests
+
+### Related pages
+
+- [Rate limiters](/config/rate-limiters) — define the budgets that auth strategies assign to each identity.
+- [Projects](/config/projects) — auth lives at `projects[*].auth`; project-level config context.
+- [Use cases: Multi-tenant RPC](/use-cases/multi-tenant-rpc) — end-to-end example combining auth + rate limiters.
+
+</AISection>

@@ -1,0 +1,2030 @@
+package common
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"unsafe"
+
+	"github.com/bytedance/sonic"
+	"github.com/bytedance/sonic/ast"
+	"github.com/erpc/erpc/util"
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+)
+
+var defaultCanonicalHashPlaceholder = interface{}(0) // placeholder for canonical hash
+
+type JsonRpcResponse struct {
+	// ID is mainly set based on incoming request.
+	// During parsing of response from upstream we'll still parse it
+	// so that batch requests are correctly identified.
+	// The "id" field is already parsed-value used within erpc,
+	// and idBytes is a lazy-loaded byte representation of the ID used when writing responses.
+	id      interface{}
+	idBytes []byte
+	idMu    sync.RWMutex
+
+	// Error is the parsed error from the response bytes, and potentially normalized based on vendor-specific drivers.
+	// errBytes is a lazy-loaded byte representation of the Error used when writing responses.
+	// When upstream response is received we're going to set the errBytes to incoming bytes and parse the error.
+	// Internal components (any error not initiated by upstream) will set the Error field directly and then we'll
+	// lazy-load the errBytes for writing responses by marshalling the Error field.
+	Error    *ErrJsonRpcExceptionExternal
+	errBytes []byte
+	errMu    sync.RWMutex
+
+	// result is the raw bytes of the result from the response, and is used when writing responses.
+	// Ideally we don't need to parse these bytes. In cases where we need a specific field (e.g. blockNumber)
+	// we use Sonic library to traverse directly to target such field (vs marshalling the whole result in memory).
+	result       []byte
+	resultWriter util.ByteWriter
+	resultMu     sync.RWMutex
+	cachedNode   *ast.Node
+
+	// canonicalHashWithIgnored caches hashes computed with ignored fields
+	// Key is the pointer to the first element of the ignoreFields slice (if non-empty)
+	// This works because consensus policy reuses the same slice for the same ignore patterns
+	canonicalHashWithIgnored sync.Map
+}
+
+func (r *JsonRpcResponse) SetResult(result []byte) {
+	r.resultMu.Lock()
+	defer r.resultMu.Unlock()
+	r.result = result
+}
+
+func (r *JsonRpcResponse) GetResultBytes() []byte {
+	r.resultMu.RLock()
+	defer r.resultMu.RUnlock()
+	return r.result
+}
+
+func (r *JsonRpcResponse) GetResultString() string {
+	return util.B2Str(r.GetResultBytes())
+}
+
+func (r *JsonRpcResponse) ResultLength() int {
+	r.resultMu.RLock()
+	ln := len(r.result)
+	rw := r.resultWriter
+	r.resultMu.RUnlock()
+	if ln > 0 {
+		return ln
+	}
+	if rw != nil {
+		if sz, err := rw.Size(); err == nil {
+			return sz
+		}
+	}
+	return 0
+}
+
+// Free releases heavy, memory-retaining fields so that upstream response buffers
+// can be garbage collected as soon as the response is no longer needed.
+//
+// This method is safe to call after the response has been fully consumed
+// (written to client or converted by callers). It must not be used while
+// there are concurrent readers of this object.
+func (r *JsonRpcResponse) Free() {
+	if r == nil {
+		return
+	}
+
+	// Clear ID bytes
+	r.idMu.Lock()
+	r.idBytes = nil
+	// keep r.id as is for logging if needed; it's tiny
+	r.idMu.Unlock()
+
+	// Clear error bytes
+	r.errMu.Lock()
+	r.errBytes = nil
+	// keep r.Error reference small
+	r.errMu.Unlock()
+
+	r.resultMu.Lock()
+	// Release the resultWriter if it implements ReleasableByteWriter
+	if r.resultWriter != nil {
+		if releasable, ok := r.resultWriter.(util.ReleasableByteWriter); ok {
+			releasable.Release()
+		}
+	}
+	r.resultWriter = nil
+	r.cachedNode = nil
+	r.result = nil
+	r.resultMu.Unlock()
+
+	// Clear canonical hash caches
+	r.canonicalHashWithIgnored.Range(func(key, _ any) bool {
+		r.canonicalHashWithIgnored.Delete(key)
+		return true
+	})
+}
+
+func NewJsonRpcResponse(id interface{}, result interface{}, rpcError *ErrJsonRpcExceptionExternal) (*JsonRpcResponse, error) {
+	resultRaw, err := SonicCfg.Marshal(result)
+	if err != nil {
+		return nil, err
+	}
+	idBytes, err := SonicCfg.Marshal(id)
+	if err != nil {
+		return nil, err
+	}
+	return &JsonRpcResponse{
+		id:      id,
+		idBytes: idBytes,
+		result:  resultRaw,
+		Error:   rpcError,
+	}, nil
+}
+
+func MustNewJsonRpcResponse(id interface{}, result interface{}, rpcError *ErrJsonRpcExceptionExternal) *JsonRpcResponse {
+	jr, err := NewJsonRpcResponse(id, result, rpcError)
+	if err != nil {
+		panic(err)
+	}
+	return jr
+}
+
+func NewJsonRpcResponseFromBytes(id []byte, resultRaw []byte, errBytes []byte) (*JsonRpcResponse, error) {
+	jr := &JsonRpcResponse{
+		idBytes: id,
+		result:  resultRaw,
+	}
+
+	if len(errBytes) > 0 {
+		// Copy to avoid retaining buffer via unsafe conversion
+		err := jr.ParseError(string(errBytes))
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if len(id) > 0 {
+		err := jr.parseID()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return jr, nil
+}
+
+func MustNewJsonRpcResponseFromBytes(id []byte, resultRaw []byte, errBytes []byte) *JsonRpcResponse {
+	jr, err := NewJsonRpcResponseFromBytes(id, resultRaw, errBytes)
+	if err != nil {
+		panic(err)
+	}
+	return jr
+}
+
+// parseID populates the typed r.id from r.idBytes WITHOUT modifying
+// r.idBytes. The wire output uses idBytes verbatim, so leaving it untouched
+// preserves byte-level fidelity for ids outside the int53 safe range and
+// for non-canonical numeric formats (e.g. "1.0"). Acquires r.idMu.
+func (r *JsonRpcResponse) parseID() error {
+	r.idMu.Lock()
+	defer r.idMu.Unlock()
+	return r.parseIDLocked()
+}
+
+// parseIDLocked is the lock-free variant for callers that already hold
+// r.idMu (e.g. SetIDBytes).
+func (r *JsonRpcResponse) parseIDLocked() error {
+	var rawID interface{}
+	if err := SonicCfg.Unmarshal(r.idBytes, &rawID); err != nil {
+		return err
+	}
+	switch v := rawID.(type) {
+	case float64:
+		r.id = int64(v)
+		return nil
+	case string:
+		r.id = v
+		return nil
+	case nil:
+		return nil
+	default:
+		return fmt.Errorf("unsupported ID type: %T", v)
+	}
+}
+
+func (r *JsonRpcResponse) SetID(id interface{}) error {
+	r.idMu.Lock()
+	defer r.idMu.Unlock()
+
+	r.id = id
+	var err error
+	r.idBytes, err = SonicCfg.Marshal(id)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (r *JsonRpcResponse) ID() interface{} {
+	r.idMu.RLock()
+
+	if r.id != nil {
+		r.idMu.RUnlock()
+		return r.id
+	}
+	r.idMu.RUnlock()
+
+	r.idMu.Lock()
+	defer r.idMu.Unlock()
+
+	if len(r.idBytes) == 0 {
+		return nil
+	}
+
+	err := SonicCfg.Unmarshal(r.idBytes, &r.id)
+	if err != nil {
+		log.Error().Err(err).Bytes("idBytes", r.idBytes).Msg("failed to unmarshal JsonRpcResponse.ID")
+	}
+
+	return r.id
+}
+
+// SetIDBytes stores the response id from raw JSON bytes verbatim. The wire
+// output (WriteTo) uses idBytes directly, so this preserves byte-for-byte
+// fidelity for large integers (>2^53), fractional ids, and any exotic
+// numeric format the upstream/client used. The parsed r.id is populated as
+// a best-effort typed view for callers that read it; precision loss there
+// is acceptable because the wire output never round-trips through r.id.
+func (r *JsonRpcResponse) SetIDBytes(idBytes []byte) error {
+	r.idMu.Lock()
+	defer r.idMu.Unlock()
+
+	r.idBytes = idBytes
+	return r.parseIDLocked()
+}
+
+// largeResultZeroCopyThreshold mirrors util.ReturnBuf's pool-discard cutoff
+// (4 * util.maxBufCap = 256 KiB). Above this threshold the read buffer is
+// going to be discarded by ReturnBuf anyway, so keeping a zero-copy slice into
+// it doesn't change pool behaviour — it just shifts WHEN the underlying byte
+// array is GC'd (after the JsonRpcResponse becomes unreachable).
+//
+// Below this threshold we copy the result bytes out and return the buffer to
+// the pool immediately; reuse of small buffers is the throughput win that
+// sync.Pool exists for.
+const largeResultZeroCopyThreshold = 4 * 64 * 1024
+
+func (r *JsonRpcResponse) ParseFromStream(ctx []context.Context, reader io.Reader, expectedSize int) error {
+	if len(ctx) > 0 {
+		_, span := StartDetailSpan(ctx[0], "JsonRpcResponse.ParseFromStream")
+		defer span.End()
+	}
+
+	data, returnBuf, err := util.ReadAll(reader, expectedSize)
+	if err != nil {
+		return err
+	}
+
+	// Use sonic.NoCopyRawMessage instead of std json.RawMessage so the
+	// unmarshaler skips the std-lib `*m = append((*m)[0:0], data...)` copy
+	// and just stores a slice into `data` (= buf.Bytes()). We then choose
+	// per-field whether to copy out so the buffer can be released, or hold
+	// the slice and keep the buffer alive (large-result fast path).
+	//
+	// ID and Error stay copy-on-parse because they're small (typically
+	// <100 bytes) — the copy is essentially free, and stashing them as
+	// slices into the buffer would prevent the pool reuse for every
+	// response, large or small.
+	var temp struct {
+		ID     json.RawMessage        `json:"id"`
+		Result sonic.NoCopyRawMessage `json:"result"`
+		Error  json.RawMessage        `json:"error"`
+	}
+
+	// Whether to release the buffer back to sync.Pool when this function
+	// returns. We default to true and flip it off only when we keep a
+	// zero-copy slice into the buffer for the result. The buffer struct
+	// itself is small; the underlying byte array stays alive via r.result
+	// until the response is GC'd / Free()'d.
+	keepBuffer := false
+	defer func() {
+		if returnBuf != nil && !keepBuffer {
+			returnBuf()
+		}
+	}()
+
+	// Use Sonic's Unmarshal which works directly with bytes
+	if err := SonicCfg.Unmarshal(data, &temp); err != nil {
+		// Parse error: copy data before stashing it for diagnostics so the
+		// buffer can return to the pool. Exceptional path, not hot.
+		dataCopy := make([]byte, len(data))
+		copy(dataCopy, data)
+		r.resultMu.Lock()
+		r.result = dataCopy
+		r.resultMu.Unlock()
+		return err
+	}
+
+	if len(temp.ID) > 0 {
+		idCopy := make([]byte, len(temp.ID))
+		copy(idCopy, temp.ID)
+		r.idMu.Lock()
+		r.idBytes = idCopy
+		r.idMu.Unlock()
+	}
+
+	if len(temp.Result) > 0 {
+		if len(temp.Result) > largeResultZeroCopyThreshold {
+			// Large result: zero-copy. r.result becomes a slice into the
+			// buffer's backing array. We MUST NOT return the buffer to the
+			// pool because a future BorrowBuf caller would Reset() and
+			// overwrite our bytes — silent data corruption (the lifetime
+			// mismatch the original 2× copy was guarding against).
+			//
+			// Above the threshold ReturnBuf() would have discarded the
+			// buffer anyway (cap > 256 KiB), so this is purely deferring
+			// when the underlying byte array gets GC'd.
+			r.resultMu.Lock()
+			r.result = []byte(temp.Result)
+			r.resultMu.Unlock()
+			keepBuffer = true
+		} else {
+			// Small result: copy so the buffer can return to the pool now.
+			// Single fresh allocation — vs the previous code's two copies
+			// (one inside std-lib RawMessage.UnmarshalJSON, one explicit
+			// resultCopy). NoCopyRawMessage on `temp.Result` skipped the
+			// first; the explicit copy here is the only one that runs.
+			resultCopy := make([]byte, len(temp.Result))
+			copy(resultCopy, temp.Result)
+			r.resultMu.Lock()
+			r.result = resultCopy
+			r.resultMu.Unlock()
+		}
+	}
+
+	// JSON-RPC 1.0-style servers (e.g. Bitcoin Core and its forks) always emit
+	// the "error" member and set it to null on success. A null error is the
+	// absence of an error, not an error.
+	if len(temp.Error) > 0 && string(temp.Error) != "null" {
+		if err := r.ParseError(string(temp.Error)); err != nil {
+			return err
+		}
+	}
+
+	// Parse ID if needed
+	if len(r.idBytes) > 0 {
+		if err := r.parseID(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (r *JsonRpcResponse) SetResultWriter(w util.ByteWriter) {
+	r.resultMu.Lock()
+	defer r.resultMu.Unlock()
+	r.resultWriter = w
+}
+
+func (r *JsonRpcResponse) ParseError(raw string) error {
+	r.errMu.Lock()
+	defer r.errMu.Unlock()
+
+	r.errBytes = nil
+
+	// `"error": null` means success (JSON-RPC 1.0-style servers always emit the
+	// member). Without this, the fallback below would turn the literal "null"
+	// into a server-side exception and fail an otherwise successful call.
+	if raw == "null" {
+		r.Error = nil
+		return nil
+	}
+
+	// First attempt to unmarshal the error as a typical JSON-RPC error
+	var rpcErr ErrJsonRpcExceptionExternal
+	if err := SonicCfg.UnmarshalFromString(raw, &rpcErr); err != nil {
+		// Special case: check for non-standard error structures in the raw data
+		if raw == "" {
+			r.Error = NewErrJsonRpcExceptionExternal(
+				int(JsonRpcErrorServerSideException),
+				"unexpected empty response from upstream endpoint",
+				"",
+			)
+			return nil
+		}
+	}
+
+	// Check if the error is well-formed and has necessary fields
+	if rpcErr.Code != 0 || rpcErr.Message != "" {
+		r.Error = &rpcErr
+		r.errBytes = []byte(raw)
+		return nil
+	}
+
+	// Handle further special cases
+	// Special case #1: numeric "code", "message", and "data"
+	sp1 := &struct {
+		Code    int    `json:"code,omitempty"`
+		Message string `json:"message,omitempty"`
+		Data    string `json:"data,omitempty"`
+	}{}
+	if err := SonicCfg.UnmarshalFromString(raw, sp1); err == nil {
+		if sp1.Code != 0 || sp1.Message != "" || sp1.Data != "" {
+			r.Error = NewErrJsonRpcExceptionExternal(
+				sp1.Code,
+				sp1.Message,
+				sp1.Data,
+			)
+			return nil
+		}
+	}
+
+	// Special case #2: only "error" field as a string
+	sp2 := &struct {
+		Error string `json:"error"`
+	}{}
+	if err := SonicCfg.UnmarshalFromString(raw, sp2); err == nil && sp2.Error != "" {
+		r.Error = NewErrJsonRpcExceptionExternal(
+			int(JsonRpcErrorServerSideException),
+			sp2.Error,
+			"",
+		)
+		return nil
+	}
+
+	// If no match, treat the raw data as message string
+	r.Error = NewErrJsonRpcExceptionExternal(
+		int(JsonRpcErrorServerSideException),
+		raw,
+		"",
+	)
+	return nil
+}
+
+func (r *JsonRpcResponse) PeekStringByPath(ctx context.Context, path ...interface{}) (string, error) {
+	_, span := StartDetailSpan(ctx, "JsonRpcResponse.PeekStringByPath")
+	defer span.End()
+
+	err := r.ensureCachedNode()
+	if err != nil {
+		return "", err
+	}
+
+	r.resultMu.Lock()
+	defer r.resultMu.Unlock()
+	n := r.cachedNode.GetByPath(path...)
+	if n == nil {
+		return "", fmt.Errorf("could not get '%s' from json-rpc response", path)
+	}
+	if n.Error() != "" {
+		return "", fmt.Errorf("error getting '%s' from json-rpc response: %s", path, n.Error())
+	}
+
+	return n.String()
+}
+
+func (r *JsonRpcResponse) PeekBytesByPath(ctx context.Context, path ...interface{}) ([]byte, error) {
+	_, span := StartDetailSpan(ctx, "JsonRpcResponse.PeekBytesByPath")
+	defer span.End()
+
+	err := r.ensureCachedNode()
+	if err != nil {
+		return nil, err
+	}
+
+	r.resultMu.Lock()
+	defer r.resultMu.Unlock()
+	n := r.cachedNode.GetByPath(path...)
+	if n == nil {
+		return nil, fmt.Errorf("could not get '%s' from json-rpc response", path)
+	}
+	if n.Error() != "" {
+		return nil, fmt.Errorf("error getting '%s' from json-rpc response: %s", path, n.Error())
+	}
+
+	// Use Raw() method to get zero-copy access to the underlying JSON bytes
+	rawStr, err := n.Raw()
+	if err != nil {
+		return nil, fmt.Errorf("error getting raw JSON from node: %s", err)
+	}
+	return []byte(rawStr), nil
+}
+
+func (r *JsonRpcResponse) Size(ctx ...context.Context) (int, error) {
+	if r == nil {
+		return 0, nil
+	}
+
+	r.resultMu.RLock()
+	rl := len(r.result)
+	hasResult := rl > 0
+	rw := r.resultWriter
+	r.resultMu.RUnlock()
+	if hasResult {
+		return rl, nil
+	}
+
+	if rw != nil {
+		return rw.Size(ctx...)
+	}
+	return 0, nil
+}
+
+func (r *JsonRpcResponse) MarshalZerologObject(e *zerolog.Event) {
+	if r == nil {
+		return
+	}
+
+	r.errMu.RLock()
+	defer r.errMu.RUnlock()
+	r.resultMu.RLock()
+	defer r.resultMu.RUnlock()
+
+	e.Interface("id", r.ID()).Int("resultSize", len(r.result))
+
+	if len(r.errBytes) > 0 {
+		if IsSemiValidJson(r.errBytes) {
+			e.RawJSON("error", r.errBytes)
+		} else {
+			e.Str("error", string(r.errBytes))
+		}
+	} else if r.Error != nil {
+		e.Interface("error", r.Error)
+	}
+
+	if len(r.result) > 0 {
+		if len(r.result) < 300*1024 {
+			if IsSemiValidJson(r.result) {
+				e.RawJSON("result", r.result)
+			} else {
+				e.Str("result", string(r.result))
+			}
+		} else {
+			head := 150 * 1024
+			tail := len(r.result) - head
+			if tail < head {
+				head = tail
+			}
+			e.Str("resultHead", string(r.result[:head])).Str("resultTail", string(r.result[tail:]))
+		}
+	} else if r.resultWriter != nil {
+		e.Bool("resultWriterEmpty", r.resultWriter.IsResultEmptyish())
+	}
+}
+
+func (r *JsonRpcResponse) ensureCachedNode() error {
+	r.resultMu.RLock()
+	needBuild := r.cachedNode == nil
+	emptyResult := len(r.result) == 0
+	rw := r.resultWriter
+	r.resultMu.RUnlock()
+	if needBuild && emptyResult && rw != nil {
+		// Materialize from writer for AST-based reads
+		r.resultMu.Lock()
+		if len(r.result) == 0 && r.resultWriter != nil {
+			var buf bytes.Buffer
+			if _, err := r.resultWriter.WriteTo(&buf, false); err != nil {
+				r.resultMu.Unlock()
+				return err
+			}
+			r.result = buf.Bytes()
+			// Drop writer after materialization
+			r.resultWriter = nil
+		}
+		r.resultMu.Unlock()
+	}
+
+	r.resultMu.RLock()
+	if r.cachedNode == nil {
+		srchr := ast.NewSearcher(util.B2Str(r.result))
+		srchr.ValidateJSON = false
+		srchr.ConcurrentRead = false
+		srchr.CopyReturn = false
+		n, err := srchr.GetByPath()
+		if err != nil {
+			r.resultMu.RUnlock()
+			return err
+		}
+		r.resultMu.RUnlock()
+		r.resultMu.Lock()
+		// Copy 'n' onto the heap to avoid taking the address of a stack variable.
+		// This prevents 'r.cachedNode' from pointing to memory that becomes invalid
+		// once the function returns.
+		r.cachedNode = new(ast.Node)
+		*r.cachedNode = n
+		r.resultMu.Unlock()
+		return nil
+	}
+
+	r.resultMu.RUnlock()
+	return nil
+}
+
+// MarshalJSON must not be used as it requires marshalling the whole response into a buffer in memory.
+func (r *JsonRpcResponse) MarshalJSON() ([]byte, error) {
+	return nil, fmt.Errorf("MarshalJSON must not be used on JsonRpcResponse")
+}
+
+// WriteTo implements io.WriterTo interface for JsonRpcResponse and is a custom implementation of marshalling json-rpc response,
+// this approach uses minimum memory allocations and is faster than a generic JSON marshaller.
+func (r *JsonRpcResponse) WriteTo(w io.Writer) (n int64, err error) {
+	r.idMu.RLock()
+	defer r.idMu.RUnlock()
+	r.errMu.RLock()
+	defer r.errMu.RUnlock()
+	r.resultMu.RLock()
+	defer r.resultMu.RUnlock()
+
+	// Write the response opening
+	nn, err := w.Write([]byte(`{"jsonrpc":"2.0","id":`))
+	if err != nil {
+		return int64(nn), err
+	}
+	n += int64(nn)
+
+	// Write ID
+	nn, err = w.Write(r.idBytes)
+	if err != nil {
+		return n + int64(nn), err
+	}
+	n += int64(nn)
+
+	if len(r.errBytes) > 0 {
+		// Write error field
+		nn, err = w.Write([]byte(`,"error":`))
+		if err != nil {
+			return n + int64(nn), err
+		}
+		n += int64(nn)
+
+		nn, err = w.Write(r.errBytes)
+		if err != nil {
+			return n + int64(nn), err
+		}
+		n += int64(nn)
+	} else if r.Error != nil {
+		// Marshal error on demand if errBytes not set
+		r.errBytes, err = SonicCfg.Marshal(r.Error)
+		if err != nil {
+			return n, err
+		}
+
+		nn, err = w.Write([]byte(`,"error":`))
+		if err != nil {
+			return n + int64(nn), err
+		}
+		n += int64(nn)
+
+		nn, err = w.Write(r.errBytes)
+		if err != nil {
+			return n + int64(nn), err
+		}
+		n += int64(nn)
+	}
+
+	if len(r.result) > 0 {
+		// Write result field
+		nn, err = w.Write([]byte(`,"result":`))
+		if err != nil {
+			return n + int64(nn), err
+		}
+		n += int64(nn)
+
+		nn, err = w.Write(r.result)
+		if err != nil {
+			return n + int64(nn), err
+		}
+		n += int64(nn)
+	} else if r.resultWriter != nil {
+		// Write result field
+		nn, err = w.Write([]byte(`,"result":`))
+		if err != nil {
+			return n + int64(nn), err
+		}
+		n += int64(nn)
+
+		nw, err := r.resultWriter.WriteTo(w, false)
+		if err != nil {
+			return n + nw, err
+		}
+		n += nw
+	}
+
+	// Write closing brace
+	nn, err = w.Write([]byte{'}'})
+	return n + int64(nn), err
+}
+
+func (r *JsonRpcResponse) WriteResultTo(w io.Writer, trimSides bool) (n int64, err error) {
+	r.resultMu.RLock()
+	defer r.resultMu.RUnlock()
+
+	if len(r.result) > 0 {
+		if trimSides {
+			if len(r.result) <= 2 {
+				return 0, nil
+			}
+			nn, err := w.Write(r.result[1 : len(r.result)-1])
+			return int64(nn), err
+		}
+		nn, err := w.Write(r.result)
+		return int64(nn), err
+	}
+
+	if r.resultWriter == nil {
+		return 0, nil
+	}
+
+	return r.resultWriter.WriteTo(w, trimSides)
+}
+
+func (r *JsonRpcResponse) Clone() (*JsonRpcResponse, error) {
+	if r == nil {
+		return nil, nil
+	}
+
+	r.idMu.RLock()
+	defer r.idMu.RUnlock()
+	r.errMu.RLock()
+	defer r.errMu.RUnlock()
+	r.resultMu.RLock()
+	defer r.resultMu.RUnlock()
+
+	clone := &JsonRpcResponse{
+		id:    r.id,
+		Error: r.Error,
+		// Do NOT copy cachedNode to avoid retaining original upstream buffer via AST.
+		// It will be lazily rebuilt from clone.Result if needed.
+		cachedNode: nil,
+	}
+
+	// Deep copy byte slices to avoid shared references
+	if r.idBytes != nil {
+		clone.idBytes = make([]byte, len(r.idBytes))
+		copy(clone.idBytes, r.idBytes)
+	}
+
+	if r.errBytes != nil {
+		clone.errBytes = make([]byte, len(r.errBytes))
+		copy(clone.errBytes, r.errBytes)
+	}
+
+	if r.result != nil {
+		clone.result = make([]byte, len(r.result))
+		copy(clone.result, r.result)
+	} else if r.resultWriter != nil {
+		// If we have a resultWriter but no materialized result,
+		// materialize it now to avoid sharing the writer instance
+		// which could lead to data races or premature cleanup
+		var buf bytes.Buffer
+		_, err := r.resultWriter.WriteTo(&buf, false)
+		if err != nil {
+			return nil, err
+		}
+		clone.result = buf.Bytes()
+		// Don't copy the resultWriter since we've materialized the result
+		clone.resultWriter = nil
+	}
+
+	// Copy the canonical hash if it exists
+	if cached, ok := r.canonicalHashWithIgnored.Load(defaultCanonicalHashPlaceholder); ok {
+		clone.canonicalHashWithIgnored.Store(defaultCanonicalHashPlaceholder, cached)
+	}
+
+	return clone, nil
+}
+
+func (r *JsonRpcResponse) IsResultEmptyish(ctx ...context.Context) bool {
+	var span trace.Span
+	if len(ctx) > 0 {
+		_, span = StartDetailSpan(ctx[0], "JsonRpcResponse.IsResultEmptyish")
+		defer span.End()
+	}
+
+	if r == nil {
+		if span != nil {
+			span.SetAttributes(attribute.Bool("resultEmptyish", true))
+		}
+		return true
+	}
+
+	r.resultMu.RLock()
+	defer r.resultMu.RUnlock()
+
+	if len(r.result) > 0 {
+		e := util.IsBytesEmptyish(r.result)
+		if span != nil {
+			span.SetAttributes(attribute.Bool("resultEmptyish", e))
+		}
+		return e
+	}
+
+	if r.resultWriter != nil {
+		e := r.resultWriter.IsResultEmptyish()
+		if span != nil {
+			span.SetAttributes(attribute.Bool("resultEmptyish", e))
+		}
+		return e
+	}
+
+	if span != nil {
+		span.SetAttributes(attribute.Bool("resultEmptyish", true))
+	}
+	return true
+}
+
+func (r *JsonRpcResponse) CanonicalHash(ctx ...context.Context) (string, error) {
+	if r == nil {
+		return "", nil
+	}
+
+	// Fast-path: if already computed, return immediately
+	if cached, ok := r.canonicalHashWithIgnored.Load(defaultCanonicalHashPlaceholder); ok {
+		return cached.(string), nil
+	}
+
+	// Compute hash
+	r.resultMu.RLock()
+	resultCopy := r.result
+	r.resultMu.RUnlock()
+
+	var obj interface{}
+	if err := SonicCfg.Unmarshal(resultCopy, &obj); err != nil {
+		return "", err
+	}
+
+	h := sha256.New()
+	_, err := canonicalizeTo(h, obj)
+	if err != nil {
+		return "", err
+	}
+	hash := hex.EncodeToString(h.Sum(nil))
+
+	// Store the computed hash atomically
+	r.canonicalHashWithIgnored.Store(defaultCanonicalHashPlaceholder, hash)
+
+	return hash, nil
+}
+
+// CanonicalHashWithIgnoredFields calculates the canonical hash while ignoring specified field paths
+func (r *JsonRpcResponse) CanonicalHashWithIgnoredFields(ignoreFields []string, ctx ...context.Context) (string, error) {
+	if r == nil {
+		return "", nil
+	}
+
+	// If no fields to ignore, use regular canonical hash
+	if len(ignoreFields) == 0 {
+		return r.CanonicalHash(ctx...)
+	}
+
+	// Use the slice's underlying array pointer as cache key
+	// This is safe because consensus policy reuses the same slice for the same ignore patterns
+	var cacheKey unsafe.Pointer
+	if len(ignoreFields) > 0 {
+		cacheKey = unsafe.Pointer(&ignoreFields[0]) // #nosec G103
+	}
+
+	// Check cache first
+	if cached, ok := r.canonicalHashWithIgnored.Load(cacheKey); ok {
+		return cached.(string), nil
+	}
+
+	// Compute hash with ignored fields
+	r.resultMu.RLock()
+	resultCopy := r.result
+	r.resultMu.RUnlock()
+
+	var obj interface{}
+	if err := SonicCfg.Unmarshal(resultCopy, &obj); err != nil {
+		return "", err
+	}
+
+	// Remove ignored fields before canonicalization
+	obj = removeFieldsByPaths(obj, ignoreFields)
+
+	h := sha256.New()
+	_, err := canonicalizeTo(h, obj)
+	if err != nil {
+		return "", err
+	}
+	hash := hex.EncodeToString(h.Sum(nil))
+
+	// Store in cache
+	r.canonicalHashWithIgnored.Store(cacheKey, hash)
+
+	return hash, nil
+}
+
+// canonicalizeTo writes the canonical JSON representation of v into w, applying
+// the same emptyish filtering semantics as canonicalize(). It returns true if
+// any bytes were written.
+func canonicalizeTo(w io.Writer, v interface{}) (bool, error) {
+	if isEmptyishValue(v) {
+		return false, nil
+	}
+
+	switch val := v.(type) {
+	case map[string]interface{}:
+		// Filter empties and precompute children
+		keys := make([]string, 0, len(val))
+		children := make(map[string]*bytes.Buffer, len(val))
+		for k, vv := range val {
+			if isEmptyishValue(vv) {
+				continue
+			}
+			buf := util.BorrowBuf()
+			wrote, err := canonicalizeTo(buf, vv)
+			if err != nil {
+				util.ReturnBuf(buf)
+				return false, err
+			}
+			if wrote {
+				children[k] = buf
+				keys = append(keys, k)
+			} else {
+				util.ReturnBuf(buf)
+			}
+		}
+		if len(keys) == 0 {
+			return false, nil
+		}
+		sort.Strings(keys)
+		// Ensure all borrowed child buffers are returned to the pool even if any write below errors.
+		defer func() {
+			for _, cb := range children {
+				if cb != nil {
+					util.ReturnBuf(cb)
+				}
+			}
+		}()
+		if _, err := w.Write([]byte{'{'}); err != nil {
+			return false, err
+		}
+		for i, k := range keys {
+			if i > 0 {
+				if _, err := w.Write([]byte{','}); err != nil {
+					return false, err
+				}
+			}
+			kj, _ := SonicCfg.Marshal(k)
+			if _, err := w.Write(kj); err != nil {
+				return false, err
+			}
+			if _, err := w.Write([]byte{':'}); err != nil {
+				return false, err
+			}
+			if _, err := w.Write(children[k].Bytes()); err != nil {
+				return false, err
+			}
+			// Return immediately and mark as nil so deferred cleanup skips it
+			util.ReturnBuf(children[k])
+			children[k] = nil
+		}
+		_, err := w.Write([]byte{'}'})
+		return true, err
+
+	case []interface{}:
+		// Filter empties and stream elements
+		if _, err := w.Write([]byte{'['}); err != nil {
+			return false, err
+		}
+		first := true
+		any := false
+		for _, item := range val {
+			if isEmptyishValue(item) {
+				continue
+			}
+			buf := util.BorrowBuf()
+			wrote, err := canonicalizeTo(buf, item)
+			if err != nil {
+				util.ReturnBuf(buf)
+				return false, err
+			}
+			if !wrote {
+				util.ReturnBuf(buf)
+				continue
+			}
+			if !first {
+				if _, err := w.Write([]byte{','}); err != nil {
+					util.ReturnBuf(buf)
+					return false, err
+				}
+			}
+			first = false
+			any = true
+			if _, err := w.Write(buf.Bytes()); err != nil {
+				util.ReturnBuf(buf)
+				return false, err
+			}
+			util.ReturnBuf(buf)
+		}
+		if _, err := w.Write([]byte{']'}); err != nil {
+			return false, err
+		}
+		if !any {
+			return false, nil
+		}
+		return true, nil
+
+	case string:
+		b := removeLeadingZeroes(util.S2Bytes(val))
+		if len(b) == 0 {
+			return false, nil
+		}
+		_, err := w.Write(b)
+		return true, err
+
+	case []byte:
+		b := removeLeadingZeroes(val)
+		if len(b) == 0 {
+			return false, nil
+		}
+		_, err := w.Write(b)
+		return true, err
+
+	default:
+		b, err := SonicCfg.Marshal(val)
+		if err != nil {
+			return false, err
+		}
+		if util.IsBytesEmptyish(b) {
+			return false, nil
+		}
+		b = removeLeadingZeroes(b)
+		_, err = w.Write(b)
+		return true, err
+	}
+}
+
+// removeFieldsByPaths removes fields from an object based on dot-separated paths
+// Supports:
+// - Simple fields: "status"
+// - Nested fields: "receipt.status"
+// - Array wildcards: "logs.*.blockTimestamp"
+func removeFieldsByPaths(obj interface{}, paths []string) interface{} {
+	if obj == nil || len(paths) == 0 {
+		return obj
+	}
+
+	// Parse paths into a tree structure for efficient removal
+	pathTree := make(map[string]interface{})
+	for _, path := range paths {
+		parts := strings.Split(path, ".")
+		current := pathTree
+		for i, part := range parts {
+			if i == len(parts)-1 {
+				current[part] = true // Leaf node
+			} else {
+				if _, exists := current[part]; !exists {
+					current[part] = make(map[string]interface{})
+				}
+				if next, ok := current[part].(map[string]interface{}); ok {
+					current = next
+				}
+			}
+		}
+	}
+
+	return removeFieldsRecursive(obj, pathTree)
+}
+
+// removeFieldsRecursive recursively removes fields based on the path tree
+func removeFieldsRecursive(obj interface{}, pathTree map[string]interface{}) interface{} {
+	switch v := obj.(type) {
+	case map[string]interface{}:
+		result := make(map[string]interface{})
+		for key, value := range v {
+			// Check if this key should be removed or has nested removals
+			if pathNode, exists := pathTree[key]; exists {
+				if pathNode == true {
+					// This field should be removed entirely
+					continue
+				} else if nestedTree, ok := pathNode.(map[string]interface{}); ok {
+					// Apply nested removals
+					result[key] = removeFieldsRecursive(value, nestedTree)
+				}
+			} else if wildcardTree, exists := pathTree["*"]; exists {
+				// Handle wildcard for arrays
+				if nestedTree, ok := wildcardTree.(map[string]interface{}); ok {
+					result[key] = removeFieldsRecursive(value, nestedTree)
+				}
+			} else {
+				// Keep the field as-is
+				result[key] = value
+			}
+		}
+		return result
+
+	case []interface{}:
+		// Handle array wildcards
+		if wildcardTree, exists := pathTree["*"]; exists {
+			if nestedTree, ok := wildcardTree.(map[string]interface{}); ok {
+				result := make([]interface{}, len(v))
+				for i, item := range v {
+					result[i] = removeFieldsRecursive(item, nestedTree)
+				}
+				return result
+			}
+		}
+		return v
+
+	default:
+		// Primitive types or other types are returned as-is
+		return v
+	}
+}
+
+func removeLeadingZeroes(b []byte) []byte {
+	if len(b) > 2 && b[0] == '0' && (b[1] == 'x' || b[1] == 'X') {
+		b = bytes.TrimLeft(b[2:], "0")
+	} else if len(b) > 3 && b[0] == '"' && b[1] == '0' && b[2] == 'x' && b[3] == '0' {
+		b = bytes.TrimLeft(b[3:], "0")
+		if len(b) == 1 {
+			return nil
+		}
+	}
+	return b
+}
+
+// isEmptyishValue checks if a value should be considered empty for canonicalization
+func isEmptyishValue(v interface{}) bool {
+	if v == nil {
+		return true
+	}
+
+	switch val := v.(type) {
+	case string:
+		// Empty string
+		if val == "" {
+			return true
+		}
+		// Check for hex values that are all zeros (0x, 0x0, 0x00, 0x000, etc.)
+		if strings.HasPrefix(val, "0x") {
+			// Remove the 0x prefix and check if the rest is all zeros
+			hexPart := val[2:]
+			if hexPart == "" {
+				return true // "0x" is empty
+			}
+			// Check if all remaining characters are zeros
+			for _, c := range hexPart {
+				if c != '0' {
+					return false
+				}
+			}
+			return true // All zeros after 0x
+		}
+		return false
+	case []interface{}:
+		// Empty arrays are considered empty
+		return len(val) == 0
+	case map[string]interface{}:
+		// Empty objects are considered empty
+		return len(val) == 0
+	case float64:
+		return val == 0
+	case bool:
+		// Booleans are never emptyish
+		return false
+	default:
+		// For other types, marshal and check
+		b, err := SonicCfg.Marshal(val)
+		if err != nil {
+			return false
+		}
+		return util.IsBytesEmptyish(b)
+	}
+}
+
+//
+//
+// JSON-RPC Request
+//
+
+// jsonRpcRequestOmitEmptyParams is the wire shape of a request whose empty
+// params are left out (see JsonRpcUpstreamConfig.OmitEmptyParams).
+type jsonRpcRequestOmitEmptyParams struct {
+	JSONRPC string        `json:"jsonrpc,omitempty"`
+	ID      interface{}   `json:"id,omitempty"`
+	Method  string        `json:"method"`
+	Params  []interface{} `json:"params,omitempty"`
+}
+
+// WireRequest returns the value to serialize when sending r to an upstream.
+// With omitEmptyParams, empty params are left out instead of sent as
+// "params":[]. The caller must hold r's read lock.
+func (r *JsonRpcRequest) WireRequest(omitEmptyParams bool) interface{} {
+	if omitEmptyParams && len(r.Params) == 0 {
+		return &jsonRpcRequestOmitEmptyParams{JSONRPC: r.JSONRPC, ID: r.ID, Method: r.Method}
+	}
+	return &JsonRpcRequest{JSONRPC: r.JSONRPC, ID: r.ID, Method: r.Method, Params: r.Params}
+}
+
+type JsonRpcRequest struct {
+	sync.RWMutex
+
+	JSONRPC string        `json:"jsonrpc,omitempty"`
+	ID      interface{}   `json:"id,omitempty"`
+	Method  string        `json:"method"`
+	Params  []interface{} `json:"params"`
+
+	// idRaw stores the verbatim bytes of the id as received from the client.
+	// This is used to round-trip the id back without precision loss for ids
+	// outside the int53 safe range (e.g. nanosecond timestamps) or fractional
+	// ids that would otherwise be truncated by the float64→int64 cast in
+	// UnmarshalJSON. Empty when the request was constructed programmatically.
+	idRaw []byte
+
+	// idAbsent records that the request had no "id" member: a notification
+	// (JSON-RPC 2.0 §4.1). "id": null is a request, not a notification.
+	idAbsent bool
+
+	// networkId holds the optional top-level "networkId" member, the body-side
+	// equivalent of the /<architecture>/<chainId> path segments. It is captured
+	// by the envelope parse so routing reads it from the same result as
+	// everything else instead of parsing the body a second time. Never sent
+	// upstream: the outbound body is rebuilt from the four JSON-RPC members.
+	networkId string
+
+	cacheHash atomic.Value
+}
+
+// NetworkIdHint returns the "networkId" member carried in the request body, or
+// an empty string when the body omitted it.
+func (r *JsonRpcRequest) NetworkIdHint() string {
+	if r == nil {
+		return ""
+	}
+	return r.networkId
+}
+
+// uniqueString decodes a JSON string member that a well-formed object states
+// at most once. The decoder calls UnmarshalJSON once per member it binds to
+// this field, so a second call means the object stated the same member twice
+// — including the spellings a plain string field folds together silently: a
+// repeated key, an escaped spelling such as "\u006dethod", and a case variant
+// such as "Method" that Go's case-insensitive field matching maps onto the
+// same field. Decoders disagree about which of the two wins, so erpc reads
+// none of them and reports the object as malformed instead.
+var errNoMethodMember = errors.New(`json-rpc request has no "method" member`)
+
+type uniqueString struct {
+	member string
+	value  string
+	seen   bool
+}
+
+func (s *uniqueString) UnmarshalJSON(data []byte) error {
+	if s.seen {
+		return fmt.Errorf("json-rpc request states the %q member more than once", s.member)
+	}
+	s.seen = true
+	// A method name is an ordinary unescaped JSON string, so copy it straight
+	// out and skip a decoder call. The copy is deliberate: the decoder owns
+	// data and may reuse it. Anything carrying an escape goes through the
+	// decoder to be unescaped properly.
+	if n := len(data); n >= 2 && data[0] == '"' && data[n-1] == '"' &&
+		bytes.IndexByte(data[1:n-1], '\\') < 0 {
+		s.value = string(data[1 : n-1])
+		return nil
+	}
+	return SonicCfg.Unmarshal(data, &s.value)
+}
+
+func NewJsonRpcRequest(method string, params []interface{}) *JsonRpcRequest {
+	return &JsonRpcRequest{
+		JSONRPC: "2.0",
+		Method:  method,
+		Params:  params,
+	}
+}
+
+func (r *JsonRpcRequest) LockWithTrace(ctx context.Context) {
+	_, span := StartDetailSpan(ctx, "JsonRpcRequest.Lock")
+	defer span.End()
+	r.Lock()
+}
+
+func (r *JsonRpcRequest) RLockWithTrace(ctx context.Context) {
+	_, span := StartDetailSpan(ctx, "JsonRpcRequest.RLock")
+	defer span.End()
+	r.RLock()
+}
+
+// IsNotification reports whether the request had no "id" member, making it
+// a JSON-RPC 2.0 notification that must not be answered.
+func (r *JsonRpcRequest) IsNotification() bool {
+	r.RLock()
+	defer r.RUnlock()
+	return r.idAbsent
+}
+
+func (r *JsonRpcRequest) Clone() *JsonRpcRequest {
+	r.RLock()
+	defer r.RUnlock()
+
+	// Deep copy the params to avoid concurrent access issues
+	var clonedParams []interface{}
+	if r.Params != nil {
+		clonedParams = make([]interface{}, len(r.Params))
+		for i, param := range r.Params {
+			clonedParams[i] = deepCopyValue(param)
+		}
+	}
+
+	clone := &JsonRpcRequest{
+		JSONRPC:  r.JSONRPC,
+		ID:       r.ID,
+		Method:   r.Method,
+		Params:   clonedParams,
+		idAbsent: r.idAbsent,
+	}
+	// Carry idRaw forward so the cloned request still round-trips its id
+	// byte-for-byte through normalizeResponse. Without this, the clone falls
+	// back to the lossy typed-id path and re-introduces the precision loss
+	// for ids outside the int53 safe range.
+	if len(r.idRaw) > 0 {
+		clone.idRaw = make([]byte, len(r.idRaw))
+		copy(clone.idRaw, r.idRaw)
+	}
+	return clone
+}
+
+// deepCopyValue creates a deep copy of a value to avoid concurrent access issues
+func deepCopyValue(v interface{}) interface{} {
+	if v == nil {
+		return nil
+	}
+
+	switch val := v.(type) {
+	case map[string]interface{}:
+		// Deep copy map
+		newMap := make(map[string]interface{}, len(val))
+		for k, v := range val {
+			newMap[k] = deepCopyValue(v)
+		}
+		return newMap
+	case []interface{}:
+		// Deep copy slice
+		newSlice := make([]interface{}, len(val))
+		for i, v := range val {
+			newSlice[i] = deepCopyValue(v)
+		}
+		return newSlice
+	default:
+		// Primitive types are safe to copy directly
+		return val
+	}
+}
+
+func (r *JsonRpcRequest) SetID(id interface{}) error {
+	r.Lock()
+	defer r.Unlock()
+
+	r.ID = id
+	// Drop any captured wire bytes — the typed id is now authoritative and
+	// must win over a stale idRaw on the response path.
+	r.idRaw = nil
+	return nil
+}
+
+// IDRawBytes returns a copy of the verbatim id bytes as received over the
+// wire, `null` included, or nil if the request was constructed
+// programmatically (e.g. via NewJsonRpcRequest) or carried no id. Used by the
+// response path to round-trip the id back to the client without precision
+// loss for large integers or fractional ids.
+func (r *JsonRpcRequest) IDRawBytes() []byte {
+	r.RLock()
+	defer r.RUnlock()
+	if len(r.idRaw) == 0 {
+		return nil
+	}
+	out := make([]byte, len(r.idRaw))
+	copy(out, r.idRaw)
+	return out
+}
+
+// ResponseID is the id an error response built outside the upstream path must
+// carry: the client's verbatim id bytes when the wire had them, else the typed
+// id. A `null` id answers `null` only when echoNull is set (Solana, as Agave
+// does); otherwise it answers the random id the request was given for
+// upstreams, which is what EVM clients have always received.
+func (r *JsonRpcRequest) ResponseID(echoNull bool) interface{} {
+	if raw := r.IDRawBytes(); raw != nil && (echoNull || string(raw) != "null") {
+		return json.RawMessage(raw)
+	}
+	r.RLock()
+	defer r.RUnlock()
+	return r.ID
+}
+
+// UnmarshalJSON is the one place a raw request body becomes a JsonRpcRequest.
+// Method resolution, validation, routing, the cache key, and the body sent
+// upstream all read the result of this single parse, so they cannot reach
+// different conclusions about what the request says.
+func (r *JsonRpcRequest) UnmarshalJSON(data []byte) error {
+	type Alias JsonRpcRequest
+	aux := &struct {
+		*Alias
+		ID     json.RawMessage `json:"id,omitempty"`
+		Method uniqueString    `json:"method"`
+		// interface{} rather than string: a non-string value is ignored, as it
+		// always was, instead of failing a request the URL already routed.
+		NetworkID interface{} `json:"networkId,omitempty"`
+	}{
+		Alias:  (*Alias)(r),
+		Method: uniqueString{member: "method"},
+	}
+	aux.JSONRPC = "2.0"
+
+	if err := SonicCfg.Unmarshal(data, &aux); err != nil {
+		// MIP-16 answers eth_query* params that are not an array with
+		// -32602, not a parse error: decode the envelope again with the
+		// params left raw and drop them, so the query parser rejects the
+		// request with the right code.
+		raw := &struct {
+			JSONRPC   string          `json:"jsonrpc,omitempty"`
+			ID        json.RawMessage `json:"id,omitempty"`
+			Method    uniqueString    `json:"method"`
+			Params    json.RawMessage `json:"params"`
+			NetworkID interface{}     `json:"networkId,omitempty"`
+		}{Method: uniqueString{member: "method"}}
+		if SonicCfg.Unmarshal(data, raw) != nil || !strings.HasPrefix(strings.ToLower(raw.Method.value), "eth_query") {
+			return err
+		}
+		if raw.JSONRPC != "" {
+			r.JSONRPC = raw.JSONRPC
+		}
+		r.Params = nil
+		aux.ID, aux.Method, aux.NetworkID = raw.ID, raw.Method, raw.NetworkID
+	}
+
+	// Absent and present-but-empty stay distinct on the wire: an object with
+	// no "method" member has always been reported as unparseable (-32700),
+	// while "" or null reaches Validate's "method is required" (-32602).
+	if !aux.Method.seen {
+		return errNoMethodMember
+	}
+	r.Method = aux.Method.value
+	r.networkId, _ = aux.NetworkID.(string)
+	r.idAbsent = aux.ID == nil
+
+	if aux.ID != nil {
+		var id interface{}
+		if err := SonicCfg.Unmarshal(aux.ID, &id); err != nil {
+			return err
+		}
+		// Preserve the verbatim id bytes, `null` included, so the response
+		// echoes exactly what the client sent. The typed ID below still gets a
+		// random value for a null id, because upstreams need a non-null id.
+		r.idRaw = make([]byte, len(aux.ID))
+		copy(r.idRaw, aux.ID)
+		switch v := id.(type) {
+		case float64:
+			// Sonic decodes every JSON number as float64, which cannot hold
+			// large or fractional ids losslessly. Recover the exact integer
+			// from the verbatim id bytes instead of casting the float: the cast
+			// silently truncates fractional ids (1.5 -> 1) and clamps
+			// out-of-range ids to MaxInt64/MinInt64, collapsing distinct ids
+			// onto the same internal id. idRaw still preserves the original
+			// bytes for the client echo, but this typed ID feeds the upstream
+			// request body and internal identity, so it must not be corrupted.
+			idInt, err := strconv.ParseInt(util.B2Str(bytes.TrimSpace(aux.ID)), 10, 64)
+			if err != nil {
+				return fmt.Errorf("json-rpc request id %s cannot be represented as a 64-bit integer", aux.ID)
+			}
+			r.ID = idInt
+		case string:
+			r.ID = v
+		}
+	}
+
+	if r.ID == nil {
+		r.ID = util.RandomID()
+	} else {
+		switch r.ID.(type) {
+		case string:
+			if r.ID.(string) == "" {
+				r.ID = util.RandomID()
+			}
+		}
+	}
+
+	return nil
+}
+
+func (r *JsonRpcRequest) MarshalZerologObject(e *zerolog.Event) {
+	if r == nil {
+		return
+	}
+
+	r.RLock()
+	defer r.RUnlock()
+
+	e.Str("method", r.Method).
+		Interface("params", r.Params).
+		Interface("id", r.ID)
+}
+
+func (r *JsonRpcRequest) CacheHash(ctx ...context.Context) (string, error) {
+	if len(ctx) > 0 {
+		_, span := StartDetailSpan(ctx[0], "Request.GenerateCacheHash")
+		defer span.End()
+	}
+	if r == nil {
+		return "", nil
+	}
+
+	if ch := r.cacheHash.Load(); ch != nil {
+		// Empty string is the "invalidated" sentinel written by
+		// InvalidateCacheHash — fall through to recompute in that case.
+		if s := ch.(string); s != "" {
+			return s, nil
+		}
+	}
+
+	// Encode into a single pooled buffer, then hash once. Streaming each token
+	// straight into an io.Writer forces the small length/tag scratch to escape
+	// to the heap on every token; a concrete *bytes.Buffer lets the digits be
+	// written byte-by-byte with no per-token allocation. This mirrors the
+	// pooled-buffer pattern canonicalizeTo already uses for responses.
+	buf := util.BorrowBuf()
+	defer util.ReturnBuf(buf)
+	for _, p := range r.Params {
+		if err := hashValue(buf, p); err != nil {
+			return "", err
+		}
+	}
+	b := sha256.Sum256(buf.Bytes())
+	ch := fmt.Sprintf("%s:%x", r.Method, b)
+	r.cacheHash.Store(ch)
+	return ch, nil
+}
+
+// InvalidateCacheHash discards any memoized CacheHash value so the next
+// CacheHash call recomputes against the current Params. Call this after any
+// in-place mutation of Params (e.g. pre-forward hooks that inject defaults).
+// Safe to call with no prior CacheHash invocation.
+func (r *JsonRpcRequest) InvalidateCacheHash() {
+	if r == nil {
+		return
+	}
+	r.cacheHash.Store("")
+}
+
+func (r *JsonRpcRequest) PeekByPath(path ...interface{}) (interface{}, error) {
+	if r == nil || len(r.Params) == 0 {
+		return nil, fmt.Errorf("cannot peek path on empty params")
+	}
+
+	// Start with params array as current value
+	var current interface{} = r.Params
+
+	// Traverse through path elements
+	for _, p := range path {
+		switch idx := p.(type) {
+		case int:
+			// Array index access
+			arr, ok := current.([]interface{})
+			if !ok {
+				return nil, fmt.Errorf("expected array at path element %v, got %T", p, current)
+			}
+			if idx < 0 || idx >= len(arr) {
+				return nil, fmt.Errorf("array index %d out of bounds, array length: %d", idx, len(arr))
+			}
+			current = arr[idx]
+
+		case string:
+			// Map key access
+			m, ok := current.(map[string]interface{})
+			if !ok {
+				return nil, fmt.Errorf("expected map at path element %v, got %T", p, current)
+			}
+			val, exists := m[idx]
+			if !exists {
+				return nil, fmt.Errorf("key %s not found in map %+v", idx, m)
+			}
+			current = val
+
+		default:
+			return nil, fmt.Errorf("unsupported path element type: %T", p)
+		}
+	}
+
+	return current, nil
+}
+
+// hashValue writes a deterministic, structure-preserving encoding of v into h,
+// used to derive request-identity keys (CacheHash / in-flight multiplexing).
+//
+// The old encoding recursively flattened params into the hash stream with no
+// type tags, lengths, or container markers, so structurally distinct requests
+// collapsed to the same byte stream and therefore the same key (#1034):
+// topics [[A,B]] and [A,B] were indistinguishable, "ab"+"c" aliased "a"+"bc",
+// and %f rounded 25.0000001 to "25.000000". Because that key drives both the
+// persistent cache and in-flight multiplexing, a follower request could be
+// handed the leader's response.
+//
+// This encoding is injective across JSON value shapes: every value carries a
+// one-byte type tag, every string/number/container is length- or count-
+// delimited, and object keys are emitted in sorted order. Two self-delimiting
+// tokens cannot concatenate into a third, so different params can never produce
+// the same bytes.
+//
+//	null    -> "N"
+//	bool    -> "B0" | "B1"
+//	number  -> "F" <len> ":" <shortest-round-tripping decimal>
+//	string  -> "S" <len> ":" <lowercased bytes>
+//	array   -> "A" <count> ":" <encoded element>...
+//	object  -> "O" <count> ":" ("K" <len> ":" <key>) <encoded value> ...
+//
+// String params are lowercased, preserving the long-standing EVM hex
+// normalization: a checksummed address and its lowercase form are the same
+// request and share a cache entry / multiplex group. The type tags make that
+// safe against cross-type aliasing that lowercasing alone would create — the
+// string "true" (S4:true) and the boolean true (B1) no longer collide. (SVM
+// needs the opposite, case-preserving key; see svmRequestKey, which is why it
+// does not route through this function.)
+func hashValue(buf *bytes.Buffer, v interface{}) error {
+	switch t := v.(type) {
+	case nil:
+		buf.WriteByte('N')
+		return nil
+	case bool:
+		if t {
+			buf.WriteString("B1")
+		} else {
+			buf.WriteString("B0")
+		}
+		return nil
+	case int:
+		writeHashToken(buf, 'F', strconv.FormatInt(int64(t), 10))
+		return nil
+	case float64:
+		// 'g'/-1 emits the shortest decimal that round-trips to the same
+		// float64, preserving full precision (25 vs 25.0000001) unlike %f.
+		writeHashToken(buf, 'F', strconv.FormatFloat(t, 'g', -1, 64))
+		return nil
+	case string:
+		writeHashToken(buf, 'S', strings.ToLower(t))
+		return nil
+	case []interface{}:
+		writeHashHeader(buf, 'A', len(t))
+		for _, i := range t {
+			if err := hashValue(buf, i); err != nil {
+				return err
+			}
+		}
+		return nil
+	case map[string]interface{}:
+		keys := make([]string, 0, len(t))
+		for k := range t {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		writeHashHeader(buf, 'O', len(keys))
+		for _, k := range keys {
+			// Keys are emitted verbatim (not lowercased): they are JSON-RPC
+			// field names, not EVM hex values. Length-prefixing keeps a key
+			// from bleeding into the following value.
+			writeHashToken(buf, 'K', k)
+			if err := hashValue(buf, t[k]); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("unsupported type for value during hash: %+v", v)
+	}
+}
+
+// writeHashHeader writes a container header — the type tag, the element count,
+// and a ':' terminator (e.g. "A3:" or "O2:").
+func writeHashHeader(buf *bytes.Buffer, tag byte, n int) {
+	buf.WriteByte(tag)
+	writeUint(buf, uint64(n))
+	buf.WriteByte(':')
+}
+
+// writeHashToken writes a length-delimited leaf token — the type tag, the byte
+// length of s, a ':' terminator, and then s itself. The length prefix is what
+// makes adjacent tokens unambiguous: "ab"+"c" (S2:abS1:c) can never match
+// "a"+"bc" (S1:aS2:bc).
+func writeHashToken(buf *bytes.Buffer, tag byte, s string) {
+	buf.WriteByte(tag)
+	writeUint(buf, uint64(len(s)))
+	buf.WriteByte(':')
+	buf.WriteString(s)
+}
+
+// writeUint appends the decimal digits of n to buf one byte at a time. The
+// scratch array is indexed only (never passed as a slice to an escaping call),
+// so it stays on the stack — this is what keeps the encoder allocation-free per
+// token, unlike strconv.AppendInt into a heap-escaping buffer.
+func writeUint(buf *bytes.Buffer, n uint64) {
+	if n == 0 {
+		buf.WriteByte('0')
+		return
+	}
+	var tmp [20]byte
+	i := len(tmp)
+	for n > 0 {
+		i--
+		tmp[i] = byte('0' + n%10)
+		n /= 10
+	}
+	for ; i < len(tmp); i++ {
+		buf.WriteByte(tmp[i])
+	}
+}
+
+// findUpstreamsExhausted locates the ErrUpstreamsExhausted bundle that carries
+// the per-upstream causes, seeing through single-cause wrappers placed on top
+// of it. The network retry loop wraps the exhausted error in an
+// ErrFailsafeRetryExceeded before it reaches translation; a direct type
+// assertion missed that entirely, so the retry-exceeded path skipped the
+// dominance scan and surfaced whichever code the generic fallback happened to
+// reach.
+//
+// Only the linear Cause chain is walked — the same discipline as
+// IsRetryableTowardNetwork. Descending into a multi-error fan-out would let an
+// exhausted bundle nested inside e.g. a consensus dispute hijack the
+// translation of an error that is not about upstream exhaustion at all.
+func findUpstreamsExhausted(err error) *ErrUpstreamsExhausted {
+	for cur := err; cur != nil; {
+		if erx, ok := cur.(*ErrUpstreamsExhausted); ok {
+			return erx
+		}
+		cse, ok := cur.(StandardError)
+		if !ok {
+			return nil
+		}
+		next := cse.GetCause()
+		if _, isMulti := next.(interface{ Unwrap() []error }); isMulti {
+			return nil
+		}
+		cur = next
+	}
+	return nil
+}
+
+// hasLinearErrorCode reports whether err, or any error on its SINGLE-cause chain,
+// carries one of codes. It stops at multi-error wrappers (ErrUpstreamsExhausted,
+// consensus bundles, errors.Join) rather than descending into them, because
+// membership in a bundle only says one upstream hit the condition — not that the
+// condition is the verdict for the request. Mirrors the traversal rule
+// IsRetryableTowardNetwork uses for the same reason.
+func hasLinearErrorCode(err error, codes ...ErrorCode) bool {
+	for cur := err; cur != nil; {
+		se, ok := cur.(StandardError)
+		if !ok {
+			return false
+		}
+		base := se.Base()
+		if base == nil {
+			return false
+		}
+		for _, c := range codes {
+			if base.Code == c {
+				return true
+			}
+		}
+		next := se.GetCause()
+		if _, isMulti := next.(interface{ Unwrap() []error }); isMulti {
+			return false
+		}
+		cur = next
+	}
+	return false
+}
+
+// isBlockUnavailableVerdict reports whether "this block is outside the served
+// window" is the answer for the WHOLE request, rather than something one upstream
+// happened to say.
+//
+// For a multi-upstream bundle that requires every non-skipped cause to agree. A
+// plurality is not enough: -32014 tells a client the data is definitively absent,
+// and a consumer may act on that by permanently skipping the block, so a single
+// dissenting timeout or server error — an upstream that never actually answered —
+// must fall back to a generic failure the client will retry. Skips carry no
+// verdict (the upstream was never asked) and are ignored.
+//
+// Must be evaluated BEFORE the dominance scan in TranslateToJsonRpcException,
+// which collapses the bundle to one representative cause and thereby makes a
+// plurality indistinguishable from unanimity.
+func isBlockUnavailableVerdict(err error) bool {
+	erx := findUpstreamsExhausted(err)
+	if erx == nil {
+		return hasLinearErrorCode(err, ErrCodeUpstreamBlockUnavailable)
+	}
+	agreed := 0
+	for _, cause := range erx.Errors() {
+		if HasErrorCode(cause, ErrCodeUpstreamRequestSkipped) {
+			continue
+		}
+		if !hasLinearErrorCode(cause, ErrCodeUpstreamBlockUnavailable) {
+			return false
+		}
+		agreed++
+	}
+	return agreed > 0
+}
+
+// TranslateToJsonRpcException is mainly responsible to translate internal eRPC errors (not those coming from upstreams) to
+// a proper json-rpc error with correct numeric code.
+func TranslateToJsonRpcException(err error) error {
+	// Decided against the intact bundle: the dominance scan below replaces err
+	// with a single representative cause, after which unanimity is unrecoverable.
+	blockUnavailableIsVerdict := isBlockUnavailableVerdict(err)
+
+	if erx := findUpstreamsExhausted(err); erx != nil {
+		// Scan an UpstreamsExhausted error to detect the most frequent error among upstreams
+		// This selection helps provide somewhat user-friendly error message vs just saying that "all upstreams failed"
+		//
+		// erx.Errors() is ordered by orderCauses (retryable-toward-network
+		// first, then upstream id), so both the dominant-code tally and the
+		// representative picked out of that bucket are deterministic for a
+		// given multiset of causes. When several upstreams disagree under one
+		// error code — e.g. the same slot reported "not yet available" by one
+		// and "permanently skipped" by another — taking the FIRST of the
+		// bucket therefore surfaces the retryable verdict, which is the
+		// data-safe answer to hand a client.
+		var (
+			counts      = make(map[ErrorCode]int)   // code -> occurrences
+			firstByCode = make(map[ErrorCode]error) // code -> earliest cause with that code
+			firstAny    error
+			maxCount    int
+			domCode     ErrorCode
+		)
+		for _, cause := range erx.Errors() {
+			se, ok := cause.(StandardError)
+			if !ok {
+				continue
+			}
+			c := se.Base().Code
+			if firstAny == nil {
+				// Fallback when every cause turns out to be uninteresting.
+				firstAny = cause
+			}
+			if c == ErrCodeUpstreamRequestSkipped || HasErrorCode(cause, ErrCodeEndpointUnsupported) {
+				// most often these errors are not interesting nor significant vs other errors
+				continue
+			}
+			if _, seen := firstByCode[c]; !seen {
+				firstByCode[c] = cause
+			}
+			counts[c]++
+			if counts[c] > maxCount {
+				maxCount = counts[c]
+				domCode = c
+			}
+		}
+		domErr := firstAny
+		if maxCount > 0 {
+			domErr = firstByCode[domCode]
+		}
+		if domErr != nil {
+			err = domErr
+		}
+	}
+
+	// If the error already has a json-rpc representation in the chain, return it as is
+	// e.g. when it is based on response from upstream
+	if HasErrorCode(err, ErrCodeJsonRpcExceptionInternal) {
+		return err
+	}
+
+	//
+	// When error is an internal eRPC error, we need to translate it to a json-rpc error
+	//
+	if HasErrorCode(
+		err,
+		ErrCodeAuthRateLimitRuleExceeded,
+		ErrCodeProjectRateLimitRuleExceeded,
+		ErrCodeNetworkRateLimitRuleExceeded,
+		ErrCodeUpstreamRateLimitRuleExceeded,
+	) {
+		return NewErrJsonRpcExceptionInternal(
+			0,
+			JsonRpcErrorCapacityExceeded,
+			"rate-limit exceeded",
+			err,
+			nil,
+		)
+	}
+	if HasErrorCode(
+		err,
+		ErrCodeAuthUnauthorized,
+	) {
+		return NewErrJsonRpcExceptionInternal(
+			0,
+			JsonRpcErrorUnauthorized,
+			"unauthorized",
+			err,
+			nil,
+		)
+	}
+	if HasErrorCode(err, ErrCodeUpstreamMethodIgnored) {
+		var reason string
+		if se, ok := err.(StandardError); ok {
+			reason = se.DeepestMessage()
+		} else {
+			reason = err.Error()
+		}
+		return NewErrJsonRpcExceptionInternal(
+			0,
+			JsonRpcErrorUnsupportedException,
+			"method ignored by upstream: "+reason,
+			err,
+			nil,
+		)
+	}
+	// geth answers an unknown eth_unsubscribe id with its generic -32000.
+	if HasErrorCode(err, ErrCodeSubscriptionNotFound) {
+		return NewErrJsonRpcExceptionInternal(
+			0,
+			JsonRpcErrorCallException,
+			"subscription not found",
+			err,
+			nil,
+		)
+	}
+	// A block outside every upstream's availability window (pruned history, or an
+	// explicit blockAvailability bound) is missing data, not an internal failure.
+	// Without this it falls through to the generic -32603 server-side exception,
+	// which reads as "eRPC broke" and is indistinguishable from a real outage.
+	// -32014 is the code eRPC already uses for this condition elsewhere (see
+	// architecture/evm/block_range.go), so it round-trips correctly back to
+	// ErrEndpointMissingData when one eRPC sits behind another.
+	//
+	// Gated on the pre-collapse verdict rather than a code match on err: only an
+	// unanimous bundle (or a plain block-unavailable error) may claim the data is
+	// definitively absent. See isBlockUnavailableVerdict.
+	if blockUnavailableIsVerdict {
+		var reason string
+		if se, ok := err.(StandardError); ok {
+			reason = se.DeepestMessage()
+		} else {
+			reason = err.Error()
+		}
+		return NewErrJsonRpcExceptionInternal(
+			0,
+			JsonRpcErrorMissingData,
+			"block not available: "+reason,
+			err,
+			nil,
+		)
+	}
+	if HasErrorCode(err, ErrCodeJsonRpcRequestUnmarshal) {
+		return NewErrJsonRpcExceptionInternal(
+			0,
+			JsonRpcErrorParseException,
+			"failed to parse json-rpc request",
+			err,
+			nil,
+		)
+	}
+	if HasErrorCode(err, ErrCodeInvalidRequest, ErrCodeInvalidUrlPath) {
+		return NewErrJsonRpcExceptionInternal(
+			0,
+			JsonRpcErrorInvalidArgument,
+			"invalid request url and/or body",
+			err,
+			nil,
+		)
+	}
+	if HasErrorCode(err, ErrCodeGetLogsExceededMaxAllowedRange, ErrCodeGetLogsExceededMaxAllowedAddresses, ErrCodeGetLogsExceededMaxAllowedTopics, ErrCodeGetLogsExceededMaxAllowedResponseSize) {
+		return NewErrJsonRpcExceptionInternal(
+			0,
+			JsonRpcErrorEvmLargeRange,
+			"getLogs request exceeded max allowed range",
+			err,
+			nil,
+		)
+	}
+	var msg = "internal server error"
+	if se, ok := err.(StandardError); ok {
+		msg = se.DeepestMessage()
+	} else {
+		msg = err.Error()
+	}
+
+	return NewErrJsonRpcExceptionInternal(
+		0,
+		JsonRpcErrorServerSideException,
+		msg,
+		err,
+		nil,
+	)
+}

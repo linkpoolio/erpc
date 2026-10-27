@@ -1,0 +1,1406 @@
+package clients
+
+import (
+	"context"
+	"crypto/tls"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"net/url"
+	"sync"
+	"sync/atomic"
+
+	_ "github.com/blockchain-data-standards/manifesto/common"
+	"github.com/blockchain-data-standards/manifesto/evm"
+	"github.com/blockchain-data-standards/manifesto/svm"
+	"github.com/blockchain-data-standards/manifesto/svm/parse"
+	"github.com/bytedance/sonic"
+	"github.com/erpc/erpc/common"
+	"github.com/erpc/erpc/util"
+	"github.com/rs/zerolog"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
+
+	// Import gzip to register the compressor - enables automatic gzip compression
+	// when clients send "grpc-accept-encoding: gzip" header
+	_ "google.golang.org/grpc/encoding/gzip"
+	// Registers the client health-check function that healthCheckConfig uses.
+	_ "google.golang.org/grpc/health"
+)
+
+type GrpcBdsClient interface {
+	GetType() ClientType
+	SendRequest(ctx context.Context, req *common.NormalizedRequest) (*common.NormalizedResponse, error)
+	SetHeaders(h map[string]string)
+	QueryClient() evm.QueryServiceClient
+	// WithHeaders returns ctx carrying the upstream's grpc.headers as outgoing
+	// metadata, for calls made on QueryClient() outside SendRequest.
+	WithHeaders(ctx context.Context) context.Context
+}
+
+// Shutdown is deliberately NOT on GrpcBdsClient, for the same reason
+// SetExpectedChainId isn't: query_pipe_through.go type-asserts against that
+// interface as a capability probe, so widening it silently drops clients out
+// of the BDS path instead of failing to compile. Callers assert for
+// ShutdownableClient; this pins the real implementation at compile time.
+type ShutdownableClient interface{ Shutdown() }
+
+var _ ShutdownableClient = (*GenericGrpcBdsClient)(nil)
+
+type GenericGrpcBdsClient struct {
+	Url     *url.URL
+	headers map[string]string
+
+	// pool is a small round-robin pool of independent gRPC connections
+	// plus a stuck-call watchdog. See grpc_bds_resilience.go.
+	pool *bdsPool
+
+	projectId       string
+	upstream        common.Upstream
+	upstreamId      string
+	appCtx          context.Context
+	logger          *zerolog.Logger
+	isLogLevelTrace bool
+
+	// expectedChainId is the chainId this client is configured to serve
+	// (0 = unknown). When set, it is (a) stamped into every BDS request that
+	// carries an optional chainId field — a chain-aware server then REJECTS
+	// requests reaching the wrong chain's backend, so a cross-wired endpoint
+	// (a stale DNS record or reused address answering for another chain)
+	// fails loudly per request instead of silently answering with another
+	// chain's data — and (b) verified by the pool's connection maintainer via
+	// the ChainId RPC (see grpc_bds_resilience.go). Atomic: the cache
+	// connector arms it via SetExpectedChainId after probing.
+	expectedChainId atomic.Uint64
+
+	// closed is shut by Shutdown and releases the appCtx watcher goroutine
+	// below. Without it that watcher blocks on appCtx.Done() for the life of
+	// the process, so an explicitly-closed client would still leak one
+	// goroutine even though its pool was gone.
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+// SetExpectedChainId arms chain-identity enforcement after construction —
+// for callers that only learn the server's chain by probing it (the gRPC
+// cache connector). From then on every request carries the chainId assertion
+// and the pool maintainer keeps re-verifying the connections. Deliberately
+// NOT part of the GrpcBdsClient interface (callers type-assert) so existing
+// interface implementations stay compatible. Safe to call concurrently with
+// in-flight requests.
+func (c *GenericGrpcBdsClient) SetExpectedChainId(chainId uint64) {
+	c.expectedChainId.Store(chainId)
+	if c.pool != nil {
+		c.pool.expectedChainId.Store(chainId)
+	}
+}
+
+// NewGrpcBdsClient builds a BDS gRPC client backed by a round-robin connection
+// pool. poolSize sets the number of connections; <= 0 uses the built-in default
+// (bdsPoolSize). A non-empty healthCheckService turns on gRPC client health
+// checking for that grpc.health.v1 service name: round_robin then skips any
+// resolved address not reporting SERVING. A server without grpc.health
+// answers UNIMPLEMENTED, which grpc-go treats as healthy.
+func NewGrpcBdsClient(
+	appCtx context.Context,
+	logger *zerolog.Logger,
+	projectId string,
+	upstream common.Upstream,
+	parsedUrl *url.URL,
+	poolSize int,
+	healthCheckService string,
+) (GrpcBdsClient, error) {
+	upsId := "n/a"
+	if upstream != nil {
+		upsId = upstream.Id()
+	}
+	client := &GenericGrpcBdsClient{
+		Url:             parsedUrl,
+		appCtx:          appCtx,
+		logger:          logger,
+		projectId:       projectId,
+		upstream:        upstream,
+		upstreamId:      upsId,
+		isLogLevelTrace: logger.GetLevel() == zerolog.TraceLevel,
+		headers:         make(map[string]string),
+		closed:          make(chan struct{}),
+	}
+	if upstream != nil {
+		if cfg := upstream.Config(); cfg != nil && cfg.Evm != nil && cfg.Evm.ChainId > 0 {
+			client.expectedChainId.Store(uint64(cfg.Evm.ChainId))
+		}
+	}
+
+	// Apply any grpc.headers configured on the upstream as gRPC metadata on
+	// every outbound request, mirroring how the HTTP client applies
+	// jsonRpc.headers (http_json_rpc_client.go) and the gRPC cache connector
+	// applies its headers (data/grpc.go). This is how an edge-api auth key
+	// (authorization: Bearer <token>) reaches the wire for a grpc:// upstream.
+	if upstream != nil {
+		if cfg := upstream.Config(); cfg != nil && cfg.Grpc != nil {
+			client.SetHeaders(cfg.Grpc.Headers)
+		}
+	}
+
+	target, methodPrefix, useTLS := pickTargetForBDS(parsedUrl)
+
+	// Determine whether to use TLS based on port or URL scheme.
+	var transportCredentials credentials.TransportCredentials
+	if useTLS {
+		// Use TLS credentials with system's trusted CA certificates
+		transportCredentials = credentials.NewTLS(&tls.Config{
+			ServerName: parsedUrl.Hostname(),
+			MinVersion: tls.VersionTLS12,
+		})
+		logger.Debug().Str("target", target).Msg("using TLS credentials for gRPC connection")
+	} else {
+		// Use insecure credentials
+		transportCredentials = insecure.NewCredentials()
+		logger.Debug().Str("target", target).Msg("using insecure credentials for gRPC connection")
+	}
+
+	serviceConfig := bdsServiceConfig(healthCheckService)
+
+	pool, err := newBdsPool(appCtx, logger, projectId, upsId, target, methodPrefix, transportCredentials, serviceConfig, poolSize, client.expectedChainId.Load(), metadata.New(client.headers))
+	if err != nil {
+		return nil, err
+	}
+	client.pool = pool
+
+	// Releases on either the app going down or an explicit Shutdown; watching
+	// appCtx alone would pin this goroutine for the life of the process on
+	// every client the caller abandons.
+	go func() {
+		select {
+		case <-appCtx.Done():
+		case <-client.closed:
+		}
+		client.Shutdown()
+	}()
+
+	logger.Debug().
+		Str("target", target).
+		Int("pool_size", pool.Size()).
+		Dur("hard_call_timeout", bdsHardCallTimeout).
+		Msg("created gRPC BDS client")
+
+	return client, nil
+}
+
+// chainIdParam returns the configured chainId as the optional per-request
+// chain assertion, or nil when unknown. Chain-aware BDS servers validate
+// this field on every RPC and reject mismatches, so a request that lands on
+// the wrong chain's backend errors loudly instead of being answered with
+// another chain's data.
+func (c *GenericGrpcBdsClient) chainIdParam() *uint64 {
+	v := c.expectedChainId.Load()
+	if v == 0 {
+		return nil
+	}
+	return &v
+}
+
+// signatureEncoding picks how transaction r/s render in JSON-RPC output for
+// the configured chain: 32-byte DATA on Tron, QUANTITY everywhere else
+// (including unknown chain 0), per execution-apis.
+func (c *GenericGrpcBdsClient) signatureEncoding() evm.SignatureEncoding {
+	return evm.SignatureEncodingForChain(c.expectedChainId.Load())
+}
+
+// grpcResponseMetadataInterceptor captures all response metadata (headers)
+// from gRPC calls and records them as span attributes on detailed traces.
+func grpcResponseMetadataInterceptor() grpc.UnaryClientInterceptor {
+	return func(
+		ctx context.Context,
+		method string,
+		req, reply any,
+		cc *grpc.ClientConn,
+		invoker grpc.UnaryInvoker,
+		opts ...grpc.CallOption,
+	) error {
+		if !common.IsTracingDetailed {
+			return invoker(ctx, method, req, reply, cc, opts...)
+		}
+		span := trace.SpanFromContext(ctx)
+		if !span.IsRecording() {
+			return invoker(ctx, method, req, reply, cc, opts...)
+		}
+
+		var respMD metadata.MD
+		opts = append(opts, grpc.Header(&respMD))
+
+		err := invoker(ctx, method, req, reply, cc, opts...)
+
+		for key, vals := range respMD {
+			if len(vals) == 1 {
+				span.SetAttributes(attribute.String("grpc.response.metadata."+key, vals[0]))
+			} else if len(vals) > 1 {
+				span.SetAttributes(attribute.StringSlice("grpc.response.metadata."+key, vals))
+			}
+		}
+
+		return err
+	}
+}
+
+func (c *GenericGrpcBdsClient) GetType() ClientType {
+	return ClientTypeGrpcBds
+}
+
+func (c *GenericGrpcBdsClient) SendRequest(ctx context.Context, req *common.NormalizedRequest) (*common.NormalizedResponse, error) {
+	// Hard per-call ceiling. FIRST line of defense — bounds the worst case
+	// for wedged H2 streams independent of caller-supplied deadlines.
+	// The cause is OUR private sentinel (not the shared failsafe one) so
+	// the watchdog classification below can tell this cap apart from a
+	// caller-side dynamic-timeout expiry.
+	var cancel context.CancelFunc
+	ctx, cancel = context.WithTimeoutCause(ctx, bdsHardCallTimeout, errBdsHardCapExceeded)
+	defer cancel()
+
+	ctx, span := common.StartSpan(ctx, "GrpcBdsClient.SendRequest",
+		trace.WithAttributes(
+			attribute.String("network.id", req.NetworkId()),
+			attribute.String("upstream.id", c.upstreamId),
+		),
+	)
+	defer span.End()
+
+	// Fail fast if context is already canceled or expired
+	if err := ctx.Err(); err != nil {
+		common.SetTraceSpanError(span, err)
+		if errors.Is(err, context.DeadlineExceeded) {
+			return nil, common.NewErrEndpointRequestTimeout(0, err)
+		}
+		return nil, common.NewErrEndpointRequestCanceled(err)
+	}
+
+	if common.IsTracingDetailed {
+		span.SetAttributes(
+			attribute.String("request.id", fmt.Sprintf("%v", req.ID())),
+		)
+	}
+
+	jrReq, err := req.JsonRpcRequest()
+	if err != nil {
+		common.SetTraceSpanError(span, err)
+		return nil, common.NewErrUpstreamRequest(
+			err,
+			c.upstream,
+			req.NetworkId(),
+			"",
+			0, 0, 0, 0,
+		)
+	}
+
+	span.SetAttributes(attribute.String("request.method", jrReq.Method))
+
+	ctx = c.WithHeaders(ctx)
+
+	conn := c.pool.Pick()
+	if conn == nil || conn.rpcClient == nil {
+		err := fmt.Errorf("BDS client has no available connections")
+		common.SetTraceSpanError(span, err)
+		return nil, common.NewErrEndpointTransportFailure(c.Url, err)
+	}
+
+	var resp *common.NormalizedResponse
+	switch jrReq.Method {
+	case "eth_getBlockByNumber":
+		resp, err = c.handleGetBlockByNumber(ctx, conn, req, jrReq)
+	case "eth_getBlockByHash":
+		resp, err = c.handleGetBlockByHash(ctx, conn, req, jrReq)
+	case "eth_getLogs":
+		resp, err = c.handleGetLogs(ctx, conn, req, jrReq)
+	case "eth_getTransactionByHash":
+		resp, err = c.handleGetTransactionByHash(ctx, conn, req, jrReq)
+	case "eth_getTransactionReceipt":
+		resp, err = c.handleGetTransactionReceipt(ctx, conn, req, jrReq)
+	case "eth_getBlockReceipts":
+		resp, err = c.handleGetBlockReceipts(ctx, conn, req, jrReq)
+	case "eth_chainId":
+		resp, err = c.handleChainId(ctx, conn, req, jrReq)
+	case "getBlock":
+		resp, err = c.handleSvmGetBlock(ctx, conn, req, jrReq)
+	default:
+		err := common.NewErrEndpointUnsupported(
+			fmt.Errorf("unsupported method for gRPC BDS client: %s", jrReq.Method),
+		)
+		common.SetTraceSpanError(span, err)
+		return nil, err
+	}
+
+	// Classify any timeout-class error and decide whether to trigger
+	// the watchdog. We distinguish three cases via context.Cause():
+	//
+	//   - OUR bdsHardCallTimeout fired:
+	//       cause is errBdsHardCapExceeded (the cause we set on the
+	//       inner WithTimeoutCause). This is the wedged-stream signal —
+	//       feed it to the pool watchdog so a consistently wedged conn
+	//       is force-closed and replaced. Logged at Warn: it should be
+	//       rare and always deserves attention.
+	//
+	//   - A failsafe timeout policy fired on the caller's ctx:
+	//       cause is common.ErrDynamicTimeoutExceeded (set by the
+	//       upstream/network executors). Under quantile-driven policies
+	//       this fires routinely — it is a normal caller-side budget
+	//       expiry, NOT a wedge. No watchdog, and only Debug logging:
+	//       the failsafe layer already surfaces these via error returns
+	//       and the timeout-fired metric.
+	//
+	//   - The caller's ctx fired with a generic DeadlineExceeded:
+	//       same as above — caller-side timeout, not a wedge.
+	if err != nil {
+		ourHardCap := errors.Is(err, errBdsHardCapExceeded)
+		anyTimeout := ourHardCap ||
+			errors.Is(err, context.DeadlineExceeded) ||
+			errors.Is(err, common.ErrDynamicTimeoutExceeded)
+		if anyTimeout {
+			evt := c.logger.Debug()
+			if ourHardCap {
+				evt = c.logger.Warn()
+			}
+			evt.
+				Err(err).
+				Str("network.id", req.NetworkId()).
+				Str("upstream.id", c.upstreamId).
+				Str("method", jrReq.Method).
+				Interface("request.id", req.ID()).
+				Bool("our_hardcap", ourHardCap).
+				Msg("BDS bounded-wait timeout fired")
+			if ourHardCap {
+				c.pool.OnBoundedTimeout(conn, jrReq.Method)
+			}
+			// Classify the error so callers see it as a request-timeout
+			// rather than a generic transport failure (normalizeGrpcError
+			// would otherwise wrap it as ErrEndpointTransportFailure).
+			return nil, common.NewErrEndpointRequestTimeout(0, err)
+		}
+		// Caller-side cancellation is not a transport failure either.
+		// BoundedCall surfaces context.Canceled (via context.Cause) when
+		// the caller aborts while the underlying gRPC call is wedged;
+		// classify it accordingly so this doesn't show up as an upstream
+		// failure in metrics.
+		if errors.Is(err, context.Canceled) {
+			return nil, common.NewErrEndpointRequestCanceled(err)
+		}
+		return nil, c.normalizeGrpcError(err)
+	}
+	return resp, nil
+}
+
+func (c *GenericGrpcBdsClient) handleGetBlockByNumber(ctx context.Context, conn *bdsConn, req *common.NormalizedRequest, jrReq *common.JsonRpcRequest) (*common.NormalizedResponse, error) {
+	var params []interface{}
+	jrReq.RLock()
+	paramsBytes, err := sonic.Marshal(jrReq.Params)
+	jrReq.RUnlock()
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal params: %w", err)
+	}
+	if err := sonic.Unmarshal(paramsBytes, &params); err != nil {
+		return nil, fmt.Errorf("failed to parse params: %w", err)
+	}
+
+	if len(params) < 2 {
+		return nil, fmt.Errorf("insufficient params for eth_getBlockByNumber")
+	}
+
+	// Parse the block parameter (could be number, hash, or object with blockHash)
+	blockNumber, blockHash, err := util.ParseBlockParameter(params[0])
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse block parameter: %w", err)
+	}
+
+	includeTransactions, ok := params[1].(bool)
+	if !ok {
+		return nil, fmt.Errorf("invalid includeTransactions parameter")
+	}
+
+	// If we have a blockHash, use GetBlockByHash instead
+	if blockHash != nil {
+		grpcReq := &evm.GetBlockByHashRequest{
+			BlockHash:           blockHash,
+			IncludeTransactions: includeTransactions,
+			ChainId:             c.chainIdParam(),
+		}
+
+		hashHex := hex.EncodeToString(blockHash)
+		c.logger.Debug().
+			Str("blockHash", hashHex).
+			Interface("originalParam", params[0]).
+			Bool("includeTransactions", includeTransactions).
+			Msg("calling gRPC GetBlockByHash (from eth_getBlockByNumber with blockHash)")
+
+		ctx, grpcHashSpan := common.StartDetailSpan(ctx, "GrpcBdsClient.GetBlockByHash",
+			trace.WithAttributes(
+				attribute.String("block_hash", hashHex),
+				attribute.String("original_param", fmt.Sprintf("%v", params[0])),
+			),
+		)
+		grpcResp, err := callBoundedT(ctx, func(ctx context.Context) (*evm.GetBlockResponse, error) {
+			return conn.rpcClient.GetBlockByHash(ctx, grpcReq)
+		})
+		if err != nil {
+			grpcHashSpan.SetAttributes(attribute.String("grpc_error", err.Error()))
+			common.SetTraceSpanError(grpcHashSpan, err)
+			grpcHashSpan.End()
+			return nil, fmt.Errorf("gRPC call failed: %w", err)
+		}
+		grpcHashSpan.SetAttributes(attribute.Bool("response_has_block", grpcResp.Block != nil))
+		grpcHashSpan.End()
+
+		var result interface{}
+		if grpcResp.Block != nil {
+			result = evm.BlockToJsonRpc(grpcResp.Block, grpcResp.Transactions, grpcResp.FullTransactions, grpcResp.Withdrawals, c.signatureEncoding())
+		}
+
+		jsonRpcResp := &common.JsonRpcResponse{}
+		err = jsonRpcResp.SetID(jrReq.ID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to set ID: %w", err)
+		}
+
+		if result != nil {
+			resultBytes, err := sonic.Marshal(result)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal result: %w", err)
+			}
+			jsonRpcResp.SetResult(resultBytes)
+		} else {
+			jsonRpcResp.SetResult([]byte("null"))
+		}
+
+		return common.NewNormalizedResponse().
+			WithRequest(req).
+			WithJsonRpcResponse(jsonRpcResp), nil
+	}
+
+	// Otherwise, use GetBlockByNumber
+	grpcReq := &evm.GetBlockByNumberRequest{
+		BlockNumber:         blockNumber,
+		IncludeTransactions: includeTransactions,
+		ChainId:             c.chainIdParam(),
+	}
+
+	c.logger.Debug().
+		Str("blockNumber", blockNumber).
+		Interface("originalParam", params[0]).
+		Bool("includeTransactions", includeTransactions).
+		Msg("calling gRPC GetBlockByNumber")
+
+	isTag := blockNumber == "latest" || blockNumber == "earliest" || blockNumber == "finalized" || blockNumber == "safe" || blockNumber == "pending"
+	ctx, grpcSpan := common.StartDetailSpan(ctx, "GrpcBdsClient.GetBlockByNumber",
+		trace.WithAttributes(
+			attribute.String("block_number", blockNumber),
+			attribute.Bool("is_block_tag", isTag),
+			attribute.String("original_param", fmt.Sprintf("%v", params[0])),
+		),
+	)
+	grpcResp, err := callBoundedT(ctx, func(ctx context.Context) (*evm.GetBlockResponse, error) {
+		return conn.rpcClient.GetBlockByNumber(ctx, grpcReq)
+	})
+	if err != nil {
+		grpcSpan.SetAttributes(attribute.String("grpc_error", err.Error()))
+		common.SetTraceSpanError(grpcSpan, err)
+		grpcSpan.End()
+		return nil, fmt.Errorf("gRPC call failed: %w", err)
+	}
+	hasBlock := grpcResp.Block != nil
+	grpcSpan.SetAttributes(attribute.Bool("response_has_block", hasBlock))
+	if hasBlock {
+		grpcSpan.SetAttributes(
+			attribute.Int64("response_block_number", int64(grpcResp.Block.Number)),
+			attribute.String("response_block_hash", fmt.Sprintf("%x", grpcResp.Block.Hash)),
+		)
+	}
+	grpcSpan.End()
+
+	var result interface{}
+	if hasBlock {
+		result = evm.BlockToJsonRpc(grpcResp.Block, grpcResp.Transactions, grpcResp.FullTransactions, grpcResp.Withdrawals, c.signatureEncoding())
+	}
+
+	jsonRpcResp := &common.JsonRpcResponse{}
+	err = jsonRpcResp.SetID(jrReq.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to set ID: %w", err)
+	}
+
+	if result != nil {
+		resultBytes, err := sonic.Marshal(result)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal result: %w", err)
+		}
+		jsonRpcResp.SetResult(resultBytes)
+	} else {
+		jsonRpcResp.SetResult([]byte("null"))
+	}
+
+	return common.NewNormalizedResponse().
+		WithRequest(req).
+		WithJsonRpcResponse(jsonRpcResp), nil
+}
+
+func (c *GenericGrpcBdsClient) handleGetBlockByHash(ctx context.Context, conn *bdsConn, req *common.NormalizedRequest, jrReq *common.JsonRpcRequest) (*common.NormalizedResponse, error) {
+	var params []interface{}
+	jrReq.RLock()
+	paramsBytes, err := sonic.Marshal(jrReq.Params)
+	jrReq.RUnlock()
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal params: %w", err)
+	}
+	if err := sonic.Unmarshal(paramsBytes, &params); err != nil {
+		return nil, fmt.Errorf("failed to parse params: %w", err)
+	}
+
+	if len(params) < 2 {
+		return nil, fmt.Errorf("insufficient params for eth_getBlockByHash")
+	}
+
+	blockHashStr, ok := params[0].(string)
+	if !ok {
+		return nil, fmt.Errorf("invalid block hash parameter")
+	}
+
+	blockHash, err := util.ParseBlockHashHexToBytes(blockHashStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse block hash: %w", err)
+	}
+
+	includeTransactions, ok := params[1].(bool)
+	if !ok {
+		return nil, fmt.Errorf("invalid includeTransactions parameter")
+	}
+
+	grpcReq := &evm.GetBlockByHashRequest{
+		BlockHash:           blockHash,
+		IncludeTransactions: includeTransactions,
+		ChainId:             c.chainIdParam(),
+	}
+
+	c.logger.Debug().
+		Str("blockHash", blockHashStr).
+		Bool("includeTransactions", includeTransactions).
+		Msg("calling gRPC GetBlockByHash")
+
+	grpcResp, err := callBoundedT(ctx, func(ctx context.Context) (*evm.GetBlockResponse, error) {
+		return conn.rpcClient.GetBlockByHash(ctx, grpcReq)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("gRPC call failed: %w", err)
+	}
+
+	var result interface{}
+	if grpcResp.Block != nil {
+		result = evm.BlockToJsonRpc(grpcResp.Block, grpcResp.Transactions, grpcResp.FullTransactions, grpcResp.Withdrawals, c.signatureEncoding())
+	}
+
+	jsonRpcResp := &common.JsonRpcResponse{}
+	err = jsonRpcResp.SetID(jrReq.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to set ID: %w", err)
+	}
+
+	if result != nil {
+		resultBytes, err := sonic.Marshal(result)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal result: %w", err)
+		}
+		jsonRpcResp.SetResult(resultBytes)
+	} else {
+		jsonRpcResp.SetResult([]byte("null"))
+	}
+
+	return common.NewNormalizedResponse().
+		WithRequest(req).
+		WithJsonRpcResponse(jsonRpcResp), nil
+}
+
+func (c *GenericGrpcBdsClient) handleGetLogs(ctx context.Context, conn *bdsConn, req *common.NormalizedRequest, jrReq *common.JsonRpcRequest) (*common.NormalizedResponse, error) {
+	var params []map[string]interface{}
+	jrReq.RLock()
+	paramsBytes, err := sonic.Marshal(jrReq.Params)
+	jrReq.RUnlock()
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal params: %w", err)
+	}
+	if err := sonic.Unmarshal(paramsBytes, &params); err != nil {
+		return nil, fmt.Errorf("failed to parse params: %w", err)
+	}
+
+	if len(params) < 1 {
+		return nil, fmt.Errorf("insufficient params for eth_getLogs")
+	}
+
+	filterParams := params[0]
+
+	// EIP-234: a blockHash filter names one block and excludes fromBlock/toBlock.
+	// A BDS server answers it directly; a hash it does not hold (a block not
+	// indexed yet, or reorged away) is OUT_OF_RANGE, a miss like any other.
+	var blockHash []byte
+	if raw, present := filterParams["blockHash"]; present && raw != nil {
+		bhStr, ok := raw.(string)
+		if !ok || bhStr == "" {
+			return nil, fmt.Errorf("failed to parse blockHash: want a 32-byte hex string, got %v", raw)
+		}
+		if filterParams["fromBlock"] != nil || filterParams["toBlock"] != nil {
+			return nil, fmt.Errorf("eth_getLogs blockHash cannot be combined with fromBlock/toBlock")
+		}
+		blockHash, err = util.ParseBlockHashHexToBytes(bhStr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse blockHash: %w", err)
+		}
+	}
+
+	var fromBlock, toBlock *uint64
+	if fromStr, ok := filterParams["fromBlock"].(string); ok {
+		if fromStr != "latest" && fromStr != "pending" && fromStr != "earliest" {
+			fromParsed, err := evm.HexToUint64(fromStr)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse fromBlock: %w", err)
+			}
+			fromBlock = &fromParsed
+		}
+	}
+
+	if toStr, ok := filterParams["toBlock"].(string); ok {
+		if toStr != "latest" && toStr != "pending" && toStr != "earliest" {
+			toParsed, err := evm.HexToUint64(toStr)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse toBlock: %w", err)
+			}
+			toBlock = &toParsed
+		}
+	}
+
+	if blockHash == nil && (fromBlock == nil || toBlock == nil) {
+		return nil, fmt.Errorf("special block numbers not yet supported via gRPC for eth_getLogs")
+	}
+
+	var addresses [][]byte
+	if addrParam, ok := filterParams["address"]; ok {
+		switch v := addrParam.(type) {
+		case string:
+			addr, err := parseHexBytes(v)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse address: %w", err)
+			}
+			addresses = append(addresses, addr)
+		case []interface{}:
+			for _, a := range v {
+				if addrStr, ok := a.(string); ok {
+					addr, err := parseHexBytes(addrStr)
+					if err != nil {
+						return nil, fmt.Errorf("failed to parse address: %w", err)
+					}
+					addresses = append(addresses, addr)
+				}
+			}
+		}
+	}
+
+	topics, err := buildTopicFilters(filterParams["topics"])
+	if err != nil {
+		return nil, err
+	}
+
+	grpcReq := &evm.GetLogsRequest{
+		Addresses: addresses,
+		Topics:    topics,
+		ChainId:   c.chainIdParam(),
+	}
+	spanAttrs := []attribute.KeyValue{}
+	if blockHash != nil {
+		grpcReq.BlockHash = blockHash
+		spanAttrs = append(spanAttrs, attribute.String("block_hash", fmt.Sprintf("0x%x", blockHash)))
+	} else {
+		grpcReq.FromBlock, grpcReq.ToBlock = fromBlock, toBlock
+		spanAttrs = append(spanAttrs,
+			attribute.Int64("from_block", int64(*fromBlock)),
+			attribute.Int64("to_block", int64(*toBlock)),
+		)
+	}
+
+	c.logger.Debug().
+		Interface("filter", filterParams).
+		Int("addressCount", len(addresses)).
+		Int("topicCount", len(topics)).
+		Msg("calling gRPC GetLogs")
+
+	ctx, grpcSpan := common.StartDetailSpan(ctx, "GrpcBdsClient.GetLogs", trace.WithAttributes(spanAttrs...))
+	grpcResp, err := callBoundedT(ctx, func(ctx context.Context) (*evm.GetLogsResponse, error) {
+		return conn.rpcClient.GetLogs(ctx, grpcReq)
+	})
+	grpcSpan.End()
+	if err != nil {
+		return nil, fmt.Errorf("gRPC call failed: %w", err)
+	}
+
+	var result []interface{}
+	for _, log := range grpcResp.Logs {
+		result = append(result, evm.LogToJsonRpc(log))
+	}
+
+	jsonRpcResp := &common.JsonRpcResponse{}
+	jrReq.RLock()
+	err = jsonRpcResp.SetID(jrReq.ID)
+	jrReq.RUnlock()
+	if err != nil {
+		return nil, fmt.Errorf("failed to set ID: %w", err)
+	}
+
+	if len(result) == 0 {
+		jsonRpcResp.SetResult([]byte("[]"))
+	} else {
+		resultBytes, err := sonic.Marshal(result)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal result: %w", err)
+		}
+		jsonRpcResp.SetResult(resultBytes)
+	}
+
+	return common.NewNormalizedResponse().
+		WithRequest(req).
+		WithJsonRpcResponse(jsonRpcResp), nil
+}
+
+func (c *GenericGrpcBdsClient) handleGetTransactionByHash(ctx context.Context, conn *bdsConn, req *common.NormalizedRequest, jrReq *common.JsonRpcRequest) (*common.NormalizedResponse, error) {
+	var params []interface{}
+	jrReq.RLock()
+	paramsBytes, err := sonic.Marshal(jrReq.Params)
+	jrReq.RUnlock()
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal params: %w", err)
+	}
+	if err := sonic.Unmarshal(paramsBytes, &params); err != nil {
+		return nil, fmt.Errorf("failed to parse params: %w", err)
+	}
+
+	if len(params) < 1 {
+		return nil, fmt.Errorf("insufficient params for eth_getTransactionByHash")
+	}
+
+	txHashStr, ok := params[0].(string)
+	if !ok {
+		return nil, fmt.Errorf("invalid transaction hash parameter")
+	}
+
+	txHash, err := parseHexBytes(txHashStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse transaction hash: %w", err)
+	}
+
+	grpcReq := &evm.GetTransactionByHashRequest{
+		TransactionHash: txHash,
+		ChainId:         c.chainIdParam(),
+	}
+
+	c.logger.Debug().
+		Str("transactionHash", txHashStr).
+		Msg("calling gRPC GetTransactionByHash")
+
+	grpcResp, err := callBoundedT(ctx, func(ctx context.Context) (*evm.GetTransactionByHashResponse, error) {
+		return conn.rpcClient.GetTransactionByHash(ctx, grpcReq)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("gRPC call failed: %w", err)
+	}
+
+	var result interface{}
+	if grpcResp.Transaction != nil {
+		result = evm.TransactionToJsonRpc(grpcResp.Transaction, c.signatureEncoding())
+	}
+
+	jsonRpcResp := &common.JsonRpcResponse{}
+	err = jsonRpcResp.SetID(jrReq.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to set ID: %w", err)
+	}
+
+	if result != nil {
+		resultBytes, err := sonic.Marshal(result)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal result: %w", err)
+		}
+		jsonRpcResp.SetResult(resultBytes)
+	} else {
+		jsonRpcResp.SetResult([]byte("null"))
+	}
+
+	return common.NewNormalizedResponse().
+		WithRequest(req).
+		WithJsonRpcResponse(jsonRpcResp), nil
+}
+
+func (c *GenericGrpcBdsClient) handleGetTransactionReceipt(ctx context.Context, conn *bdsConn, req *common.NormalizedRequest, jrReq *common.JsonRpcRequest) (*common.NormalizedResponse, error) {
+	var params []interface{}
+	jrReq.RLock()
+	paramsBytes, err := sonic.Marshal(jrReq.Params)
+	jrReq.RUnlock()
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal params: %w", err)
+	}
+	if err := sonic.Unmarshal(paramsBytes, &params); err != nil {
+		return nil, fmt.Errorf("failed to parse params: %w", err)
+	}
+
+	if len(params) < 1 {
+		return nil, fmt.Errorf("insufficient params for eth_getTransactionReceipt")
+	}
+
+	txHashStr, ok := params[0].(string)
+	if !ok {
+		return nil, fmt.Errorf("invalid transaction hash parameter")
+	}
+
+	txHash, err := parseHexBytes(txHashStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse transaction hash: %w", err)
+	}
+
+	grpcReq := &evm.GetTransactionReceiptRequest{
+		TransactionHash: txHash,
+		ChainId:         c.chainIdParam(),
+	}
+
+	c.logger.Debug().
+		Str("transactionHash", txHashStr).
+		Msg("calling gRPC GetTransactionReceipt")
+
+	grpcResp, err := callBoundedT(ctx, func(ctx context.Context) (*evm.GetTransactionReceiptResponse, error) {
+		return conn.rpcClient.GetTransactionReceipt(ctx, grpcReq)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("gRPC call failed: %w", err)
+	}
+
+	var result interface{}
+	if grpcResp.Receipt != nil {
+		result = evm.ReceiptToJsonRpc(grpcResp.Receipt)
+	}
+
+	jsonRpcResp := &common.JsonRpcResponse{}
+	err = jsonRpcResp.SetID(jrReq.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to set ID: %w", err)
+	}
+
+	if result != nil {
+		resultBytes, err := sonic.Marshal(result)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal result: %w", err)
+		}
+		jsonRpcResp.SetResult(resultBytes)
+	} else {
+		jsonRpcResp.SetResult([]byte("null"))
+	}
+
+	return common.NewNormalizedResponse().
+		WithRequest(req).
+		WithJsonRpcResponse(jsonRpcResp), nil
+}
+
+func (c *GenericGrpcBdsClient) handleChainId(ctx context.Context, conn *bdsConn, req *common.NormalizedRequest, jrReq *common.JsonRpcRequest) (*common.NormalizedResponse, error) {
+	grpcReq := &evm.ChainIdRequest{}
+
+	c.logger.Debug().
+		Msg("calling gRPC ChainId")
+
+	grpcResp, err := callBoundedT(ctx, func(ctx context.Context) (*evm.ChainIdResponse, error) {
+		return conn.rpcClient.ChainId(ctx, grpcReq)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("gRPC call failed: %w", err)
+	}
+
+	// A server answering for a different chain than this client is configured
+	// for is a cross-wired endpoint (stale DNS record / reused address) — fail
+	// loudly instead of propagating another chain's identity (and, through the
+	// state poller, its heads).
+	if expected := c.expectedChainId.Load(); expected > 0 && grpcResp.ChainId != expected {
+		mismatchErr := common.NewErrEndpointChainIdMismatch(grpcResp.ChainId, expected)
+		c.logger.Error().Err(mismatchErr).Str("target", c.Url.String()).Msg("chainId mismatch from BDS server")
+		return nil, common.NewErrEndpointTransportFailure(c.Url, mismatchErr)
+	}
+
+	// Convert chain ID to hex string per JSON-RPC standard
+	result := fmt.Sprintf("0x%x", grpcResp.ChainId)
+
+	jsonRpcResp := &common.JsonRpcResponse{}
+	err = jsonRpcResp.SetID(jrReq.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to set ID: %w", err)
+	}
+
+	resultBytes, err := sonic.Marshal(result)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal result: %w", err)
+	}
+	jsonRpcResp.SetResult(resultBytes)
+
+	return common.NewNormalizedResponse().
+		WithRequest(req).
+		WithJsonRpcResponse(jsonRpcResp), nil
+}
+
+func (c *GenericGrpcBdsClient) handleGetBlockReceipts(ctx context.Context, conn *bdsConn, req *common.NormalizedRequest, jrReq *common.JsonRpcRequest) (*common.NormalizedResponse, error) {
+	var params []interface{}
+	jrReq.RLock()
+	paramsBytes, err := sonic.Marshal(jrReq.Params)
+	jrReq.RUnlock()
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal params: %w", err)
+	}
+	if err := sonic.Unmarshal(paramsBytes, &params); err != nil {
+		return nil, fmt.Errorf("failed to parse params: %w", err)
+	}
+
+	if len(params) < 1 {
+		return nil, fmt.Errorf("insufficient params for eth_getBlockReceipts")
+	}
+
+	// Parse the block parameter (could be number, hash, or object with blockHash)
+	blockNumber, blockHash, err := util.ParseBlockParameter(params[0])
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse block parameter: %w", err)
+	}
+
+	grpcReq := &evm.GetBlockReceiptsRequest{ChainId: c.chainIdParam()}
+
+	// If we got a block hash, use it directly
+	if blockHash != nil {
+		grpcReq.BlockHash = blockHash
+	} else {
+		grpcReq.BlockNumber = &blockNumber
+	}
+
+	c.logger.Debug().
+		Str("blockNumber", blockNumber).
+		Interface("originalParam", params[0]).
+		Msg("calling gRPC GetBlockReceipts")
+
+	grpcResp, err := callBoundedT(ctx, func(ctx context.Context) (*evm.GetBlockReceiptsResponse, error) {
+		return conn.rpcClient.GetBlockReceipts(ctx, grpcReq)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("gRPC call failed: %w", err)
+	}
+
+	// Convert receipts to JSON-RPC format
+	var result []interface{}
+	if grpcResp.Receipts != nil {
+		result = make([]interface{}, len(grpcResp.Receipts))
+		for i, receipt := range grpcResp.Receipts {
+			result[i] = evm.ReceiptToJsonRpc(receipt)
+		}
+	}
+
+	jsonRpcResp := &common.JsonRpcResponse{}
+	err = jsonRpcResp.SetID(jrReq.ID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to set ID: %w", err)
+	}
+
+	if len(result) > 0 {
+		resultBytes, err := sonic.Marshal(result)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal result: %w", err)
+		}
+		jsonRpcResp.SetResult(resultBytes)
+	} else {
+		jsonRpcResp.SetResult([]byte("[]"))
+	}
+
+	return common.NewNormalizedResponse().
+		WithRequest(req).
+		WithJsonRpcResponse(jsonRpcResp), nil
+}
+
+func (c *GenericGrpcBdsClient) normalizeGrpcError(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	// status.FromError only checks the top-level error for GRPCStatus().
+	// Handler methods wrap gRPC errors with fmt.Errorf, so we walk the
+	// Unwrap chain to find the original gRPC status.
+	current := err
+	for current != nil {
+		if st, ok := status.FromError(current); ok {
+			return common.ExtractGrpcErrorFromGrpcStatus(st, c.upstream)
+		}
+		current = errors.Unwrap(current)
+	}
+
+	return common.NewErrEndpointTransportFailure(c.Url, err)
+}
+
+// Shutdown closes the underlying connection pool. Callers that construct a
+// client and then abandon it — a failed bootstrap probe, a duplicate server,
+// a lost create race — MUST call this: the pool runs a maintainLoop goroutine
+// and each pooled grpc.ClientConn holds several of its own (callback
+// serializers, HTTP/2 transport loops) that only exit on Close.
+//
+// Exported deliberately. It was unexported with zero callers, so nothing ever
+// closed a BDS client, and every abandoned one leaked its goroutines for the
+// process lifetime.
+//
+// Safe to call more than once and on a nil receiver.
+func (c *GenericGrpcBdsClient) Shutdown() {
+	if c == nil {
+		return
+	}
+	c.closeOnce.Do(func() {
+		close(c.closed)
+		if c.pool != nil {
+			c.pool.Shutdown()
+		}
+	})
+}
+
+func (c *GenericGrpcBdsClient) SetHeaders(h map[string]string) {
+	if c == nil || h == nil {
+		return
+	}
+	for k, v := range h {
+		c.headers[k] = v
+	}
+	// The pool's ChainId probes must carry the same headers as requests.
+	if c.pool != nil {
+		md := metadata.New(c.headers)
+		c.pool.md.Store(&md)
+	}
+}
+
+// WithHeaders returns ctx carrying the configured grpc.headers as outgoing
+// metadata; ctx unchanged when none are configured.
+func (c *GenericGrpcBdsClient) WithHeaders(ctx context.Context) context.Context {
+	if c == nil || len(c.headers) == 0 {
+		return ctx
+	}
+	return metadata.NewOutgoingContext(ctx, metadata.New(c.headers))
+}
+
+func (c *GenericGrpcBdsClient) QueryClient() evm.QueryServiceClient {
+	if c == nil || c.pool == nil {
+		return nil
+	}
+	conn := c.pool.Pick()
+	if conn == nil {
+		return nil
+	}
+	return conn.queryClient
+}
+
+// Helper functions for conversion
+
+func parseHexBytes(hexStr string) ([]byte, error) {
+	return evm.HexToBytes(hexStr)
+}
+
+// buildTopicFilters converts the JSON-RPC topics array (where each entry may be
+// a string, an array of strings, or null) into the proto TopicFilter slice.
+//
+// A null entry is a wildcard at that position and MUST emit an empty
+// TopicFilter so positional alignment with subsequent filters is preserved:
+// dropping the entry would shift later filters left, e.g. [selector, null, to]
+// would be sent as [selector, to] and match logs where topic[1]=to instead of
+// topic[2]=to — silently returning zero results.
+func buildTopicFilters(topicsParam interface{}) ([]*evm.TopicFilter, error) {
+	raw, ok := topicsParam.([]interface{})
+	if !ok {
+		return nil, nil
+	}
+	topics := make([]*evm.TopicFilter, 0, len(raw))
+	for _, topicParam := range raw {
+		topicFilter := &evm.TopicFilter{}
+		switch v := topicParam.(type) {
+		case string:
+			topic, err := parseHexBytes(v)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse topic: %w", err)
+			}
+			topicFilter.Values = append(topicFilter.Values, topic)
+		case []interface{}:
+			for _, t := range v {
+				if topicStr, ok := t.(string); ok {
+					topic, err := parseHexBytes(topicStr)
+					if err != nil {
+						return nil, fmt.Errorf("failed to parse topic: %w", err)
+					}
+					topicFilter.Values = append(topicFilter.Values, topic)
+				}
+			}
+		case nil:
+			// wildcard: leave Values empty, fall through to append below
+		}
+		topics = append(topics, topicFilter)
+	}
+	return topics, nil
+}
+
+// svmGetBlockParams is the parsed second argument of Solana's `getBlock`.
+// Every field is optional; the zero value is Agave's default request.
+type svmGetBlockParams struct {
+	Encoding                       string  `json:"encoding"`
+	TransactionDetails             string  `json:"transactionDetails"`
+	Rewards                        *bool   `json:"rewards"`
+	Commitment                     string  `json:"commitment"`
+	MaxSupportedTransactionVersion *uint32 `json:"maxSupportedTransactionVersion"`
+	MinContextSlot                 *uint64 `json:"minContextSlot"`
+}
+
+// errSvmEncodingUnsupported means the caller asked for a payload shape this
+// path cannot produce. It is deliberately an "unsupported" error rather than a
+// failure: the cache layer treats it as a miss and the request goes to a live
+// upstream, which is the only place the other encodings exist.
+var errSvmEncodingUnsupported = errors.New("svm getBlock encoding not served by BDS")
+
+// handleSvmGetBlock serves Solana `getBlock` from the standardised
+// bds.svm.RPCQueryService.
+//
+// The correctness-critical part is the encoding guard. BDS returns a
+// structured block, which renders as `encoding: "json"` and nothing else.
+// `jsonParsed` in particular is NOT a formatting variant of it — it requires
+// per-program decoders (SPL Token, System, Stake, Vote, ATA, …) to turn opaque
+// instruction data into named fields. Serving json where jsonParsed was asked
+// for returns a wrong-shaped result that a client cannot distinguish from a
+// correct one, so anything but json falls through to a live upstream.
+func (c *GenericGrpcBdsClient) handleSvmGetBlock(ctx context.Context, conn *bdsConn, req *common.NormalizedRequest, jrReq *common.JsonRpcRequest) (*common.NormalizedResponse, error) {
+	var params []interface{}
+	jrReq.RLock()
+	paramsBytes, err := sonic.Marshal(jrReq.Params)
+	jrReq.RUnlock()
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal params: %w", err)
+	}
+	if err := sonic.Unmarshal(paramsBytes, &params); err != nil {
+		return nil, fmt.Errorf("failed to parse params: %w", err)
+	}
+	if len(params) < 1 {
+		return nil, fmt.Errorf("insufficient params for getBlock")
+	}
+
+	slot, err := svmParseSlot(params[0])
+	if err != nil {
+		return nil, err
+	}
+
+	// The config object is optional: `getBlock(slot)` is a legal call.
+	var opts svmGetBlockParams
+	if len(params) > 1 && params[1] != nil {
+		optBytes, merr := sonic.Marshal(params[1])
+		if merr != nil {
+			return nil, fmt.Errorf("failed to marshal getBlock config: %w", merr)
+		}
+		if uerr := sonic.Unmarshal(optBytes, &opts); uerr != nil {
+			return nil, fmt.Errorf("failed to parse getBlock config: %w", uerr)
+		}
+	}
+
+	// Absent encoding means json (Agave's default). json renders from the
+	// structured block directly; jsonParsed runs Agave's instruction parsers
+	// over it HERE, in-process, via the manifesto svm/parse package — the
+	// reader ships raw instruction data and knows nothing about encodings.
+	// base58/base64/base64+zstd remain unserved: they are raw-payload
+	// encodings this path has no reason to reproduce.
+	var wantParsed bool
+	switch opts.Encoding {
+	case "", "json":
+	case "jsonParsed":
+		wantParsed = true
+	default:
+		return nil, common.NewErrEndpointUnsupported(
+			fmt.Errorf("%w: %s", errSvmEncodingUnsupported, opts.Encoding),
+		)
+	}
+
+	details, err := svmTransactionDetails(opts.TransactionDetails)
+	if err != nil {
+		return nil, err
+	}
+
+	grpcReq := &svm.GetBlockRequest{
+		Slot:               slot,
+		TransactionDetails: details,
+		// Inverted: the proto's false is Agave's `rewards: true` default.
+		ExcludeRewards:                 opts.Rewards != nil && !*opts.Rewards,
+		MaxSupportedTransactionVersion: opts.MaxSupportedTransactionVersion,
+		Commitment:                     svmCommitment(opts.Commitment),
+		MinContextSlot:                 opts.MinContextSlot,
+		// GenesisHash is deliberately never set: the reader does not publish
+		// its own, and asserting one it cannot verify would be refused.
+	}
+
+	ctx, grpcSpan := common.StartDetailSpan(ctx, "GrpcBdsClient.SvmGetBlock",
+		trace.WithAttributes(
+			attribute.Int64("slot", int64(slot)),
+			attribute.String("transaction_details", opts.TransactionDetails),
+		),
+	)
+	grpcResp, err := callBoundedT(ctx, func(ctx context.Context) (*svm.GetBlockResponse, error) {
+		return conn.svmClient.GetBlock(ctx, grpcReq)
+	})
+	if err != nil {
+		grpcSpan.SetAttributes(attribute.String("grpc_error", err.Error()))
+		common.SetTraceSpanError(grpcSpan, err)
+		grpcSpan.End()
+		return nil, svmMapGetBlockError(err)
+	}
+	grpcSpan.SetAttributes(
+		attribute.String("slot_status", grpcResp.SlotStatus.String()),
+		attribute.Bool("response_has_block", grpcResp.Block != nil),
+	)
+	grpcSpan.End()
+
+	// A skipped slot is a real, permanent answer, but Agave reports it as a
+	// JSON-RPC error (-32007/-32009) rather than a null result, and a cache
+	// connector can only return a result. Fall through so the live upstream
+	// produces the error shape clients expect.
+	// TODO(BDA-3110): cache the skip once the cache layer can hold an error.
+	if grpcResp.SlotStatus == svm.SlotStatus_SLOT_SKIPPED || grpcResp.Block == nil {
+		return nil, common.NewErrEndpointUnsupported(
+			fmt.Errorf("slot %d is skipped; not served from BDS", slot),
+		)
+	}
+
+	var result map[string]interface{}
+	if wantParsed {
+		// Attach Agave's parsed instruction forms in-process. Instructions no
+		// parser covers (compute-budget, user programs) are left unattached
+		// and render as partiallyDecoded — exactly what a real node emits for
+		// them, so an unknown program degrades rather than corrupts.
+		parse.AttachToBlock(grpcResp.Block)
+		result = svm.BlockToJsonRpcParsed(grpcResp.Block, grpcResp.Signatures)
+	} else {
+		result = svm.BlockToJsonRpc(grpcResp.Block, grpcResp.Signatures)
+	}
+
+	jsonRpcResp := &common.JsonRpcResponse{}
+	if err := jsonRpcResp.SetID(jrReq.ID); err != nil {
+		return nil, fmt.Errorf("failed to set ID: %w", err)
+	}
+	resultBytes, err := sonic.Marshal(result)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal result: %w", err)
+	}
+	jsonRpcResp.SetResult(resultBytes)
+
+	return common.NewNormalizedResponse().
+		WithRequest(req).
+		WithJsonRpcResponse(jsonRpcResp), nil
+}
+
+// svmParseSlot accepts the slot as the JSON number it is on the wire. Solana
+// slots are decimal, never hex — an "0x…" string here is an EVM habit, not a
+// valid request.
+//
+// float64 is the only numeric case: the caller decodes params with sonic's
+// default config, which never yields json.Number. A slot above 2^53 would lose
+// precision here, but Solana is ~9 orders of magnitude away from that.
+func svmParseSlot(v interface{}) (uint64, error) {
+	n, ok := v.(float64)
+	if !ok {
+		return 0, fmt.Errorf("invalid slot parameter type %T", v)
+	}
+	if n < 0 || n != math.Trunc(n) {
+		return 0, fmt.Errorf("invalid slot %v: must be a non-negative integer", v)
+	}
+	return uint64(n), nil
+}
+
+func svmTransactionDetails(s string) (svm.TransactionDetails, error) {
+	switch s {
+	case "", "full":
+		return svm.TransactionDetails_TRANSACTION_DETAILS_FULL, nil
+	case "signatures":
+		return svm.TransactionDetails_TRANSACTION_DETAILS_SIGNATURES, nil
+	case "none":
+		return svm.TransactionDetails_TRANSACTION_DETAILS_NONE, nil
+	case "accounts":
+		// The BDS model set has no representation for it; the reader rejects
+		// it too. Fall through rather than serve a lossy shape.
+		return 0, common.NewErrEndpointUnsupported(
+			fmt.Errorf("%w: transactionDetails=accounts", errSvmEncodingUnsupported),
+		)
+	default:
+		return 0, fmt.Errorf("invalid transactionDetails %q", s)
+	}
+}
+
+func svmCommitment(s string) svm.Commitment {
+	if s == "confirmed" {
+		return svm.Commitment_COMMITMENT_CONFIRMED
+	}
+	// Agave defaults history reads to finalized; "processed" is not servable
+	// from a finalized-sealed archive, and the caller gets the stricter level
+	// rather than a fresher-looking lie.
+	return svm.Commitment_COMMITMENT_FINALIZED
+}
+
+// svmMapGetBlockError decides, per gRPC status, whether the miss is benign
+// (fall through to a live upstream) or a genuine transport failure worth
+// scoring against the connector.
+func svmMapGetBlockError(err error) error {
+	st, ok := status.FromError(err)
+	if !ok {
+		return fmt.Errorf("gRPC call failed: %w", err)
+	}
+	switch st.Code() {
+	case codes.OutOfRange:
+		// Outside this reader's served range, or above its tip. Benign: some
+		// other upstream has it.
+		return common.NewErrEndpointUnsupported(
+			fmt.Errorf("slot outside BDS coverage: %s", st.Message()),
+		)
+	case codes.Unimplemented:
+		return common.NewErrEndpointUnsupported(
+			fmt.Errorf("method not served by BDS: %s", st.Message()),
+		)
+	case codes.InvalidArgument:
+		// Client-induced and deterministic — the version gate (Agave -32015),
+		// an unknown enum, or ACCOUNTS mode. A live upstream renders the
+		// proper JSON-RPC error, so fall through instead of inventing one.
+		return common.NewErrEndpointUnsupported(
+			fmt.Errorf("request not servable by BDS: %s", st.Message()),
+		)
+	default:
+		return fmt.Errorf("gRPC call failed: %w", err)
+	}
+}
+
+// bdsServiceConfig is the pool's gRPC service config: round_robin across every
+// resolved address, transparent retries on UNAVAILABLE, and waitForReady so RPCs
+// queue through brief reconnects instead of failing. healthCheckService, when
+// set, adds client health checking so round_robin uses only SERVING addresses.
+func bdsServiceConfig(healthCheckService string) string {
+	cfg := map[string]any{
+		"loadBalancingConfig": []any{map[string]any{"round_robin": map[string]any{}}},
+		"methodConfig": []any{map[string]any{
+			"name":         []any{map[string]any{"service": ""}},
+			"waitForReady": true,
+			"retryPolicy": map[string]any{
+				"maxAttempts":          2,
+				"initialBackoff":       "1s",
+				"maxBackoff":           "5s",
+				"backoffMultiplier":    2,
+				"retryableStatusCodes": []any{"UNAVAILABLE"},
+			},
+		}},
+	}
+	if healthCheckService != "" {
+		cfg["healthCheckConfig"] = map[string]any{"serviceName": healthCheckService}
+	}
+	out, err := json.Marshal(cfg)
+	if err != nil {
+		panic(fmt.Sprintf("bds service config does not marshal: %v", err))
+	}
+	return string(out)
+}

@@ -1,0 +1,608 @@
+package consensus
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/erpc/erpc/common"
+	"github.com/rs/zerolog"
+)
+
+// responseGroup holds all responses that share the same hash.
+type responseGroup struct {
+	Hash    string
+	Results []*execResult
+	Count   int
+	IsTie   bool // Flag to indicate a tie with another group
+
+	ResponseType ResponseType
+	ResponseSize int // Size of the largest result in the group
+
+	// Cached largest result/error for quick access (prefer largest response even within same consensus group)
+	LargestResult *common.NormalizedResponse
+	// RepresentativeError is the error every winner rule returns for this group.
+	// It is the member with the lowest upstream id (ties broken by attempt
+	// index), never the first to arrive: a group can hold members whose codes or
+	// messages differ — missing-data groups by verdict, and no group has ever
+	// hashed the message — so picking by arrival made the client-visible error
+	// depend on which upstream happened to answer first.
+	RepresentativeError error
+	// repKey is the sort key of the member RepresentativeError came from.
+	repKey    representativeKey
+	HasResult bool
+}
+
+// representativeKey orders a group's error members. Upstream id is the stable
+// axis; attempt index only breaks ties when one upstream answered twice, and an
+// unattributed result (no upstream) always loses to an attributed one.
+type representativeKey struct {
+	unattributed bool
+	upstreamID   string
+	index        int
+}
+
+func newRepresentativeKey(r *execResult) representativeKey {
+	if r.Upstream == nil {
+		return representativeKey{unattributed: true, index: r.Index}
+	}
+	return representativeKey{upstreamID: r.Upstream.Id(), index: r.Index}
+}
+
+func (k representativeKey) before(other representativeKey) bool {
+	if k.unattributed != other.unattributed {
+		return !k.unattributed
+	}
+	if k.upstreamID != other.upstreamID {
+		return k.upstreamID < other.upstreamID
+	}
+	return k.index < other.index
+}
+
+func (g *responseGroup) participants() []common.ParticipantInfo {
+	participants := make([]common.ParticipantInfo, 0, len(g.Results))
+	for _, r := range g.Results {
+		upsId := "n/a"
+		if r.Upstream != nil {
+			upsId = r.Upstream.Id()
+		}
+		participants = append(participants, common.ParticipantInfo{
+			Upstream:   upsId,
+			ResultHash: r.CachedHash,
+			ErrSummary: common.ErrorSummary(r.Err),
+		})
+	}
+	return participants
+}
+
+// consensusAnalysis contains the complete, one-time analysis of all collected responses.
+type consensusAnalysis struct {
+	config            *config
+	groups            map[string]*responseGroup
+	totalParticipants int
+	// collectedResponses is the RAW response count before upstream
+	// deduplication — the number of participant slots that have answered.
+	// Use for "how many more can arrive" math; use totalParticipants for
+	// vote counting.
+	collectedResponses int
+	validParticipants  int
+	originalRequest    *common.NormalizedRequest
+	leaderUpstream     common.Upstream
+	method             string // The RPC method being called (e.g., "eth_getTransactionCount")
+
+	// Cached computed values
+	cachedBestNonEmpty *responseGroup
+	cachedBestEmpty    *responseGroup
+	cachedBestError    *responseGroup
+	cachedBestByCount  *responseGroup
+	cachedBestBySize   *responseGroup
+	cachedValidGroups  []*responseGroup
+}
+
+func newConsensusAnalysis(lg *zerolog.Logger, ctx context.Context, config *config, responses []*execResult) *consensusAnalysis {
+	analysis := &consensusAnalysis{
+		config: config,
+		groups: make(map[string]*responseGroup),
+	}
+
+	// Try to extract original request and compute leader upstream once
+	if req, ok := ctx.Value(common.RequestContextKey).(*common.NormalizedRequest); ok && req != nil {
+		analysis.originalRequest = req
+		if method, err := req.Method(); err == nil {
+			analysis.method = method
+		}
+		if net := req.Network(); net != nil && net.Architecture() == common.ArchitectureEvm {
+			// Use the executor context; leader selection is read-only and fast
+			analysis.leaderUpstream = common.EvmLeaderUpstream(net, ctx)
+		}
+	}
+
+	// Classify and hash all responses first so deduplication can rank them.
+	for _, r := range responses {
+		classifyAndHashResponse(r, ctx, config)
+	}
+
+	// Deduplicate by upstream ID: hedge/retry can reselect an upstream that
+	// already produced a response for another participant slot, and a single
+	// node must not vote twice toward agreementThreshold. Keep the most
+	// useful response per upstream (see responseTypeVoteRank); participant
+	// counts below reflect distinct upstreams only.
+	analysis.collectedResponses = len(responses)
+	responses = dedupeByUpstream(responses)
+	analysis.totalParticipants = len(responses)
+
+	// Group all responses
+	for _, r := range responses {
+		if r.CachedResponseType != ResponseTypeInfrastructureError {
+			analysis.validParticipants++
+		}
+
+		group, exists := analysis.groups[r.CachedHash]
+		if !exists {
+			group = &responseGroup{
+				Hash:         r.CachedHash,
+				ResponseType: r.CachedResponseType,
+				ResponseSize: r.CachedResponseSize,
+			}
+			analysis.groups[r.CachedHash] = group
+		}
+
+		group.Count++
+		group.Results = append(group.Results, r)
+		// Track the largest successful response in the group
+		if r.Err == nil {
+			if !group.HasResult {
+				// First successful response in this group
+				group.LargestResult = r.Result
+				group.ResponseSize = r.CachedResponseSize
+				group.RepresentativeError = nil
+				group.HasResult = true
+			} else if r.CachedResponseSize > group.ResponseSize {
+				// Found a larger response in the same consensus group
+				group.LargestResult = r.Result
+				group.ResponseSize = r.CachedResponseSize
+			}
+		} else if key := newRepresentativeKey(r); group.RepresentativeError == nil || key.before(group.repKey) {
+			group.RepresentativeError = r.Err
+			group.repKey = key
+		}
+	}
+
+	// After grouping, compute tie flags among valid groups by response type (exclude infrastructure errors)
+	if len(analysis.groups) > 1 {
+		countsByType := make(map[ResponseType]map[int]int)
+		for _, g := range analysis.groups {
+			if g.ResponseType == ResponseTypeInfrastructureError {
+				continue
+			}
+			if _, ok := countsByType[g.ResponseType]; !ok {
+				countsByType[g.ResponseType] = make(map[int]int)
+			}
+			countsByType[g.ResponseType][g.Count]++
+		}
+		for _, g := range analysis.groups {
+			if g.ResponseType == ResponseTypeInfrastructureError {
+				g.IsTie = false
+				continue
+			}
+			g.IsTie = countsByType[g.ResponseType][g.Count] > 1
+		}
+	}
+
+	// Pre-populate all cached accessors so the struct is effectively
+	// immutable after construction. This is critical: after the analyzer
+	// goroutine sends the outcome to the caller via outcomeCh (see
+	// executor.go runAnalyzer), both goroutines may read the analysis
+	// concurrently. Lazy-init under concurrent reads would be a data race.
+	analysis.getValidGroups()
+	analysis.getBestNonEmpty()
+	analysis.getBestEmpty()
+	analysis.getBestError()
+	analysis.getBestByCount()
+	analysis.getBestBySize()
+
+	return analysis
+}
+
+// responseTypeVoteRank orders response types by their usefulness as a
+// consensus vote: a real result beats a consensus-valid error, which beats
+// an infrastructure error. Used by dedupeByUpstream to pick which of an
+// upstream's duplicate responses keeps its vote.
+func responseTypeVoteRank(rt ResponseType) int {
+	switch rt {
+	case ResponseTypeNonEmpty:
+		return 3
+	case ResponseTypeEmpty:
+		return 2
+	case ResponseTypeConsensusError:
+		return 1
+	default: // ResponseTypeInfrastructureError
+		return 0
+	}
+}
+
+// dedupeByUpstream returns responses with at most one entry per upstream ID
+// so a single upstream reselected via hedge/retry counts only once toward
+// consensus. Responses must already be classified. The best-ranked response
+// wins (e.g. a valid result from a later slot replaces an earlier
+// infrastructure error from the same upstream); on equal rank the LAST
+// arrival wins — a node answering twice at the chain tip may see advanced
+// state, and its latest answer is its vote (keeping the first would drop a
+// fresher vote that agrees with the eventual winner and manufacture a
+// dispute). The kept entry stays at its first-seen position so arrival
+// order is preserved. Responses without an upstream are kept as-is.
+// Dropped responses are not released here: the executor's release path
+// iterates the raw responses slice and covers them.
+func dedupeByUpstream(responses []*execResult) []*execResult {
+	byUpstream := make(map[string]int, len(responses)) // upstream ID -> index in out
+	out := make([]*execResult, 0, len(responses))
+	for _, r := range responses {
+		if r.Upstream == nil {
+			out = append(out, r)
+			continue
+		}
+		id := r.Upstream.Id()
+		if i, seen := byUpstream[id]; seen {
+			if responseTypeVoteRank(r.CachedResponseType) >= responseTypeVoteRank(out[i].CachedResponseType) {
+				out[i] = r
+			}
+			continue
+		}
+		byUpstream[id] = len(out)
+		out = append(out, r)
+	}
+	return out
+}
+
+// hasRemaining reports whether more responses can still arrive this round.
+// It compares against the RAW collected count, not the deduplicated
+// totalParticipants: a deduplicated duplicate consumed a participant slot —
+// counting it as still-arriving capacity would suppress short-circuits (and
+// hold composition-dispute rounds open) after every slot already answered.
+func (a *consensusAnalysis) hasRemaining() bool {
+	return a.config.maxParticipants > a.collectedResponses
+}
+
+func (a *consensusAnalysis) participants() []common.ParticipantInfo {
+	participants := make([]common.ParticipantInfo, 0, len(a.groups))
+	for _, group := range a.groups {
+		participants = append(participants, group.participants()...)
+	}
+	return participants
+}
+
+// groupOf returns the response group that produced the winner's result or
+// error, matching by pointer identity. Returns nil for synthesized winners
+// (dispute/low-participants errors constructed by rules have no backing
+// group).
+func (a *consensusAnalysis) groupOf(sr *slotResult) *responseGroup {
+	if sr == nil {
+		return nil
+	}
+	for _, g := range a.groups {
+		if sr.Error != nil && g.RepresentativeError == sr.Error {
+			return g
+		}
+		for _, r := range g.Results {
+			if r == nil {
+				continue
+			}
+			if (sr.Result != nil && r.Result == sr.Result) ||
+				(sr.Error != nil && r.Err == sr.Error) {
+				return g
+			}
+		}
+	}
+	return nil
+}
+
+// getValidGroups returns all groups of non-empty, empty, or valid consensus errors, skipping infrastructure errors
+func (a *consensusAnalysis) getValidGroups() []*responseGroup {
+	if a.cachedValidGroups == nil {
+		a.cachedValidGroups = make([]*responseGroup, 0, len(a.groups))
+		for _, group := range a.groups {
+			if group.ResponseType != ResponseTypeInfrastructureError {
+				a.cachedValidGroups = append(a.cachedValidGroups, group)
+			}
+		}
+	}
+	return a.cachedValidGroups
+}
+
+// getBestNonEmpty returns the best non-empty group (cached)
+func (a *consensusAnalysis) getBestNonEmpty() *responseGroup {
+	if a.cachedBestNonEmpty == nil {
+		var best *responseGroup
+		for _, group := range a.groups {
+			if group.ResponseType != ResponseTypeNonEmpty {
+				continue
+			}
+			if best == nil || group.Count > best.Count || (group.Count == best.Count && group.ResponseSize > best.ResponseSize) {
+				best = group
+			}
+		}
+		a.cachedBestNonEmpty = best
+	}
+	return a.cachedBestNonEmpty
+}
+
+// getBestEmpty returns the best empty group (cached)
+func (a *consensusAnalysis) getBestEmpty() *responseGroup {
+	if a.cachedBestEmpty == nil {
+		var best *responseGroup
+		for _, group := range a.groups {
+			if group.ResponseType == ResponseTypeEmpty {
+				if best == nil {
+					best = group
+					continue
+				}
+				if group.Count > best.Count {
+					best = group
+				}
+			}
+		}
+		a.cachedBestEmpty = best
+	}
+	return a.cachedBestEmpty
+}
+
+// getBestError returns the best error group (cached)
+func (a *consensusAnalysis) getBestError() *responseGroup {
+	if a.cachedBestError == nil {
+		var best *responseGroup
+		for _, group := range a.groups {
+			if group.ResponseType == ResponseTypeConsensusError || group.ResponseType == ResponseTypeInfrastructureError {
+				if best == nil {
+					best = group
+					continue
+				}
+				if group.Count > best.Count {
+					best = group
+				}
+			}
+		}
+		a.cachedBestError = best
+	}
+	return a.cachedBestError
+}
+
+// getBestByCount returns the group with highest count (cached)
+func (a *consensusAnalysis) getBestByCount() *responseGroup {
+	if a.cachedBestByCount == nil && len(a.groups) > 0 {
+		var best *responseGroup
+		for _, group := range a.groups {
+			if best == nil || group.Count > best.Count {
+				best = group
+			}
+		}
+		a.cachedBestByCount = best
+	}
+	return a.cachedBestByCount
+}
+
+// getBestBySize returns the largest non-empty group (cached)
+func (a *consensusAnalysis) getBestBySize() *responseGroup {
+	if a.cachedBestBySize == nil {
+		var best *responseGroup
+		for _, group := range a.groups {
+			if group.ResponseType == ResponseTypeNonEmpty && (best == nil || group.ResponseSize > best.ResponseSize) {
+				best = group
+			}
+		}
+		a.cachedBestBySize = best
+	}
+	return a.cachedBestBySize
+}
+
+// isLowParticipants checks if we have insufficient participants
+func (a *consensusAnalysis) isLowParticipants(threshold int) bool {
+	return a.validParticipants < threshold
+}
+
+// getLeaderGroupNonError returns the response group that contains the leader upstream with a non-error response (non-empty or empty).
+func (a *consensusAnalysis) getLeaderGroupNonError() *responseGroup {
+	if a.leaderUpstream == nil {
+		return nil
+	}
+	for _, group := range a.groups {
+		if group.ResponseType == ResponseTypeConsensusError || group.ResponseType == ResponseTypeInfrastructureError {
+			continue
+		}
+		for _, r := range group.Results {
+			if r != nil && r.Upstream != nil && r.Err == nil {
+				if r.Upstream == a.leaderUpstream {
+					return group
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// getLeaderGroupAny returns the response group that contains the leader upstream for any valid response
+// (non-empty, empty, or consensus-valid error). Infrastructure errors are ignored since they are not
+// meaningful consensus responses.
+func (a *consensusAnalysis) getLeaderGroupAny() *responseGroup {
+	if a.leaderUpstream == nil {
+		return nil
+	}
+	// search valid groups only (exclude infrastructure errors)
+	for _, group := range a.getValidGroups() {
+		for _, r := range group.Results {
+			if r != nil && r.Upstream != nil && r.Upstream == a.leaderUpstream {
+				return group
+			}
+		}
+	}
+	return nil
+}
+
+// getLeaderFirstErrorIncludingInfra returns the leader's first error from any group,
+// including infrastructure errors. Used by leader-preferring behaviors that must
+// return the leader's error even when it isn't a consensus-valid error.
+func (a *consensusAnalysis) getLeaderFirstErrorIncludingInfra() error {
+	if a.leaderUpstream == nil {
+		return nil
+	}
+	for _, group := range a.groups {
+		if group == nil || group.RepresentativeError == nil {
+			// Fast path: skip groups without cached error
+			// Still scan results in case RepresentativeError isn't populated
+		}
+		for _, r := range group.Results {
+			if r != nil && r.Upstream != nil && r.Upstream == a.leaderUpstream && r.Err != nil {
+				return r.Err
+			}
+		}
+	}
+	return nil
+}
+
+// --- Helper and Utility Functions ---
+
+// isConsensusValidError checks if an error can be part of consensus (e.g., EVM revert).
+func isConsensusValidError(err error) bool {
+	return common.HasErrorCode(err, common.ErrCodeEndpointExecutionException)
+}
+
+// isAgreedUponError checks for errors that are not execution-related but can be agreed upon (e.g., invalid params).
+func isAgreedUponError(err error) bool {
+	return common.HasErrorCode(err,
+		common.ErrCodeEndpointClientSideException,
+		common.ErrCodeEndpointUnsupported,
+		common.ErrCodeEndpointMissingData,
+	)
+}
+
+// errorToConsensusHash generates a comparable hash from an error.
+//
+// Missing-data errors hash by verdict, not by number. A provider's JSON-RPC code
+// for "I do not have this" reports its own storage layout, not the chain: agave
+// answers a permanently absent slot with -32007 when check_blockstore_root
+// settles it locally and -32009 when check_bigtable_result had to ask long-term
+// storage, and answers a block it cannot serve with -32001 when its ledger was
+// pruned below the slot and -32004 when the slot is above its rooted tip. Two
+// honest upstreams therefore landed in different groups and disputed under
+// returnError, which is the one outcome neither of them claimed.
+//
+// EVM is unaffected in practice: every EVM missing-data site already normalizes
+// to JsonRpcErrorMissingData, so those responses shared a group before this and
+// share one now.
+func errorToConsensusHash(err error) string {
+	if err == nil {
+		return ""
+	}
+	hash := "error:generic"
+	var jre *common.ErrJsonRpcExceptionInternal
+	switch {
+	case common.HasErrorCode(err, common.ErrCodeEndpointMissingData):
+		hash = "missingdata"
+	case errors.As(err, &jre):
+		hash = fmt.Sprintf("jsonrpc:%d", jre.NormalizedCode())
+	default:
+		if se, ok := err.(common.StandardError); ok {
+			if base := se.Base(); base != nil {
+				hash = string(base.Code)
+			}
+		}
+	}
+	// "Skipped for good" and "not indexed yet" are opposite claims about whether
+	// asking again can help. One group would hand the caller whichever arrived
+	// first, so permanence stays part of the key and the two dispute instead.
+	if common.IsPermanentlyMissingData(err) {
+		hash += ":permanent"
+	}
+	return hash
+}
+
+// resultToJsonRpcResponse safely converts a result to a JsonRpcResponse.
+func resultToJsonRpcResponse(result *common.NormalizedResponse, ctx context.Context) *common.JsonRpcResponse {
+	if result == nil {
+		return nil
+	}
+	jr, _ := result.JsonRpcResponse(ctx)
+	return jr
+}
+
+// classifyAndHashResponse computes and caches the response type, hash, and size for a result.
+func classifyAndHashResponse(r *execResult, ctx context.Context, config *config) {
+	if r.Err != nil {
+		// ErrUpstreamsExhausted means no upstream was reachable — always infrastructure.
+		// Its Cause wraps the shared ErrorsByUpstream map which may contain errors from
+		// other consensus participants (e.g. execution reverts). Without this guard,
+		// HasErrorCode traversal would find those foreign errors and misclassify this
+		// as a consensus-valid response, creating phantom voting groups.
+		if common.HasErrorCode(r.Err, common.ErrCodeUpstreamsExhausted) {
+			r.CachedResponseType = ResponseTypeInfrastructureError
+			r.CachedHash = "error:exhausted"
+			r.CachedResponseSize = 0
+			return
+		}
+
+		// Classify agreed-upon JSON-RPC errors and execution exceptions as consensus-valid errors.
+		// Only true infrastructure issues (like timeouts, network/server failures) are infrastructure errors.
+		if isConsensusValidError(r.Err) || isAgreedUponError(r.Err) {
+			r.CachedResponseType = ResponseTypeConsensusError
+		} else {
+			r.CachedResponseType = ResponseTypeInfrastructureError
+		}
+		r.CachedHash, _ = resultOrErrorToHash(r, ctx, config)
+		if r.CachedHash == "" {
+			r.CachedHash = "error:generic"
+		}
+		r.CachedResponseSize = 0
+		return
+	}
+
+	// Successful response
+	jr := resultToJsonRpcResponse(r.Result, ctx)
+	if jr == nil {
+		r.CachedResponseType = ResponseTypeInfrastructureError
+		r.CachedHash = "error:generic"
+		return
+	}
+
+	// Use NormalizedResponse-aware emptyish check to capture method-specific semantics (e.g., EVM logs)
+	if r.Result != nil && r.Result.IsResultEmptyish(ctx) {
+		r.CachedResponseType = ResponseTypeEmpty
+	} else {
+		r.CachedResponseType = ResponseTypeNonEmpty
+	}
+
+	if size, err := jr.Size(ctx); err == nil {
+		r.CachedResponseSize = size
+	}
+
+	r.CachedHash, _ = resultOrErrorToHash(r, ctx, config)
+	if r.CachedHash == "" {
+		r.CachedResponseType = ResponseTypeInfrastructureError
+		r.CachedHash = "error:generic"
+	}
+}
+
+// resultOrErrorToHash computes a hash for a result, considering both success and error cases.
+func resultOrErrorToHash(r *execResult, ctx context.Context, config *config) (string, error) {
+	if r.Err != nil {
+		if isConsensusValidError(r.Err) || isAgreedUponError(r.Err) {
+			return errorToConsensusHash(r.Err), nil
+		}
+		return "", errNotConsensusValid // Infrastructure errors are not hashed for consensus
+	}
+
+	// Successful result
+	jr := resultToJsonRpcResponse(r.Result, ctx)
+	if jr == nil {
+		return "", errNoJsonRpcResponse
+	}
+
+	if config.ignoreFields != nil {
+		if originalReq, ok := ctx.Value(common.RequestContextKey).(*common.NormalizedRequest); ok {
+			if method, err := originalReq.Method(); err == nil {
+				if fields, ok := methodFields(config.ignoreFields, method); ok {
+					return jr.CanonicalHashWithIgnoredFields(fields, ctx)
+				}
+			}
+		}
+	}
+	return jr.CanonicalHash()
+}

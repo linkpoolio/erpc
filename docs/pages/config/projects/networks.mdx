@@ -1,0 +1,871 @@
+---
+title: Networks
+description: One entry per chain — eRPC routes every request to the right upstreams, caches results, and retries failures, all without touching your code.
+---
+
+import {
+	LLMsTxtLink,
+	AISection,
+	ConfigTabs,
+	SourceLink,
+	PromptExample,
+} from "../../../components";
+import { Tabs } from "nextra/components";
+
+<LLMsTxtLink />
+
+# Networks
+
+A **network** is one chain inside a project. Declare it once and eRPC owns the whole pipeline: smarter caching, automatic failover, and in-flight deduplication — on every chain you touch. Three things make it ergonomic: **zero-config chains** bootstrap automatically from your providers on first request, **`networkDefaults`** lets one block set shared policy for every chain, and a human-readable **`alias`** replaces `evm/42161` in every URL.
+
+**What you get:**
+- Any EVM chain or SVM (Solana) cluster, any provider — routes automatically on first request.
+- Any other JSON-RPC node (Bitcoin-family, Stellar, …) through the chain-agnostic `jsonrpc` passthrough — same failover, retries and rate limits, methods forwarded unchanged.
+- One `networkDefaults` block replaces repetitive per-chain config.
+- `alias: arbitrum` turns every URL into `/main/arbitrum` instead of `/main/evm/42161`.
+- Static canned replies for chains with non-standard genesis blocks.
+- In-flight deduplication so 100 identical concurrent requests cost you one upstream call.
+
+## Quick taste
+
+Illustrative, not a tuned production config — declare Ethereum with a human-readable alias:
+
+<ConfigTabs
+	path="projects[].networks[]"
+	focusYaml="7-8"
+  focusTs="6-7"
+	yaml={`projects:
+  - id: main
+    networks:
+      - architecture: evm
+        evm:
+          chainId: 1
+        # human-readable alias replaces evm/1 in every URL and metric label
+        alias: ethereum`}
+	ts={`projects: [{
+  id: "main",
+  networks: [{
+    architecture: "evm",
+    evm: { chainId: 1 },
+    // human-readable alias replaces evm/1 in every URL and metric label
+    alias: "ethereum",
+  }],
+}]`}
+/>
+
+## `eth_subscribe`
+
+Some JSON-RPC clients include `fromBlock: "0x0"` in the `eth_subscribe("logs", {…})` filter as a "from genesis" marker. `eth_subscribe` is a live-stream RPC — `fromBlock` has no standardised meaning there — and on backends that prune historical data the subscribe call fails outright. Enable `stripSubscribeFromBlockZero` on the network to drop the field before forwarding so the live stream succeeds; historical logs stay retrievable via `eth_getLogs` in the normal way.
+
+<Tabs items={["yaml", "typescript"]} defaultIndex={0} storageKey="GlobalConfigTypeTabIndex">
+  <Tabs.Tab>
+```yaml filename="erpc.yaml"
+projects:
+  - id: main
+    networks:
+      - architecture: evm
+        evm:
+          chainId: 1
+          # Drops fromBlock: "0x0" / "0" from eth_subscribe logs filters
+          # before forwarding to upstream WebSockets. Only a value that
+          # parses to zero is stripped — other fromBlocks pass through.
+          stripSubscribeFromBlockZero: true  # default: false
+```
+</Tabs.Tab>
+  <Tabs.Tab>
+```ts filename="erpc.ts"
+import { createConfig } from "@erpc-cloud/config";
+
+export default createConfig({
+  projects: [
+    {
+      id: "main",
+      networks: [
+        {
+          architecture: "evm",
+          evm: {
+            chainId: 1,
+            // Drops fromBlock: "0x0" / "0" from eth_subscribe logs filters
+            // before forwarding to upstream WebSockets. Only a value that
+            // parses to zero is stripped — other fromBlocks pass through.
+            stripSubscribeFromBlockZero: true,  // default: false
+          },
+        },
+      ],
+    },
+  ],
+});
+```
+</Tabs.Tab>
+</Tabs>
+
+Leave unset for chains where upstreams handle `fromBlock: "0x0"` in an `eth_subscribe` filter correctly (most do — the flag is a targeted workaround, not a universal default). It can also be set once for every network under `networkDefaults.evm`.
+
+## Future-block polling
+
+Clients that follow a chain by number (for example rollup nodes reading L1) poll `eth_getBlockByNumber` for the block after the head and treat `null` as "not produced yet". No upstream has that block, so each one returns `null` in turn and every poll walks every routed upstream, fallbacks included. Enable `shortCircuitFutureBlocks` to return `null` for a numbered `eth_getBlockByNumber` above the latest head of every upstream of the network (static availability caps included), without dispatching it. A block at or below the last head any upstream reported is still dispatched, and the request is dispatched as usual while any upstream's head is unknown. It is always on when `servedTip.enabledFor` includes `"latest"`.
+
+<Tabs items={["yaml", "typescript"]} defaultIndex={0} storageKey="GlobalConfigTypeTabIndex">
+  <Tabs.Tab>
+```yaml filename="erpc.yaml"
+projects:
+  - id: main
+    networks:
+      - architecture: evm
+        evm:
+          chainId: 1
+          # Returns null for eth_getBlockByNumber(N) when N is above every
+          # upstream's head, instead of asking each upstream.
+          # default: false
+          shortCircuitFutureBlocks: true
+```
+</Tabs.Tab>
+  <Tabs.Tab>
+```ts filename="erpc.ts"
+import { createConfig } from "@erpc-cloud/config";
+
+export default createConfig({
+  projects: [
+    {
+      id: "main",
+      networks: [
+        {
+          architecture: "evm",
+          evm: {
+            chainId: 1,
+            // Returns null for eth_getBlockByNumber(N) when N is above every
+            // upstream's head, instead of asking each upstream.
+            // default: false
+            shortCircuitFutureBlocks: true,
+          },
+        },
+      ],
+    },
+  ],
+});
+```
+</Tabs.Tab>
+</Tabs>
+
+The head is what eRPC last saw from the state poller and head subscriptions. A block an upstream produced after that gets `null` until eRPC sees it, so a client that learned of the block elsewhere (for example from the node's own `newHeads`) can briefly get `null` for a block that exists. Only enable it where heads arrive promptly, such as networks with WebSocket head subscriptions, and where clients retry a `null`.
+
+## Failover
+
+By default a request only reaches the upstreams the [selection policy](/config/projects/selection-policies) currently routes to; upstreams tagged `tier:fallback` join once the policy promotes them, which happens on its evaluation interval. `failover.onDefaultsExhausted` adds a per-request escape for the moments before that: when every routed upstream failed with an error that another upstream might not repeat, the same request is retried once on the `tier:fallback` upstreams it has not tried yet — even while the policy still keeps them cordoned.
+
+<Tabs items={["yaml", "typescript"]} defaultIndex={0} storageKey="GlobalConfigTypeTabIndex">
+  <Tabs.Tab>
+```yaml filename="erpc.yaml"
+projects:
+  - id: main
+    networkDefaults:
+      failover:
+        onDefaultsExhausted: true  # default: false
+    upstreams:
+      - endpoint: https://primary.example.com
+      - endpoint: https://backup.example.com
+        tags: ["tier:fallback"]
+```
+</Tabs.Tab>
+  <Tabs.Tab>
+```ts filename="erpc.ts"
+import { createConfig } from "@erpc-cloud/config";
+
+export default createConfig({
+  projects: [
+    {
+      id: "main",
+      networkDefaults: {
+        failover: { onDefaultsExhausted: true }, // default: false
+      },
+      upstreams: [
+        { endpoint: "https://primary.example.com" },
+        { endpoint: "https://backup.example.com", tags: ["tier:fallback"] },
+      ],
+    },
+  ],
+});
+```
+</Tabs.Tab>
+</Tabs>
+
+The escape:
+
+- escalates only on errors that are retryable toward the network — an error every upstream would return (e.g. an execution revert) is returned as-is;
+- treats an empty result as a miss only for a concrete block number the network should already have (see `evm.emptyResultConfidence`), so polling for a pending transaction receipt does not sweep the fallbacks;
+- skips fallbacks whose circuit breaker is open for the method, or that don't handle the method;
+- fires at most once per request, and never for consensus requests;
+- is counted in `erpc_network_fallback_escape_total{project,network,category}` — expect zero in steady state.
+
+The validation report warns when `onDefaultsExhausted` is enabled but no upstream is tagged `tier:fallback`.
+
+## Agent reference
+
+Copy one of these prompts into your AI agent session (Claude Code, Cursor, …) — each one
+points the agent at this page's machine-readable reference so it can do the work correctly:
+
+<PromptExample
+	n={1}
+	title="add multiple chains with shared policy"
+	defaultOpen
+	prompt={`I'm running eRPC for several EVM chains and want to declare Ethereum mainnet,
+Arbitrum, and Base in a single project. Set human-readable aliases (e.g. "ethereum",
+"arbitrum", "base"), share a common rate-limit budget and failsafe via networkDefaults,
+and keep per-chain blocks minimal. Work with my existing eRPC config. Read the full reference
+first: https://docs.erpc.cloud/config/projects/networks.llms.txt`}
+/>
+
+<PromptExample
+	n={2}
+	title="tune getLogs limits and splitting"
+	prompt={`My eRPC instance is hitting "block range too large" errors from upstreams on
+eth_getLogs. Adjust getLogsMaxAllowedRange for my Ethereum mainnet network, enable
+automatic range splitting on errors, and set a safe concurrency cap so sub-requests
+don't flood the provider. Work with my existing eRPC config. Reference:
+https://docs.erpc.cloud/config/projects/networks.llms.txt`}
+/>
+
+<PromptExample
+	n={3}
+	title="fix backward tip jumps in multi-pod deployment"
+	prompt={`My clients occasionally see older block numbers between requests, which I think
+means different eRPC pods are returning different "latest" tips. Enable cluster-min
+served tip for the "latest" axis on my production chains so all pods agree on the
+served tip. Work with my existing eRPC config. Reference:
+https://docs.erpc.cloud/config/projects/networks.llms.txt`}
+/>
+
+<PromptExample
+	n={4}
+	title="disable validation for a non-standard chain"
+	prompt={`I'm adding zkSync Era to eRPC and eth_getBlockByNumber responses from zkSync use a
+non-standard transactionsRoot — the data-integrity module is rejecting them. For the
+zkSync network only, make sure data-integrity is off (or disable the transactionsRoot
+checks via the integrity block) without touching the global policy. Work with my existing
+eRPC config. Reference: https://docs.erpc.cloud/config/projects/networks.llms.txt`}
+/>
+
+<PromptExample
+	n={5}
+	title="debug 503 on a newly added chain"
+	prompt={`I added a new chain to eRPC's networks list but requests are returning HTTP 503
+with ErrNetworkInitializing. Walk me through what the bootstrap task does, what
+conditions produce 503 vs 404, and which config keys to check first (providers,
+onlyNetworks/ignoreNetworks, rateLimitBudget). Work with my existing eRPC config. Reference:
+https://docs.erpc.cloud/config/projects/networks.llms.txt`}
+/>
+
+<AISection title="Networks — full agent reference">
+
+### How it works
+
+**Architecture concept.** `NetworkArchitecture` is a string enum with three valid values: `"evm"`, `"svm"` and `"jsonrpc"` (<SourceLink file="common/network.go" />). The canonical id is `evm:<chainId>` from `util.EvmNetworkId`, `svm:<cluster>` / `svm:<chain>:<cluster>` from `util.SvmNetworkId`, or `jsonrpc:<id>` from `util.JsonRpcNetworkId` (<SourceLink file="util/ids.go" />). The `network` Prometheus label equals the alias when set, otherwise the raw id.
+
+`architecture` is inferred when omitted: a network carrying an `svm` block derives `architecture: svm`, one carrying a `jsonRpc` block derives `jsonrpc`, one carrying `evm` (or none of them) derives `evm` (<SourceLink file="common/defaults.go" lines="2010-2028" />). Declaring `architecture: svm` auto-creates an empty `svm` block, and `networkDefaults.evm` is never injected into an SVM or jsonrpc network. See [SvmNetworkConfig](#projectsnetworkssvm--svmnetworkconfig) below and the [SVM reference pages](/reference/svm/commitment).
+
+**Generic JSON-RPC passthrough (`jsonrpc`).** For JSON-RPC nodes that are neither EVM nor SVM, `architecture: jsonrpc` gives the network the generic pipeline — upstream selection, failsafe policies (retry, hedge, timeout, circuit breaker, consensus), rate limiting, multiplexing, metrics, healthcheck — with no chain model at all: no chain-id or genesis detection at bootstrap, no state poller, no request normalization and no per-method hooks (its `ArchitectureHandler` is a no-op, <SourceLink file="architecture/jsonrpc/handler.go" />). Every method is forwarded to the selected upstream unchanged, except that empty `params` are left out by default (`upstreams[].jsonRpc.omitEmptyParams`). Upstreams join a `jsonrpc:<id>` network by declaring `type: jsonrpc` and the same id in `jsonRpc.networkId` (see [Upstreams](/config/projects/upstreams)); they use the regular HTTP(S) and WebSocket JSON-RPC clients, while gRPC endpoints are rejected. Because there is no block or slot model, responses are not cached and finality is `unknown` unless `methods.definitions` marks a method `finalized` or `realtime`. Upstream errors fall through to the default extractor, which maps HTTP status codes and standard JSON-RPC error codes into eRPC's error taxonomy.
+
+**Lazy creation.** `NetworksRegistry.GetNetwork` fast-paths a `sync.Map` lookup; on miss it validates the id format and schedules a bootstrap task. The task: (1) resolves or synthesizes a `NetworkConfig` and runs `SetDefaults` so it inherits `networkDefaults` exactly like static networks; (2) calls `PrepareUpstreamsForNetwork` — fans out to every configured provider, polls 200 ms for up to 30 s until ≥1 upstream is ready; (3) wires the cache DAL; (4) registers with the selection-policy engine. Statically-declared networks bootstrap in background at startup through the same machinery; a failed eager bootstrap is retried when the first request arrives.
+
+**Forward pipeline order** (exact sequence, `erpc/networks.go:L931-1603`):
+1. Apply `directiveDefaults` + start OTel span.
+2. **Static response** match — returns immediately if hit (before multiplexer, cache, upstreams).
+3. **Multiplexer** — leader/follower on `CacheHash`; followers copy the leader's response.
+4. **Cache read** — non-null hit closes the mux and returns.
+5. **Policy-engine upstream ordering** — falls back to registration order if empty; `ErrNoUpstreamsFound` (404) if still empty.
+6. EVM pre-forward hook (future-block short-circuit; never cached).
+7. Stateful-method guard, network rate-limit, request normalization.
+8. **Failsafe executor selection** — first config-order entry matching method + finality.
+9. **Upstream sweep** — per-upstream block-availability gate, hedge/retry orchestration.
+10. Post-sweep: timeout translation, last-valid-response fallback, async cache set, misbehavior accounting.
+
+**networkDefaults inheritance** (`common/defaults.go:L1781-1973`). "Network wins; defaults fill gaps." Scalars inherit when zero-valued; pointers when nil. `selectionPolicy` and `directiveDefaults` are whole-struct copies (no per-field merge). `evm` is a whole-struct copy when absent from the network, otherwise per-field fill for 14 named fields. Failsafe: if the network has entries, each is matched against the first compatible default (wildcard method + finality) and missing sub-fields are inherited; if the network has no entries the defaults list is deep-copied wholesale.
+
+**Finality classification** (`erpc/networks.go:L1645-1743`). Explicit `finalized`/`realtime` flags in `methods.definitions` win. Otherwise the block ref/number is extracted from the request, then from the response body (for hash-keyed cache hits). Non-numeric tags → `realtime`; numeric blocks are checked via `EvmIsBlockFinalized` on the serving upstream, then the last upstream tried, then the network-wide lowest-finalized heuristic.
+
+**Served tip.** Default ("max mode"): `EvmHighestLatestBlockNumber` / `EvmHighestFinalizedBlockNumber` return the MAX across policy-eligible, non-syncing upstreams. Setting `evm.servedTip.enabledFor` switches that axis to a cluster-min, cross-pod monotonic counter. Rollback tolerance is 1024 blocks (`DefaultToleratedBlockHeadRollback`, [`architecture/evm/evm_state_poller.go:L27`](https://github.com/erpc/erpc/blob/main/architecture/evm/evm_state_poller.go#L27)). A `use-upstream` selector produces a per-group scoped tip keyed by the SHA-256 (first 8 bytes, hex-encoded) of the sorted matched upstream-id set; unmatched selectors compute a stateless min and emit no gauges. Group partitions are capped at 16 (`maxServedTipPartitions`); a "simple" group selector must be ≤128 chars, no whitespace, at most one leading `!`, and the matched set must be ≥2 upstreams and less than all upstreams. Syncing upstreams are excluded from every head computation (max mode, cluster mode, lowest-finalized, and guaranteed-method floors). `EvmLeaderUpstream` returns the upstream with the highest raw `LatestBlock()`; `EvmLowestFinalizedBlockNumber` returns the min positive effective finalized across non-syncing upstreams.
+
+### Config schema
+
+#### `projects[].networks[]` — NetworkConfig
+
+| Field | Type | Default | Behavior / footguns |
+|---|---|---|---|
+| `architecture` | `string` (`evm` \| `svm` \| `jsonrpc`) | Inferred from the sub-block: `svm` present → `"svm"`, `jsonRpc` present → `"jsonrpc"`, otherwise `"evm"` (<SourceLink file="common/defaults.go" lines="2010-2028" />) | `evm`, `svm` and `jsonrpc` are valid (<SourceLink file="common/network.go" />). Required by validation. |
+| `evm` | `EvmNetworkConfig` | Auto-created empty struct for EVM networks (<SourceLink file="common/defaults.go" lines="1914-1916" />); never injected into an SVM network | See EvmNetworkConfig table below. |
+| `svm` | `SvmNetworkConfig` | Auto-created empty struct when `architecture: svm` (<SourceLink file="common/defaults.go" lines="2026-2028" />) | Required for SVM networks — `network.*.svm is required for svm networks` otherwise. See SvmNetworkConfig table below. |
+| `jsonRpc` | `JsonRpcNetworkConfig` | Auto-created when `architecture: jsonrpc`; `id` defaults to `alias` | Required for jsonrpc networks (an `alias` is enough) — `network.*.jsonRpc.id (or network.*.alias) is required for jsonrpc networks` otherwise. See JsonRpcNetworkConfig table below. |
+| `alias` | `string` | `""` | Charset `[a-zA-Z0-9_-]+` (<SourceLink file="common/validation.go" lines="1264-1269" />); unique per project (<SourceLink file="common/validation.go" lines="622-627" />). Used as the `network` metric label via `Network.Label()` (<SourceLink file="erpc/networks.go" lines="278-286" />). Aliases work in URL path only — not in body `networkId`. |
+| `cacheKeySuffix` | `string` | `""`; inherits `networkDefaults.cacheKeySuffix` when empty (<SourceLink file="common/defaults.go" lines="2107-2109" />) | Inserted into the JSON-RPC cache partition key as `{networkId}:{suffix}:{blockRef}` so two networks that share a chainId and a Redis do not collide. Empty keeps `{networkId}:{blockRef}`. Charset `[a-zA-Z0-9_-]+` (same as alias); `:` is rejected. Not unique — many networks may share `systx`. When `{networkId}:{suffix}` is itself a valid network id (`svm:<cluster>` plus a suffix), colons in the network id are escaped so that partition cannot be read as the longer network; unsuffixed keys and EVM suffixed keys are unchanged. Reverse-index wildcard is `{networkId}:{suffix}:*` (same helper as the main key), so hash-keyed / tag reads are isolated even when the block ref contains `:`. |
+| `rateLimitBudget` | `string` | `""` (none); inherits `networkDefaults.rateLimitBudget` when empty (<SourceLink file="common/defaults.go" lines="1783-1785" />) | Must reference an existing budget. Enforced per-request before upstream contact → `ErrNetworkRateLimitRuleExceeded`. |
+| `failsafe[]` | `[]FailsafeConfig` | `nil`; inherited/merged from `networkDefaults.failsafe` | One `networkExecutor` per entry + a no-op catch-all (<SourceLink file="erpc/networks_registry.go" lines="115-138" />). Selection: first config-order match on `matchMethod` wildcard + `matchFinality` (<SourceLink file="erpc/networks.go" lines="907-929" />). Old single-object YAML auto-converted to a one-element list with `matchMethod: "*"`. |
+| `selectionPolicy` | `SelectionPolicyConfig` | `nil`; inherited wholesale from `networkDefaults.selectionPolicy` when nil (<SourceLink file="common/defaults.go" lines="1833-1836" />) | Auto-attached when any upstream has tag `tier:fallback` (<SourceLink file="common/defaults.go" lines="1932-1940" />). See [Selection & scoring](/config/projects/selection-policies). |
+| `directiveDefaults` | `DirectiveDefaultsConfig` | Always materialized (<SourceLink file="common/defaults.go" lines="1947-1950" />); inherited wholesale from `networkDefaults.directiveDefaults` when nil (<SourceLink file="common/defaults.go" lines="1837-1840" />) | **Footgun**: a network that sets ANY `directiveDefaults` field ignores `networkDefaults.directiveDefaults` entirely — no per-field merge. Applied at request start (<SourceLink file="erpc/networks.go" lines="937" />). |
+| `multiplexing` | `*bool` | `nil` = enabled (<SourceLink file="common/config.go" lines="2034-2039" />); inherits `networkDefaults.multiplexing` when nil (<SourceLink file="common/defaults.go" lines="1841-1844" />) | Gates in-flight identical-request dedup. **Footgun**: legacy single-object `networkDefaults.failsafe` YAML drops this field silently (old struct has no `Multiplexing` field, <SourceLink file="common/config.go" lines="626-655" />). |
+| `staticResponses[]` | `[]StaticResponseConfig` | `nil` | Checked before multiplexer, cache, upstreams (<SourceLink file="erpc/networks.go" lines="976-981" />). See [Static responses](/config/projects/static-responses). |
+| `staticResponses[].method` | `string` | required | Exact JSON-RPC method name; case-sensitive string equality (<SourceLink file="common/validation.go" lines="1282-1284" />). |
+| `staticResponses[].params` | `[]any` | `nil` | `nil` and `[]` are interchangeable in matching (both have `len==0`). YAML `params: []` deserializes to non-nil empty slice; omitted `params:` deserializes to nil — both match requests with zero params. Hex strings (`"0x0"` vs `"0x00"`) are NOT normalized — exact string match only. Declaration order matters: first match wins. |
+| `staticResponses[].response.result` | `any` | — | Exactly one of `result` or `error` must be set; both or neither → startup error. |
+| `staticResponses[].response.error.code` | `int` | `0` | No minimum/maximum enforced. **Footgun**: code `0` passes validation but is omitted from the wire JSON (`json:"code,omitempty"` on `int`, <SourceLink file="common/errors.go" lines="2226" />). Always set a non-zero code in production. |
+| `staticResponses[].response.error.message` | `string` | required when error set | Non-empty string required; `Validate()` returns `"response.error.message is required"` otherwise. |
+| `staticResponses[].response.error.data` | `any` | `nil` | Optional arbitrary extra data; omitted from JSON when nil. |
+| `methods.preserveDefaultMethods` | `bool` | `false` | **Critical footgun**: `false` + any `definitions` entries → ALL built-in methods (hundreds, including `eth_call`, `eth_getLogs`) are silently replaced by only your custom entries plus stateful markers. `false` + no `definitions` → all built-ins kept (same as omitting the block). `true` + any `definitions` → built-ins copied first, then user entries merged on top (<SourceLink file="common/defaults.go" lines="493-576" />). |
+| `methods.definitions` | `map[string]CacheMethodConfig` | Full built-in table (<SourceLink file="common/defaults.go" lines="493-528" />) | Per-method fields: `finalized`, `realtime`, `stateful`, `reqRefs`, `respRefs`, `translateLatestTag`, `translateFinalizedTag`, `enforceBlockAvailability`. |
+| `methods.definitions.<m>.finalized` | `bool` | `false` (true for static-cache methods) | **Footgun**: setting `true` on a non-finalized method (e.g. `eth_getBalance`) permanently caches ALL responses from that method with long/permanent TTL — a severe data-correctness bug (<SourceLink file="erpc/networks.go" lines="1656-1660" />). |
+| `methods.definitions.<m>.realtime` | `bool` | `false` (true for `eth_blockNumber` and similar) | Forces `GetFinality` → `Realtime`; responses use the realtime cache policy (short TTL). |
+| `methods.definitions.<m>.stateful` | `bool` | `true` for `DefaultStatefulMethodNames`, else `false` | **Footgun**: `stateful: false` on any of the 6 built-in stateful methods (`eth_newFilter`, `eth_newBlockFilter`, `eth_newPendingTransactionFilter`, `eth_getFilterChanges`, `eth_getFilterLogs`, `eth_uninstallFilter`) is silently overridden to `true` with no warning (<SourceLink file="common/defaults.go" lines="512-519" />). |
+| `methods.definitions.<m>.translateLatestTag` | `*bool` | `nil` = enabled | `nil`/`true` → `"latest"` tag replaced with current block hex before forwarding and cache keying. `false` → tag passed through unchanged. `eth_getBlockByNumber` ships with `false` so it can discover new blocks. **Footgun**: `false` on a changing method means all callers share one `"latest"` cache key; stale data returned until TTL expires (<SourceLink file="common/config.go" lines="307-309" />). |
+| `methods.definitions.<m>.translateFinalizedTag` | `*bool` | `nil` = enabled | Same as `translateLatestTag` for the `"finalized"` tag (<SourceLink file="common/config.go" lines="310-312" />). |
+| `methods.definitions.<m>.enforceBlockAvailability` | `*bool` | `nil` (inherit) | Per-method override; highest priority in the 5-step enforcement chain (<SourceLink file="erpc/networks.go" lines="1806-1813" />). |
+
+#### `projects[].networks[].evm` — EvmNetworkConfig
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `chainId` | `int64` | — (no default) | Drives `networkId = "evm:<chainId>"`. Not validated &gt; 0 for networks; `chainId: 0` yields `evm:0`. |
+| `fallbackFinalityDepth` | `int64` | `1024` (<SourceLink file="common/defaults.go" lines="1975" />) | Used when an upstream doesn't expose the `finalized` tag. Must be &gt; 0 after defaults. |
+| `fallbackStatePollerDebounce` | `Duration` | `5s` (<SourceLink file="common/defaults.go" lines="1976" />) | Static debounce for block polling until dynamic block time is learned. Must be &gt; 0. |
+| `dynamicBlockTimeDebounceMultiplier` | `*float64` | `0.7` (<SourceLink file="common/defaults.go" lines="1977" />) | Polling debounce = EMA block time × multiplier. Lower → more aggressive polling (fresher data, more upstream load). |
+| `blockUnavailableDelayMultiplier` | `*float64` | `1.0` (<SourceLink file="common/defaults.go" lines="1978" />) | Retry delay for block-unavailable = EMA block time × multiplier. |
+| `enforceBlockAvailability` | `*bool` | `nil` (defer; fallback = enabled) | Network-level priority 2 in 5-step chain. `nil` defers to upstream bounds and system defaults. `false` disables enforcement even when an upstream has explicit bounds configured. |
+| `maxRetryableBlockDistance` | `*int64` | `nil` → `128` at use site (<SourceLink file="erpc/networks.go" lines="1973-1979" />) | Block-unavailable errors within this distance of upstream head are retryable; beyond → non-retryable skip. |
+| `getLogsMaxAllowedRange` | `int64` | `30_000` (<SourceLink file="common/defaults.go" lines="2092-2094" />) | Hard limit on `eth_getLogs` block range. Must be &gt; 0; `0` inherits defaults value. |
+| `getLogsMaxAllowedAddresses` | `int64` | `0` = unlimited | Enforced only when &gt; 0 (<SourceLink file="architecture/evm/eth_getLogs.go" lines="212" />). |
+| `getLogsMaxAllowedTopics` | `int64` | `0` = unlimited | Enforced only when &gt; 0. |
+| `getLogsSplitOnError` | `*bool` | `true` (<SourceLink file="common/defaults.go" lines="2095-2097" />) | Retry by bisecting range on "too many results" errors. |
+| `getLogsSplitConcurrency` | `int` | `10` (<SourceLink file="common/defaults.go" lines="2098-2100" />) | Parallelism cap for split sub-requests. |
+| `traceFilterSplitOnError` | `*bool` | `nil` = **off** (deliberate opt-in, <SourceLink file="common/defaults.go" lines="2102-2104" />) | Opt-in bisecting for `trace_filter`/`arbtrace_filter`. |
+| `traceFilterSplitConcurrency` | `int` | `10` (<SourceLink file="common/defaults.go" lines="2105-2107" />) | Parallelism cap for trace-filter splits. |
+| `idempotentTransactionBroadcast` | `*bool` | `nil` = **enabled** (<SourceLink file="architecture/evm/eth_sendRawTransaction.go" lines="27-36" />) | "Already known"/"nonce too low"-verified errors become success-with-tx-hash, making retry/hedge safe for `eth_sendRawTransaction`. |
+| `markEmptyAsErrorMethods` | `[]string` | `eth_blockNumber`, `eth_getBlockByNumber`, `eth_getTransactionByHash`, and 8 others (<SourceLink file="common/defaults.go" lines="2044-2057" />) | Methods where empty response = error (retried, upstream scored down). `eth_getTransactionReceipt` deliberately excluded. |
+| `emptyResultConfidence` | `blockHead` \| `finalizedBlock` | `blockHead` (<SourceLink file="common/defaults.go" lines="2075-2079" />) | How confirmed a block must be for empty point-lookups to be retried as missing data. |
+| `shortCircuitFutureBlocks` | `*bool` | `nil` = **off**; inherited from `networkDefaults.evm` (<SourceLink file="common/defaults.go" lines="2283-2285" />) | Returns `null` for a numbered `eth_getBlockByNumber` above the highest latest head across every upstream of the network (static caps included; selection policy, tier and syncing state ignored), without dispatching. Fails open while any upstream's head is unknown. Uses latest heads regardless of `emptyResultConfidence`. Always on when `servedTip.enabledFor` includes `latest` (<SourceLink file="common/config.go" lines="2777-2785" />). Does not change what `latest` resolves to. |
+| `safeBlockSource` | `string` (upstream selector) | `""` = inherit or provider-defined routing | Routes standard block-tagged JSON-RPC requests carrying `safe` to matching upstreams and skips cache reads. The tag stays verbatim so those upstreams define both height and hash. Operator routing overrides client `use-upstream`; retry/consensus still applies inside the matching pool. An empty network value inherits `networkDefaults.evm.safeBlockSource` when present. Does not affect `eth_query*` or direct gRPC Query APIs. |
+| `evm.integrity.enforceHighestBlock` | `*bool` | `true` (<SourceLink file="common/defaults.go" lines="2117-2120" />) | **Deprecated** — migrated into `directiveDefaults.enforceHighestBlock` at `SetDefaults` time when the directive is unset (<SourceLink file="common/defaults.go" lines="1952-1966" />). Prefer `directiveDefaults.enforceHighestBlock`. |
+| `evm.integrity.enforceGetLogsBlockRange` | `*bool` | `true` (<SourceLink file="common/defaults.go" lines="2121-2123" />) | **Deprecated** — same migration path as `enforceHighestBlock`. |
+| `evm.integrity.enforceNonNullTaggedBlocks` | `*bool` | `true` (<SourceLink file="common/defaults.go" lines="2124-2126" />) | **Deprecated** — same migration path. |
+| `maxFutureBlockRetryDistance` | `*int64` | `nil` | **Deprecated** — warned about and set to nil in `SetDefaults` (<SourceLink file="common/defaults.go" lines="2080-2083" />). Has no effect; remove from configs. |
+| `servedTip` | `EvmServedTipConfig` | `nil` = max mode | Copied wholesale from `networkDefaults.evm.servedTip` when nil. |
+| `servedTip.enabledFor` | `[]string` | `[]` (max mode) | Valid: `latest`, `finalized`, `safe`. Listing a tag switches that axis from max-across-upstreams to cluster-min + monotonic clamp via shared state. |
+| `servedTip.clusterDelta` | `int64` | `0` = auto-derive from EMA block time, clamped `[2, 10]` | Must be ≥ 0. |
+| `servedTip.guaranteedMethods` | `[]string` (glob) | `[]` | Global tip clamped to per-method supporting-set floor (<SourceLink file="erpc/networks.go" lines="643-649" />). |
+
+#### `projects[].networks[].svm` — SvmNetworkConfig
+
+| Field | Type | Default | Behavior / footguns |
+|---|---|---|---|
+| `cluster` | `string` | `""` (required) | The cluster these upstreams serve — `mainnet-beta`, `devnet`, `testnet`, or a fork's own cluster name. Together with `chain` it forms the network id. **This is network identity** (the SVM analogue of `evm.chainId`) and is therefore **not** inherited from `networkDefaults.svm`. |
+| `chain` | `string` | `""` → treated as `"solana"` | Which SVM chain this network runs on. Set it explicitly for forks and variants (`fogo`, `eclipse`) so several SVM chains can be hosted side by side without network-id or cache-key collisions. Inherited from `networkDefaults.svm.chain`. |
+| `commitment` | `string` | `""` — **no default** | One of `finalized`, `confirmed`, `processed`. When unset nothing is injected and each node applies its own default (Solana's is `finalized`), so a deviating vendor can disagree on identical requests. Serving and routing assume that documented default; cacheability stays stricter — unpinned slot-addressed reads classify `unfinalized`. Setting it pins one level across the pool so the cache and consensus compare like-for-like. Details: [Commitment & finality](/reference/svm/commitment). |
+| `statePollerDebounce` | Duration | `400ms` (one slot) (<SourceLink file="common/defaults.go" lines="2237-2243" />) | Minimum interval between poll fan-outs of an upstream's slot/health view. A **gate**, not the ticker period — the ticker stays pinned at 400 ms, so values below it have no effect. Raising it widens the `getBlock` availability guard's staleness margin proportionally. |
+| `maxFinalizedSlotLag` | `*int64` | `100` slots ≈ 40 s (<SourceLink file="common/defaults.go" lines="2244-2251" />) | Bounds how far an upstream's finalized slot may trail the pool reference before it is excluded from **consensus voting on finalized data**. Applied only when a consensus policy is active AND the request's resolved finality is `Finalized`. **Tri-state**: omitted → `100`; explicit `0` → filter **disabled**; `>0` → that value. The field is a pointer precisely so an explicit `0` is distinguishable from "unset" — a plain integer would collapse the two and make the documented disable switch unreachable. |
+| `enforceBlockAvailability` | `*bool` | `nil` → `true` (materialized at read time by `SvmEnforceBlockAvailability()`, <SourceLink file="erpc/networks.go" lines="1487-1494" />) | Gates the `getBlock`/`getConfirmedBlock` guard that short-circuits requests for slots above the pool's highest indexed slot, saving quota and firing the indexing-lag retry immediately, **and** any operator-declared `upstreams[*].svm.blockAvailability` window. It does **not** enable a history-floor skip by itself: the floor (`getBlocksWithLimit(0, 1)`) is probed only for upstreams that declare a `firstAvailableSlotPlus` bound, and there is no always-on floor or pool-level `-32009`. Set `false` when shred-insert tracking is unavailable or unreliable on a deployment. An explicit `false` in `networkDefaults.svm` **is** honored. |
+
+Not present on `SvmNetworkConfig`: there is no `maxSlotsPerSignaturesQuery`. An early design proposed one as an analogue of EVM's `getLogs` range cap, but `getSignaturesForAddress` is bounded by signature cursors (`before`/`until`), not by a slot range, so the key described semantics Solana does not have and was removed. `minContextSlot` is a node-freshness floor — the minimum bank slot at which a request may be *evaluated* — not a lower bound on returned history, so it cannot serve as a range cap either.
+
+**Cluster and genesis-hash validation.** Known `(chain, cluster)` pairs — currently Solana `mainnet-beta`, `devnet`, and `testnet` — have their genesis hash validated at bootstrap by a single `getGenesisHash` call compared against a hardcoded table. Both a mismatch and a *fetch failure* fail the upstream, so a node mis-pointed at the wrong cluster never joins the pool. For unknown clusters (forks, private clusters) the same check runs only when the upstream sets `svm.checkGenesisHash: true`. `getGenesisHash` itself is then answered from the table with no upstream round-trip, mirroring EVM's `eth_chainId` short-circuit.
+
+#### `projects[].networks[].jsonRpc` — JsonRpcNetworkConfig
+
+| Field | Type | Default | Behavior / footguns |
+|---|---|---|---|
+| `id` | `string` | the network's `alias` | Network slug; the network id is `jsonrpc:<id>`. Charset `[a-zA-Z0-9_-]+` (same as `alias`; `:` and `.` are rejected). **This is network identity**: upstreams are matched to the network by `jsonRpc.networkId == id`. |
+
+There is no `networkDefaults.jsonRpc`: the passthrough has no tunables beyond the generic network fields (`failsafe`, `selectionPolicy`, `rateLimitBudget`, `methods`, …), which inherit from `networkDefaults` as usual.
+
+#### `projects[].networks[].directiveDefaults` — DirectiveDefaultsConfig
+
+| Field | Type | Default |
+|---|---|---|
+| `retryEmpty` | `*bool` | `nil` |
+| `retryPending` | `*bool` | `nil` |
+| `skipCacheRead` | `bool\|string` | `nil` |
+| `useUpstream` | `*string` | `nil` |
+| `skipInterpolation` | `*bool` | `nil` |
+| `skipConsensus` | `*bool` | `nil` |
+| `enforceHighestBlock` | `*bool` | **`true`** (<SourceLink file="common/defaults.go" lines="1458-1460" />) |
+| `enforceGetLogsBlockRange` | `*bool` | **`true`** (<SourceLink file="common/defaults.go" lines="1461-1463" />) |
+| `enforceNonNullTaggedBlocks` | `*bool` | **`true`** (<SourceLink file="common/defaults.go" lines="1464-1466" />) |
+
+> **Data-integrity validation** is configured under `networks[].integrity` (not `directiveDefaults`) — an opt-in `level`/`checks`/`profiles` block. The deprecated per-check flags (`validateLogsBloomMatch`, `enforceLogIndexStrictIncrements`, `validateTransactionsRoot`, …) are translated into it at startup. See [Integrity checks](/config/failsafe/integrity).
+
+#### `projects[].networkDefaults` — NetworkDefaults
+
+| Field | Type | Default | Inheritance rule |
+|---|---|---|---|
+| `rateLimitBudget` | `string` | `""` | Copied when network's value is empty string (<SourceLink file="common/defaults.go" lines="1783-1785" />). Validated after inheritance per network — an invalid name surfaces as a per-network error (e.g. `"network.*.rateLimitBudget 'x' does not exist"`), not a top-level `networkDefaults` error. Networks that explicitly set their own non-empty `rateLimitBudget` are not affected. |
+| `cacheKeySuffix` | `string` | `""` | Copied when network's value is empty string (<SourceLink file="common/defaults.go" lines="2107-2109" />). Same charset as `alias`. Not unique. |
+| `failsafe[]` | `[]FailsafeConfig` | `nil` | Network has none → deep-copied wholesale. Network has some → per-entry merge from the FIRST compatible default (wildcard method + finality match); break on first match (<SourceLink file="common/defaults.go" lines="1793-1832" />). |
+| `selectionPolicy` | `SelectionPolicyConfig` | `nil` | Shallow-copied when network's is nil (<SourceLink file="common/defaults.go" lines="1833-1836" />). |
+| `directiveDefaults` | `DirectiveDefaultsConfig` | `nil` | Shallow-copied when network's is nil — **no per-field merge** (<SourceLink file="common/defaults.go" lines="1837-1840" />). |
+| `evm` | `EvmNetworkConfig` | `nil` | Struct-copied wholesale when network has no `evm` block — **except onto SVM and jsonrpc networks, which never receive it**. Otherwise per-field fill for: `integrity`, `fallbackStatePollerDebounce`, `dynamicBlockTimeDebounceMultiplier`, `blockUnavailableDelayMultiplier`, `fallbackFinalityDepth`, `getLogsMaxAllowed*`, `getLogs*`, `traceFilter*`, `servedTip`, `emptyResultConfidence`, `shortCircuitFutureBlocks`. NOT inherited individually: `chainId`, `enforceBlockAvailability`, `maxRetryableBlockDistance`, `markEmptyAsErrorMethods`, `idempotentTransactionBroadcast` (<SourceLink file="common/defaults.go" lines="1845-1889" />). |
+| `svm` | `SvmNetworkConfig` | `nil` | Per-field fill: `chain`, `commitment`, `statePollerDebounce`, `maxFinalizedSlotLag`, `enforceBlockAvailability` (<SourceLink file="common/defaults.go" lines="2197-2221" />). **`cluster` is deliberately NOT inherited** — it is network identity, and inheriting it would let two networks alias one another. The two pointer fields are tested for `nil`, not for their zero value, so an explicit `maxFinalizedSlotLag: 0` or `enforceBlockAvailability: false` set here survives the merge. |
+| `multiplexing` | `*bool` | `nil` | Value-copied when network's `multiplexing` is nil (<SourceLink file="common/defaults.go" lines="1841-1844" />). No deep merge — a network must set its own `multiplexing` to deviate from the project-wide default. |
+
+Note: `networkDefaults` has **no** `alias`, `methods`, `staticResponses`, or `architecture` fields — those are per-network only. `cacheKeySuffix` *is* inherited.
+
+#### `server.aliasing.rules[]` — domain-based aliasing
+
+| Field | Type | Default | Behavior |
+|---|---|---|---|
+| `rules[]` | list | `nil`; auto-created `{matchDomain: "*", serveProject: "main"}` when config has zero projects (<SourceLink file="common/defaults.go" lines="100-110" />) | First rule whose `matchDomain` wildcard matches the request Host wins (<SourceLink file="erpc/http_server.go" lines="232-257" />). |
+| `rules[].matchDomain` | `string` (wildcard) | — | Matched against Host header (port stripped). |
+| `rules[].serveProject` | `string` | — | Pre-selects projectId. |
+| `rules[].serveArchitecture` | `string` | — | Pre-selects architecture. |
+| `rules[].serveChain` | `string` | — | Pre-selects chainId. Pre-selecting project+chain WITHOUT architecture is rejected at parse time. |
+
+### Worked examples
+
+All patterns below are distilled from real production fleets; comments explain the
+non-obvious choices.
+
+**1. The production baseline: `networkDefaults` with finality-split failsafe policies.** Block-availability races on realtime/unfinalized requests need a non-zero retry delay; finalized/unknown don't — this is why production splits them:
+
+<ConfigTabs
+  path="projects[].networkDefaults"
+  yaml={`projects:
+  - id: main
+    networkDefaults:
+      # All chains inherit these unless they set their own failsafe list
+      directiveDefaults:
+        retryEmpty: true
+        retryPending: false
+      # multiplexing: false in production to avoid follower-timeout amplification
+      # on chains where every block is a write (e.g. high-throughput L2s)
+      multiplexing: false
+      evm:
+        getLogsMaxAllowedRange: 30000
+        getLogsSplitOnError: true
+        # cluster-min tip on "latest" prevents backward tip jumps across pods
+        servedTip:
+          enabledFor: [latest]
+      failsafe:
+        # NOTE: delay MUST NOT be 0 for realtime/unfinalized — a short non-zero
+        # delay gives shared-state propagation time to catch up after a block
+        # arrives on one upstream but not yet on another
+        - matchMethod: "eth_call|eth_getLogs"
+          matchFinality: [realtime, unfinalized]
+          hedge:
+            quantile: 0.95
+            maxCount: 1
+            minDelay: 500ms
+            maxDelay: 10s
+          retry:
+            maxAttempts: 4
+            delay: 50ms
+        - matchMethod: "eth_call|eth_getLogs"
+          matchFinality: [finalized, unknown]
+          hedge:
+            quantile: 0.95
+            maxCount: 1
+            minDelay: 500ms
+            maxDelay: 10s
+          retry:
+            maxAttempts: 4
+            delay: 0
+        - matchMethod: "*"
+          retry:
+            maxAttempts: 6
+            delay: 50ms
+    networks:
+      - architecture: evm
+        evm: { chainId: 1 }
+        alias: ethereum
+      - architecture: evm
+        evm: { chainId: 42161 }
+        alias: arbitrum`}
+  ts={`projects: [{
+  id: "main",
+  networkDefaults: {
+    directiveDefaults: { retryEmpty: true, retryPending: false },
+    // multiplexing: false in production to avoid follower-timeout amplification
+    multiplexing: false,
+    evm: {
+      getLogsMaxAllowedRange: 30000,
+      getLogsSplitOnError: true,
+      // cluster-min tip on "latest" prevents backward tip jumps across pods
+      servedTip: { enabledFor: ["latest"] },
+    },
+    failsafe: [
+      // NOTE: delay MUST NOT be 0 for realtime/unfinalized — non-zero delay
+      // gives shared-state propagation time after a block arrives on one upstream
+      {
+        matchMethod: "eth_call|eth_getLogs",
+        matchFinality: ["realtime", "unfinalized"],
+        hedge: { quantile: 0.95, maxCount: 1, minDelay: "500ms", maxDelay: "10s" },
+        retry: { maxAttempts: 4, delay: "50ms" },
+      },
+      {
+        matchMethod: "eth_call|eth_getLogs",
+        matchFinality: ["finalized", "unknown"],
+        hedge: { quantile: 0.95, maxCount: 1, minDelay: "500ms", maxDelay: "10s" },
+        retry: { maxAttempts: 4, delay: "0" },
+      },
+      { matchMethod: "*", retry: { maxAttempts: 6, delay: "50ms" } },
+    ],
+  },
+  networks: [
+    { evm: { chainId: 1 }, alias: "ethereum" },
+    { evm: { chainId: 42161 }, alias: "arbitrum" },
+  ],
+}]`}
+/>
+
+**2. Per-chain bespoke policy appended before the shared catch-all.** Ethereum mainnet adds consensus on eth_getLogs and state-read integrity checks; Arbitrum bumps the getLogs hedge floor for its faster blocks. Both spread `sharedNetworkFailsafe` at the end so the catch-all policy is never per-chain:
+
+<ConfigTabs
+  path="projects[].networks[]"
+  yaml={`networks:
+  - evm: { chainId: 1 }
+    alias: ethereum
+    failsafe:
+      # Ethereum-specific: 2-of-3 consensus on getLogs for indexing integrity
+      - matchMethod: "eth_getLogs|eth_getBlockReceipts"
+        matchFinality: [unfinalized, unknown]
+        timeout: { duration: 15s }
+        hedge:
+          quantile: 0.95
+          maxCount: 1
+          minDelay: 500ms
+          maxDelay: 10s
+        retry:
+          maxAttempts: 6
+          delay: 0
+          emptyResultDelay: 1000ms
+        # consensus config would follow here
+      # ... sharedNetworkFailsafe spread after (catch-all always last)
+
+  - evm: { chainId: 42161 }
+    alias: arbitrum-one
+    failsafe:
+      # Arbitrum-specific: getLogs minDelay raised to 1000ms — Arbitrum delivers
+      # blocks at ~250ms and block-availability races persist slightly longer
+      - matchMethod: "eth_getLogs|eth_getBlockReceipts"
+        matchFinality: [unfinalized]
+        hedge:
+          quantile: 0.95
+          maxCount: 1
+          minDelay: 1000ms
+          maxDelay: 10s
+        retry:
+          maxAttempts: 6
+          delay: 0
+      # ... sharedNetworkFailsafe spread after`}
+  ts={`networks: [
+  {
+    evm: { chainId: 1 },
+    alias: "ethereum",
+    failsafe: [
+      {
+        matchMethod: "eth_getLogs|eth_getBlockReceipts",
+        matchFinality: ["unfinalized", "unknown"],
+        timeout: { duration: "15s" },
+        hedge: { quantile: 0.95, maxCount: 1, minDelay: "500ms", maxDelay: "10s" },
+        retry: { maxAttempts: 6, delay: "0", emptyResultDelay: "1000ms" },
+        // consensus config would follow
+      },
+      // ...sharedNetworkFailsafe spread after
+    ],
+  },
+  {
+    evm: { chainId: 42161 },
+    alias: "arbitrum-one",
+    failsafe: [
+      {
+        matchMethod: "eth_getLogs|eth_getBlockReceipts",
+        matchFinality: ["unfinalized"],
+        // Arbitrum delivers ~250ms blocks; minDelay raised to avoid
+        // block-availability races more common on fast L2s
+        hedge: { quantile: 0.95, maxCount: 1, minDelay: "1000ms", maxDelay: "10s" },
+        retry: { maxAttempts: 6, delay: "0" },
+      },
+      // ...sharedNetworkFailsafe spread after
+    ],
+  },
+]`}
+/>
+
+**3. Static genesis-block response for a chain that starts at block 1.** Serve a canned reply before the multiplexer and cache so clients don't hit a dead upstream on block 0. The `staticResponses` array is checked before everything else in the forward pipeline:
+
+<ConfigTabs
+  path="projects[].networks[].staticResponses[]"
+  yaml={`networks:
+  - evm: { chainId: 1328 }
+    alias: sei-testnet
+    staticResponses:
+      - method: eth_getBlockByNumber
+        params: ["0x0", false]
+        response:
+          result:
+            # Fill the fields your clients read; unrecognised fields are fine
+            number: "0x0"
+            hash: "0x0000000000000000000000000000000000000000000000000000000000000000"
+            parentHash: "0x0000000000000000000000000000000000000000000000000000000000000000"
+            transactions: []`}
+  ts={`networks: [{
+  evm: { chainId: 1328 },
+  alias: "sei-testnet",
+  staticResponses: [{
+    method: "eth_getBlockByNumber",
+    params: ["0x0", false],
+    response: {
+      result: {
+        number: "0x0",
+        hash: "0x0000000000000000000000000000000000000000000000000000000000000000",
+        parentHash: "0x0000000000000000000000000000000000000000000000000000000000000000",
+        transactions: [],
+      },
+    },
+  }],
+}]`}
+/>
+
+**4. Skip data-integrity validation for non-standard chains.** ZkSync Era and other ZK-rollups use a non-standard `transactionsRoot` (and other encodings) the [data-integrity module](/config/failsafe/integrity)'s recompute checks can't model. The module is opt-in, but if you enabled it project-wide, turn it off for that chain — a network `integrity` block overrides the project one:
+
+<ConfigTabs
+  path="projects[].networks[].integrity"
+  yaml={`networks:
+  - evm: { chainId: 324 }
+    alias: zksync-mainnet
+    # Override the project-wide integrity level to off for this chain
+    # (or disable just the transactionsRoot checks via integrity.checks).
+    integrity:
+      level: off`}
+  ts={`networks: [{
+  evm: { chainId: 324 },
+  alias: "zksync-mainnet",
+  integrity: { level: "off" },
+}]`}
+/>
+
+**5. Domain-based aliasing for fully path-free routing.** Route an entire subdomain straight to a chain — no project or network segment in the URL path. The alias and domain rule work together so clients call a clean HTTPS endpoint:
+
+```yaml
+server:
+  aliasing:
+    rules:
+      - matchDomain: "eth.rpc.example.com"
+        serveProject: main
+        serveArchitecture: evm
+        serveChain: "1"
+      # Wildcard: any unknown subdomain falls through to the main project
+      - matchDomain: "*.rpc.example.com"
+        serveProject: main
+```
+
+```
+POST https://eth.rpc.example.com/   →  main/evm:1
+```
+
+**6. Multiple SVM chains side by side.** `chain` defaults to `solana`, so a plain Solana cluster keeps the short two-segment id. Naming a fork's chain switches the id to three segments, which is what keeps cache partitions and alias registration from colliding between `svm:mainnet-beta` and `svm:fogo:mainnet`. Note that `cluster` stays per-network — it is identity, so `networkDefaults.svm` carries only the shared policy:
+
+<ConfigTabs
+  path="projects[].networks[]"
+  focusYaml="4-6,9-11,13-16"
+  focusTs="3-5,8-9,11-13"
+  yaml={`projects:
+  - id: main
+    networkDefaults:
+      svm:
+        # shared policy only — cluster is network identity and must not be here
+        commitment: confirmed
+        statePollerDebounce: 500ms
+    networks:
+      # chain omitted → "solana" → networkId "svm:mainnet-beta"
+      - architecture: svm
+        svm:
+          cluster: mainnet-beta
+      # explicit chain → networkId "svm:fogo:mainnet"
+      - architecture: svm
+        svm:
+          chain: fogo
+          cluster: mainnet`}
+  ts={`projects: [{
+  id: "main",
+  networkDefaults: {
+    svm: {
+      // shared policy only — cluster is network identity and must not be here
+      commitment: "confirmed",
+      statePollerDebounce: "500ms",
+    },
+  },
+  networks: [
+    // chain omitted → "solana" → networkId "svm:mainnet-beta"
+    { architecture: "svm", svm: { cluster: "mainnet-beta" } },
+    // explicit chain → networkId "svm:fogo:mainnet"
+    { architecture: "svm", svm: { chain: "fogo", cluster: "mainnet" } },
+  ],
+}]`}
+/>
+
+Both id shapes are addressable the same three ways — URL path, request-body `networkId`, or an `alias`. The fork's colon is carried inside the third path segment:
+
+```
+POST /main/svm/mainnet-beta   →  svm:mainnet-beta
+POST /main/svm/fogo:mainnet   →  svm:fogo:mainnet
+POST /main                    →  body {"networkId": "svm:fogo:mainnet", ...}
+```
+
+**7. Generic JSON-RPC passthrough for a non-EVM chain.** `architecture: jsonrpc` proxies any JSON-RPC node without a chain model: no chain-id detection, no state poller, every method forwarded as-is. The network is identified by a slug (`jsonRpc.id`, defaulting to `alias`), and upstreams opt in with `type: jsonrpc` plus the same slug in `jsonRpc.networkId`:
+
+<ConfigTabs
+  path="projects[].networks[]"
+  focusYaml="4-8,13,15"
+  focusTs="4-7,12,14"
+  yaml={`projects:
+  - id: main
+    networks:
+      - architecture: jsonrpc
+        alias: bitcoin
+        jsonRpc:
+          # networkId "jsonrpc:bitcoin-mainnet"; omit to use the alias
+          id: bitcoin-mainnet
+        failsafe:
+          - retry: { maxAttempts: 3 }
+    upstreams:
+      - id: btc-node-1
+        type: jsonrpc
+        endpoint: https://rpc.example.com
+        jsonRpc: { networkId: bitcoin-mainnet }`}
+  ts={`projects: [{
+  id: "main",
+  networks: [{
+    architecture: "jsonrpc",
+    alias: "bitcoin",
+    // networkId "jsonrpc:bitcoin-mainnet"; omit to use the alias
+    jsonRpc: { id: "bitcoin-mainnet" },
+    failsafe: [{ retry: { maxAttempts: 3 } }],
+  }],
+  upstreams: [{
+    id: "btc-node-1",
+    type: "jsonrpc",
+    endpoint: "https://rpc.example.com",
+    jsonRpc: { networkId: "bitcoin-mainnet" },
+  }],
+}]`}
+/>
+
+```
+POST /main/jsonrpc/bitcoin-mainnet  →  jsonrpc:bitcoin-mainnet
+POST /main/bitcoin                  →  jsonrpc:bitcoin-mainnet (alias)
+```
+
+### Request/response behavior
+
+- The `network` label on every Prometheus metric equals the alias when set, otherwise the raw network id (`evm:1`, `svm:mainnet-beta`, `svm:fogo:mainnet`). This affects all `erpc_network_*` metrics. [`erpc/networks.go:L278-286`](https://github.com/erpc/erpc/blob/main/erpc/networks.go#L278-L286)
+- Static-response hits short-circuit before the multiplexer; `static_response.hit=true` is set on the `Network.Forward` OTel span. They never read or write the cache.
+- Multiplexer followers receive a copy of the leader's response; if the follower's context deadline fires before the leader completes, the error is `ErrNetworkRequestTimeout` (HTTP 504 status code, JSON-RPC error code −32603). This is distinct from `ErrFailsafeTimeoutExceeded` (failsafe policy timeout) and `ErrEndpointRequestTimeout` (individual upstream HTTP timeout).
+- `ErrNetworkInitializing` (HTTP 503) is returned while the bootstrap task is still running. The client should retry. Failed (non-fatal) bootstrap tasks are auto-retried by the background loop with factor-1.5 backoff (3 s to 130 s, task timeout 120 s).
+- `ErrNetworkNotSupported` (HTTP 404) is returned when all providers report the chain is not supported and zero upstreams were registered. It is never retried by the bootstrap loop.
+- `ErrNetworkNotFound` (HTTP 404) is returned after a successful bootstrap task that stored nothing (defensive path). The caller must retry.
+- `ErrInvalidRequest` (HTTP 400) is returned when the networkId in the URL is not a valid `evm:<int>` format — the error message suggests using an alias or `evm/42161` form. [`erpc/networks_registry.go:L220-222`](https://github.com/erpc/erpc/blob/main/erpc/networks_registry.go#L220-L222)
+- `ErrNoUpstreamsFound` (HTTP 404) fires when the policy engine returns an empty ordered list and the raw registration list is also empty — all upstreams have been filtered out.
+- `ErrUpstreamsExhausted` fires when every upstream in the ordered list was tried and all failed; it carries per-upstream errors. [`erpc/networks.go:L1392-1406`](https://github.com/erpc/erpc/blob/main/erpc/networks.go#L1392-L1406)
+- `ErrNotImplemented` (HTTP 501) is returned for `eth_accounts` and `eth_sign` (always); stateful methods with more than one candidate upstream also produce this error unless scoped by a `use-upstream` directive.
+- `ErrInvalidEvmChainId` (HTTP 400) is returned when the chain id cannot be parsed.
+- `ErrNetworkRequestTimeout` wire behavior: JSON-RPC error code −32603; HTTP transport status is 200 (JSON-RPC over HTTP); `ErrorStatusCode()` returns 504 but this is only seen in non-JSON-RPC error paths. The error is retryable toward both network and upstream (no explicit non-retryable flag). Message format: `"network-level request towards one or more upstreams timed out after <N>ms"` where N is the elapsed time since the follower registered with the multiplexer.
+- An alias in the request body `networkId` field is silently ignored — the body fallback splits the literal value on `:` with no alias lookup. Only URL path segments resolve aliases.
+
+### Best practices
+
+- Always set `networkDefaults.failsafe` before adding per-chain `failsafe` entries — once a network has any failsafe list, the defaults list is superseded entirely for that network.
+- Use `alias` on every statically-declared chain you control. It makes URLs readable, shows up in every Prometheus label, and costs nothing.
+- Set `preserveDefaultMethods: true` before adding any custom `methods.definitions` entry. The default `false` silently drops all built-in methods (including `eth_call`, `eth_getLogs`) the moment you add one definition.
+- Never set `finalized: true` on a method that returns block-specific data (`eth_getBalance`, `eth_getCode`, etc.) — every response will be permanently cached at the first value ever returned.
+- Enable `servedTip.enabledFor: [latest, finalized]` in production multi-pod deployments to prevent backward tip jumps across pods that could surface stale reads to clients.
+- Keep `getLogsMaxAllowedRange` at its default 30 000 unless your upstreams document a higher limit — range splits happen automatically on oversized requests but `getLogsSplitConcurrency` caps parallelism at 10 to avoid flooding providers.
+- For `eth_sendRawTransaction` in high-retry configs, leave `idempotentTransactionBroadcast` enabled (default). Disabling it turns idempotent "already known" errors back into real failures, making retries unsafe.
+
+### Edge cases & gotchas
+
+1. **Aliases work in URLs only, not body `networkId`** — body fallback splits on `:` with no alias lookup; only `parseUrlPath` resolves aliases. [`erpc/http_server.go:L613-634`](https://github.com/erpc/erpc/blob/main/erpc/http_server.go#L613-L634)
+2. **Unknown alias segment falls through silently** — an unresolvable single path segment is treated as architecture, yielding "architecture is not valid (must be 'evm', 'svm' or 'jsonrpc')" instead of an alias-not-found error.
+3. **`directiveDefaults` is all-or-nothing** — a network-level `directiveDefaults` block completely replaces `networkDefaults.directiveDefaults`; individual fields are not merged. [`common/defaults.go:L1837-1840`](https://github.com/erpc/erpc/blob/main/common/defaults.go#L1837-L1840)
+4. **`failsafe` replaces, not merges** — any `networks[].failsafe` list supersedes `networkDefaults.failsafe` entirely for that network.
+5. **`preserveDefaultMethods: false` + one custom `definitions` entry drops ALL built-ins** — including `eth_call`, `eth_getLogs`, etc. Only the custom entries plus the 6 stateful markers survive. [`common/defaults.go:L561-573`](https://github.com/erpc/erpc/blob/main/common/defaults.go#L561-L573)
+6. **`finalized: true` on a non-finalized method permanently caches all responses** — every response is placed in the `finalized` cache bucket (long/permanent TTL). Setting this on `eth_getBalance` would permanently cache every balance at the first value returned. [`erpc/networks.go:L1656-1660`](https://github.com/erpc/erpc/blob/main/erpc/networks.go#L1656-L1660)
+7. **`networkDefaults.multiplexing` has no deep merge** — a network must set its own `multiplexing` field; there is no per-network override via defaults alone.
+8. **Legacy single-object `networkDefaults.failsafe` silently drops `multiplexing`** — the old-format fallback struct has no `Multiplexing` field. [`common/config.go:L626-655`](https://github.com/erpc/erpc/blob/main/common/config.go#L626-L655)
+9. **Lazily-exposed networks never get a metrics alias resolver entry** — `erpc/init.go` builds the map only from static `cfg.Projects[].Networks[]`; gRPC-cache metrics for lazy networks show the raw networkId. [`erpc/init.go:L62-77`](https://github.com/erpc/erpc/blob/main/erpc/init.go#L62-L77)
+10. **`evm.enforceBlockAvailability: false` overrides upstream bounds** — step 3 of the enforcement chain (upstream-has-bounds) is only reached when steps 1–2 yield no decision; an explicit `false` at the network level (step 2) short-circuits it. [`erpc/networks.go:L1814-1817`](https://github.com/erpc/erpc/blob/main/erpc/networks.go#L1814-L1817)
+11. **Static response error code `0` is omitted from the wire response** — `Code` is tagged `json:"code,omitempty"` on int, so `0` disappears from the JSON error object. Always use a non-zero code in production. [`common/errors.go:L2226`](https://github.com/erpc/erpc/blob/main/common/errors.go#L2226)
+12. **Failsafe merge picks the FIRST matching default** — ordering of `networkDefaults.failsafe` entries matters when multiple wildcard entries could match.
+13. **`stateful: false` on a built-in stateful method is silently overridden** — `MethodsConfig.SetDefaults` force-sets `Stateful = true` for all 6 stateful methods in all three code paths, overwriting any user-supplied `false` without any warning. [`common/defaults.go:L512-573`](https://github.com/erpc/erpc/blob/main/common/defaults.go#L512-L573)
+14. **`EnforceGetLogsBlockRange` and `EnforceHighestBlock` directives cannot be overridden per-request via HTTP headers for `eth_getLogs`, `trace_filter`, `arbtrace_filter`, and `eth_blockNumber`** — these hooks read from the config baked in at startup, not live per-request directives. Set `enforceGetLogsBlockRange: false` in `directiveDefaults`, not as an HTTP header. [`architecture/evm/eth_getLogs.go:L282-285`](https://github.com/erpc/erpc/blob/main/architecture/evm/eth_getLogs.go#L282-L285)
+15. **`ErrNetworkRequestTimeout` is produced only in the multiplexer follower path** — a request that is itself the leader experiences `ErrFailsafeTimeoutExceeded` or upstream sweep errors, never `ErrNetworkRequestTimeout`. [`erpc/networks.go:L2079-2084`](https://github.com/erpc/erpc/blob/main/erpc/networks.go#L2079-L2084)
+16. **`evm.chainId: 0` is not rejected** — `chainId: 0` produces `networkId = evm:0`, which passes `util.IsValidNetworkId` but is excluded by provider `onlyNetworks`/`ignoreNetworks` lists that use the stricter `chainId > 0` check.
+17. **`translateLatestTag: false` on a non-historical method collapses all callers to one cache key** — all requests for that method share the literal `"latest"` key; stale data is returned until the cache TTL expires.
+18. **`preserveDefaultMethods: false` with NO `definitions` block keeps ALL built-ins** — the drop-all behavior only triggers when `definitions` is non-empty AND `preserveDefaultMethods` is false. A config with `methods: { preserveDefaultMethods: false }` and no `definitions` key is identical to omitting the `methods` block entirely. [`common/defaults.go:L494`](https://github.com/erpc/erpc/blob/main/common/defaults.go#L494)
+19. **Lazy network alias registration happens after first bootstrap** — statically-declared networks register aliases eagerly in the `NetworksRegistry` constructor; lazily-created networks only register their alias inside `prepareNetwork`, which runs during bootstrap. Until bootstrap completes, alias-based URLs for lazy networks return an alias-not-found error. [`erpc/networks_registry.go:L322-328`](https://github.com/erpc/erpc/blob/main/erpc/networks_registry.go#L322-L328)
+20. **Failed lazy bootstrap is user-retryable** — non-fatal bootstrap tasks are retried by the background auto-retry loop and by the next request's `ExecuteTasks`. Only `resolveNetworkConfig` format errors are `TaskFatal` and never retried. [`erpc/networks_registry.go:L263-266`](https://github.com/erpc/erpc/blob/main/erpc/networks_registry.go#L263-L266)
+21. **Provider `onlyNetworks` bypasses vendor support checks entirely** — a networkId listed in `onlyNetworks` returns `SupportsNetwork = true` without consulting the vendor's dynamic check; `ignoreNetworks` is evaluated first and short-circuits to false. [`thirdparty/provider.go:L34-49`](https://github.com/erpc/erpc/blob/main/thirdparty/provider.go#L34-L49)
+22. **Synthesized lazy network configs become permanently visible** — `ExposeNetworkConfig` appends to `project.Config.Networks` (admin API surface) and never overwrites an existing entry, so lazy networks persist in the admin response after first use. [`erpc/projects.go:L58-77`](https://github.com/erpc/erpc/blob/main/erpc/projects.go#L58-L77)
+23. **Syncing upstreams are excluded from every head computation** — max mode, cluster mode, lowest-finalized, and guaranteed-method floor calculations all skip upstreams in `EvmSyncingStateSyncing`. The future-block short-circuit is the exception: it counts every upstream of the network, syncing ones included ([`erpc/networks.go:L935-954`](https://github.com/erpc/erpc/blob/main/erpc/networks.go#L935-L954)). [`erpc/networks.go:L327-330`](https://github.com/erpc/erpc/blob/main/erpc/networks.go#L327-L330)
+24. **Future-block short-circuit compares against the MAX head across every upstream of the network, not the cluster-min served tip** — selection policy, tier (a cordoned fallback can still serve through the escape) and syncing state are ignored, and it fails open while any upstream's head is unknown, so it never nulls a block that any upstream reports having. One upstream whose head is never learned (for example a broken endpoint) therefore keeps it from firing on that network. It runs only when `evm.shortCircuitFutureBlocks` is true or `servedTip.enabledFor` includes `latest`, and always compares latest heads: `emptyResultConfidence: finalizedBlock` does not make it null an unfinalized block an upstream already has. The synthetic null response is never cached, and the short-circuit only fires for concrete block numbers (not tags or hashes). [`erpc/networks.go:L901-954`](https://github.com/erpc/erpc/blob/main/erpc/networks.go#L901-L954)
+25. **Wrong-empty misbehavior is suppressed for out-of-bounds blocks** — if the block number in a missing-data response falls outside an upstream's configured `blockAvailability` bounds, the empty response is expected and no misbehavior is recorded against that upstream. [`erpc/networks.go:L1566-1587`](https://github.com/erpc/erpc/blob/main/erpc/networks.go#L1566-L1587)
+26. **`getLogsMaxAllowedRange: 0` is rejected by validation** — the field must be &gt; 0 after defaults (`common/validation.go:L1309-1311`). Unlike `getLogsMaxAllowedAddresses` and `getLogsMaxAllowedTopics` (which default to 0 = unlimited), `getLogsMaxAllowedRange` defaults to 30 000 and cannot be explicitly zeroed out; setting `0` in a network inheriting from defaults is treated as "unset" and inherits the parent value. [`common/defaults.go:L2092-2094`](https://github.com/erpc/erpc/blob/main/common/defaults.go#L2092-L2094)
+27. **Zero projects → implicit `main` project + catch-all aliasing rule** — when the config has no projects, eRPC auto-creates `{matchDomain: "*", serveProject: "main"}`, so `/evm/123` works without a project path segment. [`common/defaults.go:L100-110`](https://github.com/erpc/erpc/blob/main/common/defaults.go#L100-L110)
+28. **Selector-scoped tips never pollute network gauges** — stateless scoped picks (unmatched or non-simple selectors) use a sentinel lane and emit no Prometheus gauge; equivalent selectors dedup into one partition keyed by matched-set hash; the cap of 16 partitions is enforced globally per network. [`erpc/networks.go:L98-105`](https://github.com/erpc/erpc/blob/main/erpc/networks.go#L98-L105)
+29. **Static response params matching has no wildcard** — there is no glob or `*` support; every params slot must match exactly. To catch a method regardless of params, add an entry with an empty `params` array. To match block 0 (`"0x0"`), be exact — `"0x00"` will not match. [`common/static_response.go:L14-99`](https://github.com/erpc/erpc/blob/main/common/static_response.go#L14-L99)
+30. **Same-chain networks share Redis cache keys unless `cacheKeySuffix` is set** — partition keys are `{networkId}:{blockRef}` (`evm:998:64321354`). Two projects on chainId 998 with a shared Redis will HIT each other's bodies. `X-ERPC-Skip-Cache-Read` still writes, so the last fetch poisons the other project. Set `cacheKeySuffix: systx` on one network to get `evm:998:systx:{blockRef}`. Colon is rejected. Reverse-index wildcard is `{networkId}:{suffix}:*`, passed from the known network id and suffix rather than inferred from the concrete key. Memory/Redis `Delete` must use the same `WithReverseIndex` ctx as `Set`. A chain-wide main-key flush of `evm:998:*` still matches suffixed data keys. [`common/config.go:L3022-L3028`](https://github.com/erpc/erpc/blob/main/common/config.go#L3022-L3028), [`data/connector.go`](https://github.com/erpc/erpc/blob/main/data/connector.go)
+31. **`shortCircuitFutureBlocks` can briefly null a block that exists** — the head it compares against is what the state poller and head subscriptions last reported. A block an upstream produced after that gets `null` until eRPC sees it, even if the client already saw it via the node's own `newHeads` (the case covered by `TestNetworkAvailability_Issue934_*`, which run with the option off). Enable it only where heads arrive promptly (WebSocket head subscriptions) and clients retry a `null`. [`erpc/networks.go:L901-926`](https://github.com/erpc/erpc/blob/main/erpc/networks.go#L901-L926)
+
+### Observability
+
+| Metric | Type | Labels | When it fires |
+|---|---|---|---|
+| `erpc_network_request_received_total` | counter | `project`, `network`, `category`, `finality`, `user`, `agent_name`, `transport` | On project forward entry |
+| `erpc_network_successful_request_total` | counter | `project`, `network`, `vendor`, `upstream`, `category`, `attempt`, `finality`, `emptyish`, `user`, `agent_name` | Successful response (vendor/upstream = `<cache>` for cache hits) |
+| `erpc_network_failed_request_total` | counter | `project`, `network`, `category`, `attempt`, `error`, `severity`, `finality`, `user`, `agent_name` | Failed response |
+| `erpc_network_request_duration_seconds` | histogram | `project`, `network`, `vendor`, `upstream`, `category`, `finality`, `user` | Request completed (vendor/upstream = `<error>` on failure) |
+| `erpc_network_multiplexed_request_total` | counter | `project`, `network`, `category`, `finality`, `user`, `agent_name` | Follower registered with the in-flight deduplicator |
+| `erpc_network_static_response_served_total` | counter | `project`, `network`, `category` | Static response matched and served |
+| `erpc_network_timeout_fired_total` | counter | `project`, `network`, `category`, `finality`, `scope` | Failsafe timeout fired; `scope=network` at network level |
+| `erpc_network_served_tip_block_number` | gauge | `project`, `network`, `lane`, `axis` | Served-tip value updated; absent in max mode |
+| `erpc_network_served_tip_lag_blocks` | gauge | `project`, `network`, `lane`, `axis` | `MaxEligible - served`, clamped ≥ 0; absent in max mode |
+| `erpc_network_served_tip_upstream_excluded_total` | counter | `project`, `network`, `upstream`, `axis`, `reason` | Upstream excluded from tip computation (`velocity`\|`outlier`) |
+| `erpc_network_hedged_request_total` | counter | `project`, `network`, `upstream`, `category`, `attempt`, `finality`, `user`, `agent_name` | Hedge attempt dispatched for this upstream |
+| `erpc_network_hedge_discards_total` | counter | `project`, `network`, `upstream`, `category`, `attempt`, `hedge`, `finality`, `user`, `agent_name` | Hedge response discarded (a faster response already won) |
+| `erpc_upstream_wrong_empty_response_total` | counter | `project`, `vendor`, `network`, `upstream`, `category`, `finality`, `user`, `agent_name` | Upstream returned missing-data while another upstream served real data; suppressed when the block is outside the upstream's `blockAvailability` bounds |
+| `erpc_unexpected_panic_total` | counter | (standard labels) | Panic recovered in the async cache-set goroutine |
+
+**Notable logs** (zerolog, at `erpc/networks_registry.go` and `erpc/networks.go` unless noted):
+- `"registered network alias"` / `"skipping duplicate alias registration with different target"` — alias map events.
+- `"network initialization ended with zero upstreams"` — bootstrap completed but no upstreams were registered.
+- `"networks bootstrap completed"` / `"failed to bootstrap networks in background"` — startup background bootstrap outcome.
+- `"response served from cache"` — cache hit in the forward pipeline.
+- `"found identical request initiating multiplexer"` — multiplexer follower registered.
+- `"block availability check failed; failing open to allow request"` — block-availability extraction or poller error; request proceeds.
+- `"served static response (no upstream contacted)"` (debug) — static response matched and served (`erpc/networks_static_responses.go`).
+- `"skipping static response: cannot inspect request"` (debug) — `JsonRpcRequest()` failed; static check skipped.
+- `"failed to build static response"` (error) — `NewJsonRpcResponse` failed on a matched static entry.
+- Provider task: `"registering N upstream(s) from provider"` (`upstream/registry.go`).
+
+**Span attributes** (on the `Network.Forward` span):
+- `future_block.short_circuit=true` — the future-block short-circuit returned `null` without dispatching (`evm.shortCircuitFutureBlocks` or served-tip for `latest`). No metric counts these; they are not dispatched, so they do not appear in upstream request metrics.
+
+### Source code entry points
+
+- [`erpc/networks_registry.go:L83-376`](https://github.com/erpc/erpc/blob/main/erpc/networks_registry.go#L83-L376) — `NetworksRegistry`: lazy `GetNetwork`, bootstrap tasks, `resolveNetworkConfig` synthesis, alias map register/resolve, `NewNetwork` constructor.
+- [`erpc/networks.go:L931-1603`](https://github.com/erpc/erpc/blob/main/erpc/networks.go#L931-L1603) — `Network.Forward`: full request pipeline, failsafe-executor matching, static responses, multiplexing, cache, upstream ordering, block-availability gating, finality classification.
+- [`common/defaults.go:L1781-1973`](https://github.com/erpc/erpc/blob/main/common/defaults.go#L1781-L1973) — `NetworkConfig.SetDefaults`: networkDefaults inheritance, per-field fill rules, EvmNetworkConfig/MethodsConfig/DirectiveDefaults sub-passes.
+- [`erpc/http_server.go:L810-1006`](https://github.com/erpc/erpc/blob/main/erpc/http_server.go#L810-L1006) — `parseUrlPath`: URL/alias parsing decision table, domain-aliasing rules, body-networkId fallback.
+- [`common/config.go:L1995-2256`](https://github.com/erpc/erpc/blob/main/common/config.go#L1995-L2256) — `NetworkConfig`, `EvmNetworkConfig` struct definitions, legacy single-failsafe decode, `NetworkId()`.
+- [`upstream/registry.go:L155-293`](https://github.com/erpc/erpc/blob/main/upstream/registry.go#L155-L293) — `PrepareUpstreamsForNetwork`: provider fan-out, ready-wait, 503/404 error states.
+- [`erpc/networks_static_responses.go`](https://github.com/erpc/erpc/blob/main/erpc/networks_static_responses.go) — `tryServeStaticResponse`: canned-response serving, metric emit.
+- [`common/static_response.go:L14-99`](https://github.com/erpc/erpc/blob/main/common/static_response.go#L14-L99) — `FindStaticResponseMatch`, `paramsEqual`, `valueEqual`: pure matching logic (YAML int vs JSON float64 tolerance, map key order independence).
+
+### Related pages
+
+- [SVM commitment & finality](/reference/svm/commitment) — how `svm.commitment` is injected and how SVM finality is classified.
+- [SVM slot tracking & health](/reference/svm/slot-tracking) — the state poller behind `statePollerDebounce`, plus `maxFinalizedSlotLag` and `enforceBlockAvailability` in depth.
+- [SVM JSON-RPC cache](/config/database/svm-json-rpc-cache) — caching for SVM networks.
+- [Static responses](/config/projects/static-responses) — full matching semantics and edge cases for canned replies.
+- [Selection & scoring](/config/projects/selection-policies) — upstream ordering within a network.
+- [Retry](/config/failsafe/retry) — per-network failsafe retry policy.
+- [Hedge](/config/failsafe/hedge) — parallel backup requests on slow upstreams.
+- [Timeout](/config/failsafe/timeout) — bounds the upstream sweep from outside.
+- [Rate limiters](/config/rate-limiters) — budgets referenced by `rateLimitBudget`.
+- [Survive provider outages](/use-cases/survive-provider-outages) — the outcome networks + failsafe deliver together.
+
+</AISection>

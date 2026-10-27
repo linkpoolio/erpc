@@ -1,0 +1,80 @@
+import type { DynamoDBConnectorConfig, EvmNetworkConfig, SvmNetworkConfig, AuthStrategyConfig as GenAuthStrategyConfig, JwtStrategyConfig, MemoryConnectorConfig, NetworkStrategyConfig, PostgreSQLConnectorConfig, RedisConnectorConfig, SecretStrategyConfig, SiweStrategyConfig } from "../generated";
+/**
+ * Possible log level configuration
+ */
+export type LogLevel = "trace" | "debug" | "info" | "warn" | "error" | "disabled" | undefined;
+/**
+ * Generic type representing a time duration with units (ms, s, m, h),
+ * or a number that will be interpreted as milliseconds.
+ */
+export type Duration = `${number}ms` | `${number}s` | `${number}m` | `${number}h` | number;
+/**
+ * Generic type representing size with units (b, kb, mb), or a number that will be interpreted as bytes.
+ */
+export type ByteSize = `${number}kb` | `${number}mb` | `${number}b` | number;
+/**
+ * Suported network architecture
+ */
+export type NetworkArchitecture = "evm" | "svm";
+/**
+ * Supported connector driver type overide
+ */
+export type ConnectorDriverType = "memory" | "redis" | "postgresql" | "dynamodb";
+/**
+ * Connector config depending on the upstream type
+ */
+export type ConnectorConfig = {
+    id: string;
+    driver: "memory";
+    memory: MemoryConnectorConfig;
+} | {
+    id: string;
+    driver: "redis";
+    redis: RedisConnectorConfig;
+} | {
+    id: string;
+    driver: "dynamodb";
+    dynamodb: DynamoDBConnectorConfig;
+} | {
+    id: string;
+    driver: "postgresql";
+    postgresql: PostgreSQLConnectorConfig;
+};
+/**
+ * Supported upstream type
+ */
+export type UpstreamType = "evm" | "evm+goldsky" | "evm+alchemy" | "evm+blastapi" | "evm+conduit" | "evm+drpc" | "evm+dwellir" | "evm+envio" | "evm+etherspot" | "evm+infura" | "evm+pimlico" | "evm+quicknode" | "evm+llama" | "evm+thirdweb" | "evm+repository" | "evm+superchain" | "evm+chainstack" | "evm+tenderly" | "evm+onfinality" | "evm+erpc" | "evm+blockpi" | "evm+ankr" | "evm+routemesh" | "svm";
+/**
+ * Supported auth type
+ */
+export type AuthType = "secret" | "jwt" | "siwe" | "network";
+/**
+ * Connector config depending on the upstream type
+ */
+export type AuthStrategyConfig = Omit<GenAuthStrategyConfig, "type" | "network" | "secret" | "jwt" | "siwe"> & ({
+    type: "secret";
+    secret: SecretStrategyConfig;
+} | {
+    type: "network";
+    secret: NetworkStrategyConfig;
+} | {
+    type: "jwt";
+    secret: JwtStrategyConfig;
+} | {
+    type: "siwe";
+    secret: SiweStrategyConfig;
+});
+/**
+  * Network defaults override (chainId isn't needed for defaults config)
+  */
+export type EvmNetworkConfigForDefaults = Omit<EvmNetworkConfig, "chainId">;
+/**
+ * Network defaults override (cluster isn't needed for defaults config)
+ */
+export type SvmNetworkConfigForDefaults = Omit<SvmNetworkConfig, "cluster">;
+/**
+ * Accepts both boolean (backward compat) and string (connector ID pattern) values.
+ * Examples: true, false, "redis*", "memory*|dynamo*"
+ */
+export type BoolOrString = boolean | string;
+//# sourceMappingURL=generic.d.ts.map

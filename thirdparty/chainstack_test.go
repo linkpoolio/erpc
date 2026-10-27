@@ -1,0 +1,258 @@
+package thirdparty
+
+import (
+	"context"
+	"encoding/json"
+	"testing"
+	"time"
+
+	"github.com/erpc/erpc/common"
+	"github.com/rs/zerolog"
+	"github.com/stretchr/testify/assert"
+)
+
+func TestChainstackVendor_GenerateConfigs(t *testing.T) {
+	vendor := CreateChainstackVendor()
+	ctx := context.Background()
+	logger := zerolog.Nop()
+
+	// Test with API key on cold cache.
+	//
+	// Per the request-path safety rule (see remote_cache.go): the hot path
+	// no longer blocks on the network call. With no snapshot populated yet,
+	// GenerateConfigs returns ErrRemoteCacheCold and kicks off an async
+	// refresh. The bootstrap initializer's auto-retry loop is responsible
+	// for trying again later.
+	t.Run("with API key - cold cache returns retryable error", func(t *testing.T) {
+		settings := common.VendorSettings{
+			"apiKey":          "test-api-key",
+			"recheckInterval": 2 * time.Hour,
+		}
+
+		upstream := &common.UpstreamConfig{
+			Evm: &common.EvmUpstreamConfig{
+				ChainId: 123,
+			},
+		}
+
+		configs, err := vendor.GenerateConfigs(ctx, &logger, upstream, settings)
+
+		// Cold cache: returns retryable error, no upstream configs.
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "cache not yet populated")
+		assert.Nil(t, configs)
+	})
+
+	// Test without API key (should fail)
+	t.Run("without API key", func(t *testing.T) {
+		settings := common.VendorSettings{}
+
+		upstream := &common.UpstreamConfig{
+			Evm: &common.EvmUpstreamConfig{
+				ChainId: 123,
+			},
+		}
+
+		_, err := vendor.GenerateConfigs(ctx, &logger, upstream, settings)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "apiKey is required")
+	})
+
+	// Test with pre-defined endpoint (should not make API calls)
+	t.Run("with pre-defined endpoint", func(t *testing.T) {
+		settings := common.VendorSettings{
+			"apiKey": "test-api-key",
+		}
+
+		upstream := &common.UpstreamConfig{
+			Endpoint: "https://ethereum-mainnet.core.chainstack.com/test-key",
+			Evm: &common.EvmUpstreamConfig{
+				ChainId: 123,
+			},
+		}
+
+		// Should return the upstream as-is without making API calls
+		configs, err := vendor.GenerateConfigs(ctx, &logger, upstream, settings)
+		assert.NoError(t, err)
+		assert.Len(t, configs, 1)
+		assert.Equal(t, upstream.Endpoint, configs[0].Endpoint)
+	})
+
+	// Test SupportsNetwork with API key on cold cache.
+	//
+	// Same contract as GenerateConfigs above: cold cache returns a
+	// retryable error so the bootstrap auto-retry loop reschedules; the
+	// async refresh kicked off by this call will populate the snapshot
+	// for the next attempt.
+	t.Run("supports network with API key - cold cache returns retryable error", func(t *testing.T) {
+		// Use a fresh vendor so this sub-test is not coupled to whatever
+		// state the previous "with API key" sub-test left behind.
+		freshVendor := CreateChainstackVendor()
+		settings := common.VendorSettings{
+			"apiKey": "test-api-key",
+		}
+
+		supported, err := freshVendor.SupportsNetwork(ctx, &logger, settings, "evm:123")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "cache not yet populated")
+		assert.False(t, supported)
+	})
+
+	// Test SupportsNetwork without API key
+	t.Run("supports network without API key", func(t *testing.T) {
+		settings := common.VendorSettings{}
+
+		// Should return false when no API key is provided
+		supported, err := vendor.SupportsNetwork(ctx, &logger, settings, "evm:123")
+		assert.NoError(t, err)
+		assert.False(t, supported)
+	})
+
+	// Test SupportsNetwork with non-EVM network
+	t.Run("supports network - non-EVM", func(t *testing.T) {
+		settings := common.VendorSettings{
+			"apiKey": "test-api-key",
+		}
+
+		// Should return false for non-EVM networks
+		supported, err := vendor.SupportsNetwork(ctx, &logger, settings, "solana:mainnet")
+		assert.NoError(t, err)
+		assert.False(t, supported)
+	})
+}
+
+// TestChainstackNode_ResilientDecoding demonstrates that the vendor can handle
+// API responses with unexpected field types
+func TestChainstackNode_ResilientDecoding(t *testing.T) {
+	// Example of a response with mixed types that would cause issues
+	// Note: version is a number instead of string in the original API response
+	rawJSON := `{
+		"id": "ND-123-456",
+		"status": "running",
+		"name": "Test Node",
+		"version": 25.3,
+		"configuration": {
+			"archive": true,
+			"someUnknownField": {"nested": "data"}
+		},
+		"details": {
+			"https_endpoint": "https://test.endpoint.com",
+			"auth_key": "test-key",
+			"version": 25.3,
+			"api_namespaces": ["eth", "web3"]
+		},
+		"unknownField": "ignored"
+	}`
+
+	var node ChainstackNode
+	err := json.Unmarshal([]byte(rawJSON), &node)
+
+	// Should decode successfully, ignoring unknown fields
+	assert.NoError(t, err)
+	assert.Equal(t, "ND-123-456", node.ID)
+	assert.Equal(t, "running", node.Status)
+	assert.Equal(t, "https://test.endpoint.com", node.Details.HTTPSEndpoint)
+	assert.Equal(t, "test-key", node.Details.AuthKey)
+	assert.True(t, node.Configuration.Archive)
+}
+
+func TestChainstackFilterParams(t *testing.T) {
+	vendor := CreateChainstackVendor().(*ChainstackVendor)
+
+	tests := []struct {
+		name     string
+		settings common.VendorSettings
+		expected *ChainstackFilterParams
+	}{
+		{
+			name: "no filters",
+			settings: common.VendorSettings{
+				"apiKey": "test-key",
+			},
+			expected: &ChainstackFilterParams{},
+		},
+		{
+			name: "all filters",
+			settings: common.VendorSettings{
+				"apiKey":       "test-key",
+				"project":      "proj-123",
+				"organization": "org-456",
+				"region":       "us-east-1",
+				"provider":     "aws",
+				"type":         "dedicated",
+			},
+			expected: &ChainstackFilterParams{
+				Project:      "proj-123",
+				Organization: "org-456",
+				Region:       "us-east-1",
+				Provider:     "aws",
+				Type:         "dedicated",
+			},
+		},
+		{
+			name: "partial filters",
+			settings: common.VendorSettings{
+				"apiKey":  "test-key",
+				"project": "proj-123",
+				"type":    "shared",
+			},
+			expected: &ChainstackFilterParams{
+				Project: "proj-123",
+				Type:    "shared",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := vendor.extractFilterParams(tt.settings)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}
+
+func TestChainstackCacheKey(t *testing.T) {
+	vendor := CreateChainstackVendor().(*ChainstackVendor)
+
+	tests := []struct {
+		name     string
+		apiKey   string
+		params   *ChainstackFilterParams
+		expected string
+	}{
+		{
+			name:     "no filters",
+			apiKey:   "test-key",
+			params:   &ChainstackFilterParams{},
+			expected: "test-key",
+		},
+		{
+			name:   "all filters",
+			apiKey: "test-key",
+			params: &ChainstackFilterParams{
+				Project:      "proj-123",
+				Organization: "org-456",
+				Region:       "us-east-1",
+				Provider:     "aws",
+				Type:         "dedicated",
+			},
+			expected: "test-key_p:proj-123_o:org-456_r:us-east-1_pr:aws_t:dedicated",
+		},
+		{
+			name:   "partial filters",
+			apiKey: "test-key",
+			params: &ChainstackFilterParams{
+				Project: "proj-123",
+				Type:    "shared",
+			},
+			expected: "test-key_p:proj-123_t:shared",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := vendor.getCacheKey(tt.apiKey, tt.params)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}

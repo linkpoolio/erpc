@@ -962,6 +962,13 @@ func (s *AuthStrategyConfig) Validate() error {
 		if err := s.Database.Validate(); err != nil {
 			return err
 		}
+	case AuthTypeForwardedClientId:
+		if s.ForwardedClientId == nil {
+			return fmt.Errorf("auth.*.forwardedClientId is required for forwardedClientId strategy")
+		}
+		if err := s.ForwardedClientId.Validate(); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("auth.*.type '%s' is invalid must be one of: %v", s.Type, []AuthType{
 			AuthTypeNetwork,
@@ -969,7 +976,20 @@ func (s *AuthStrategyConfig) Validate() error {
 			AuthTypeJwt,
 			AuthTypeSiwe,
 			AuthTypeDatabase,
+			AuthTypeForwardedClientId,
 		})
+	}
+	return nil
+}
+
+func validateSecretLocations(field string, locations []SecretLocation) error {
+	for _, l := range locations {
+		switch l {
+		case SecretLocationApikeyQuery, SecretLocationApikeyHeader, SecretLocationPath:
+		default:
+			return fmt.Errorf("%s: unknown location %q (supported: %s, %s, %s)",
+				field, l, SecretLocationApikeyQuery, SecretLocationApikeyHeader, SecretLocationPath)
+		}
 	}
 	return nil
 }
@@ -977,6 +997,9 @@ func (s *AuthStrategyConfig) Validate() error {
 func (s *DatabaseStrategyConfig) Validate() error {
 	if s.Connector == nil {
 		return fmt.Errorf("auth.*.database.connector is required")
+	}
+	if err := validateSecretLocations("auth.*.database.additionalLocations", s.AdditionalLocations); err != nil {
+		return err
 	}
 
 	if s.Cache != nil {
@@ -1005,7 +1028,7 @@ func (s *SecretStrategyConfig) Validate() error {
 	if s.Value == "" {
 		return fmt.Errorf("auth.*.secret.value is required")
 	}
-	return nil
+	return validateSecretLocations("auth.*.secret.additionalLocations", s.AdditionalLocations)
 }
 
 func (j *JwtStrategyConfig) Validate() error {
@@ -1036,6 +1059,43 @@ func (j *JwtStrategyConfig) Validate() error {
 
 func (s *SiweStrategyConfig) Validate() error {
 	return nil
+}
+
+func (s *ForwardedClientIdStrategyConfig) Validate() error {
+	if !isValidHeaderName(s.Header) {
+		return fmt.Errorf("auth.*.forwardedClientId.header '%s' is not a valid HTTP header name", s.Header)
+	}
+	for _, id := range s.AllowedIds {
+		if strings.TrimSpace(id) == "" {
+			return fmt.Errorf("auth.*.forwardedClientId.allowedIds must not contain empty values")
+		}
+	}
+	for _, entry := range s.AllowedProxies {
+		if net.ParseIP(entry) != nil {
+			continue
+		}
+		if _, _, err := net.ParseCIDR(entry); err != nil {
+			return fmt.Errorf("auth.*.forwardedClientId.allowedProxies entry '%s' is not a valid IP or CIDR", entry)
+		}
+	}
+	return nil
+}
+
+// isValidHeaderName reports whether name is a non-empty RFC 7230 token.
+func isValidHeaderName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case strings.IndexByte("!#$%&'*+-.^_`|~", c) >= 0:
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func (c *CORSConfig) Validate() error {

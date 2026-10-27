@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -64,6 +65,54 @@ func InjectHTTPResponseTraceContext(ctx context.Context, w http.ResponseWriter) 
 	propagator.Inject(ctx, propagation.HeaderCarrier(w.Header()))
 }
 
+// credentialQueryParams are the query parameters the HTTP auth payload
+// extractor reads credentials from (see auth.NewPayloadFromHttp).
+var credentialQueryParams = []string{"token", "secret", "jwt", "apikey"}
+
+// RedactedPath replaces a request path that carries a credential in telemetry.
+const RedactedPath = "/REDACTED"
+
+// RedactedRequestURL renders u for telemetry with the values of
+// credential-carrying query parameters replaced, so secrets passed in the
+// URL do not end up in exported spans.
+func RedactedRequestURL(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	if u.RawQuery == "" {
+		return u.String()
+	}
+	q := u.Query()
+	redacted := false
+	for _, name := range credentialQueryParams {
+		if vals, ok := q[name]; ok {
+			for i := range vals {
+				vals[i] = "REDACTED"
+			}
+			redacted = true
+		}
+	}
+	if !redacted {
+		return u.String()
+	}
+	c := *u
+	c.RawQuery = q.Encode()
+	return c.String()
+}
+
+// RedactHTTPServerSpanPath overwrites the http.url attribute of the server
+// span in ctx with u's path replaced by RedactedPath, for requests whose path
+// carries a credential.
+func RedactHTTPServerSpanPath(ctx context.Context, u *url.URL) {
+	if !IsTracingEnabled || u == nil {
+		return
+	}
+	c := *u
+	c.Path = RedactedPath
+	c.RawPath = ""
+	trace.SpanFromContext(ctx).SetAttributes(semconv.HTTPURLKey.String(RedactedRequestURL(&c)))
+}
+
 func StartHTTPServerSpan(ctx context.Context, r *http.Request) (context.Context, trace.Span) {
 	if !IsTracingEnabled {
 		return ctx, trace.SpanFromContext(ctx)
@@ -80,7 +129,7 @@ func StartHTTPServerSpan(ctx context.Context, r *http.Request) (context.Context,
 		trace.WithSpanKind(trace.SpanKindServer),
 		trace.WithAttributes(
 			semconv.HTTPMethodKey.String(r.Method),
-			semconv.HTTPURLKey.String(r.URL.String()),
+			semconv.HTTPURLKey.String(RedactedRequestURL(r.URL)),
 			semconv.HTTPSchemeKey.String(r.URL.Scheme),
 			semconv.HTTPUserAgentKey.String(r.UserAgent()),
 		),

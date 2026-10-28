@@ -85,6 +85,14 @@ func (s *HttpServer) handleWebSocket(
 ) {
 	wsCfg := s.serverCfg.WebSocket
 
+	// Refused before the upgrade once shutdown has begun, so the client's dial
+	// fails instead of completing the handshake and being closed right away.
+	if s.draining.Load() {
+		lg.Debug().Msg("websocket connection refused: server shutting down")
+		http.Error(w, "server shutting down", http.StatusServiceUnavailable)
+		return
+	}
+
 	upgrader := websocket.Upgrader{
 		ReadBufferSize:  wsCfg.ReadBufferSize,
 		WriteBufferSize: wsCfg.WriteBufferSize,
@@ -122,7 +130,7 @@ func (s *HttpServer) handleWebSocket(
 	lg.Info().Str("connId", wsc.id).Str("remoteAddr", r.RemoteAddr).Msg("websocket connection established")
 
 	// Store before checking draining so shutdownWebSockets either sees this
-	// connection or we see its flag.
+	// connection or we see its flag (shutdown began during the handshake).
 	s.activeWsConns.Store(wsc.id, wsc)
 	telemetry.GaugeHandle(telemetry.MetricWebsocketConnectionsActive, project.Config.Id).Inc()
 	if s.draining.Load() {

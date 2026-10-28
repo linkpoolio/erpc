@@ -271,7 +271,7 @@ server:
     subscriptionBufferSize: 256
 ```
 
-The upgrade request must name a network (`/<project-id>/<architecture>/<chain-id>`, or a path that [domain aliasing](/operation/url) resolves to one); otherwise it is rejected with `400`. On shutdown eRPC closes every client connection with `1001` (going away) straight away so clients reconnect to another instance; in-flight requests get up to `server.waitBeforeShutdown` to answer first.
+The upgrade request must name a network (`/<project-id>/<architecture>/<chain-id>`, or a path that [domain aliasing](/operation/url) resolves to one); otherwise it is rejected with `400`. On shutdown eRPC closes every client connection with `1001` (going away) straight away so clients reconnect to another instance; in-flight requests get up to `server.waitBeforeShutdown` to answer first. New connections are refused with `503` before the upgrade from then on.
 
 ## Cost frames
 

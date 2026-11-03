@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/erpc/erpc/architecture/evm"
+	_ "github.com/erpc/erpc/architecture/jsonrpc" // registers the jsonrpc passthrough architecture
 	"github.com/erpc/erpc/architecture/svm"
 	"github.com/erpc/erpc/auth"
 	"github.com/erpc/erpc/clients"

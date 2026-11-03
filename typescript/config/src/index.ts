@@ -63,9 +63,11 @@ export {
   // Architecture export
   ArchitectureEvm,
   ArchitectureSvm,
+  ArchitectureJsonRpc,
   // Upstream types const exprots
   UpstreamTypeEvm,
   UpstreamTypeSvm,
+  UpstreamTypeJsonRpc,
   // Auth types
   AuthTypeSecret,
   AuthTypeJwt,
@@ -133,6 +135,7 @@ export type {
   EvmNetworkConfig,
   EvmIntegrityConfig,
   SvmNetworkConfig,
+  JsonRpcNetworkConfig,
   SelectionPolicyConfig,
   EvalScope,
   DirectiveDefaultsConfig,

@@ -165,7 +165,7 @@ func NewJsonRpcResponseFromBytes(id []byte, resultRaw []byte, errBytes []byte) (
 		result:  resultRaw,
 	}
 
-	if len(errBytes) > 0 {
+	if len(errBytes) > 0 && !isJsonNull(errBytes) {
 		// Copy to avoid retaining buffer via unsafe conversion
 		err := jr.ParseError(string(errBytes))
 		if err != nil {
@@ -181,6 +181,12 @@ func NewJsonRpcResponseFromBytes(id []byte, resultRaw []byte, errBytes []byte) (
 	}
 
 	return jr, nil
+}
+
+// isJsonNull reports whether raw is the JSON literal null. JSON-RPC 1.0
+// servers send "error": null on success, which is the absence of an error.
+func isJsonNull(raw []byte) bool {
+	return string(bytes.TrimSpace(raw)) == "null"
 }
 
 func MustNewJsonRpcResponseFromBytes(id []byte, resultRaw []byte, errBytes []byte) *JsonRpcResponse {
@@ -373,7 +379,9 @@ func (r *JsonRpcResponse) ParseFromStream(ctx []context.Context, reader io.Reade
 		}
 	}
 
-	if len(temp.Error) > 0 {
+	// JSON-RPC 1.0 servers always send the "error" member and set it to null
+	// on success: a null error is no error.
+	if len(temp.Error) > 0 && !isJsonNull(temp.Error) {
 		if err := r.ParseError(string(temp.Error)); err != nil {
 			return err
 		}

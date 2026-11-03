@@ -131,7 +131,7 @@ func TestNewPayloadFromHttp_SignalPrecedence(t *testing.T) {
 			if args == nil {
 				args = url.Values{}
 			}
-			ap, err := NewPayloadFromHttp("eth_call", "10.0.0.1:1234", headers, args)
+			ap, err := NewPayloadFromHttp("eth_call", "10.0.0.1:1234", headers, args, "")
 			require.NoError(t, err)
 			assert.Equal(t, "eth_call", ap.Method)
 			assert.Equal(t, tc.wantType, ap.Type)
@@ -169,7 +169,7 @@ func TestNewPayloadFromHttp_MalformedBasicAuth(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ap, err := NewPayloadFromHttp("eth_call", "", http.Header{"Authorization": {tc.value}}, url.Values{})
+			ap, err := NewPayloadFromHttp("eth_call", "", http.Header{"Authorization": {tc.value}}, url.Values{}, "")
 			require.Error(t, err)
 			assert.Nil(t, ap)
 		})

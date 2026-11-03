@@ -160,7 +160,7 @@ func TestHealthCheckSvmNetworkScope(t *testing.T) {
 		ctx, w,
 		&http.Request{Method: "GET", URL: &url.URL{Path: "/"}},
 		&startTime,
-		"solana-mainnet-beta", "svm", "mainnet-beta",
+		"solana-mainnet-beta", "svm", "mainnet-beta", "",
 		encoder,
 		func(ctx context.Context, statusCode int, body error) {
 			w.WriteHeader(statusCode)

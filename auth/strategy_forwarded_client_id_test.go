@@ -14,7 +14,7 @@ import (
 
 func forwardedPayload(t *testing.T, remoteAddr string, headers http.Header) *AuthPayload {
 	t.Helper()
-	ap, err := NewPayloadFromHttp("eth_blockNumber", remoteAddr, headers, url.Values{})
+	ap, err := NewPayloadFromHttp("eth_blockNumber", remoteAddr, headers, url.Values{}, "")
 	require.NoError(t, err)
 	return ap
 }

@@ -69,7 +69,10 @@ func InjectHTTPResponseTraceContext(ctx context.Context, w http.ResponseWriter) 
 // extractor reads credentials from (see auth.NewPayloadFromHttp). A SIWE
 // signature is replayable until its message expires, so it is redacted too;
 // the SIWE message itself is kept.
-var credentialQueryParams = []string{"token", "secret", "jwt", "signature"}
+var credentialQueryParams = []string{"token", "secret", "jwt", "signature", "apikey"}
+
+// RedactedPath replaces a request path that carries a credential in telemetry.
+const RedactedPath = "/REDACTED"
 
 // RedactedRequestURL renders u for telemetry with the values of
 // credential-carrying query parameters replaced, so secrets passed in the
@@ -97,6 +100,19 @@ func RedactedRequestURL(u *url.URL) string {
 	c := *u
 	c.RawQuery = q.Encode()
 	return c.String()
+}
+
+// RedactHTTPServerSpanPath overwrites the http.url attribute of the server
+// span in ctx with u's path replaced by RedactedPath, for requests whose path
+// carries a credential.
+func RedactHTTPServerSpanPath(ctx context.Context, u *url.URL) {
+	if !IsTracingEnabled || u == nil {
+		return
+	}
+	c := *u
+	c.Path = RedactedPath
+	c.RawPath = ""
+	trace.SpanFromContext(ctx).SetAttributes(semconv.HTTPURLKey.String(RedactedRequestURL(&c)))
 }
 
 func StartHTTPServerSpan(ctx context.Context, r *http.Request) (context.Context, trace.Span) {

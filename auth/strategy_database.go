@@ -115,7 +115,7 @@ func NewDatabaseStrategy(appCtx context.Context, logger *zerolog.Logger, cfg *co
 }
 
 func (s *DatabaseStrategy) Supports(ap *AuthPayload) bool {
-	return ap.Type == common.AuthTypeSecret || ap.Type == common.AuthTypeDatabase
+	return ap.Type == common.AuthTypeSecret || ap.Type == common.AuthTypeDatabase || secretAccepted(ap, s.cfg.AdditionalLocations)
 }
 
 func (s *DatabaseStrategy) Authenticate(ctx context.Context, req *common.NormalizedRequest, ap *AuthPayload) (*common.User, error) {

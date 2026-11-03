@@ -74,6 +74,7 @@ func (s *HttpServer) handleHealthCheck(
 	projectId string,
 	architecture string,
 	chainId string,
+	credentialPath string,
 	encoder sonic.Encoder,
 	writeFatalError func(ctx context.Context, statusCode int, body error),
 ) {
@@ -87,7 +88,7 @@ func (s *HttpServer) handleHealthCheck(
 		headers := r.Header
 		queryArgs := r.URL.Query()
 
-		ap, err := auth.NewPayloadFromHttp("healthcheck", r.RemoteAddr, headers, queryArgs)
+		ap, err := auth.NewPayloadFromHttp("healthcheck", r.RemoteAddr, headers, queryArgs, credentialPath)
 		if err != nil {
 			handleErrorResponse(ctx, &logger, startedAt, nil, err, w, encoder, writeFatalError, &common.TRUE, s.executionHeadersMode())
 			return

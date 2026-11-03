@@ -63,6 +63,18 @@ func NewAuthorizer(appCtx context.Context, logger *zerolog.Logger, projectId str
 		if err != nil {
 			return nil, err
 		}
+	case common.AuthTypeForwardedClientId:
+		if cfg.ForwardedClientId == nil {
+			return nil, common.NewErrInvalidConfig("forwardedClientId strategy config is nil")
+		}
+		strategy, err = NewForwardedClientIdStrategy(cfg.ForwardedClientId)
+		if err != nil {
+			return nil, err
+		}
+		if len(cfg.ForwardedClientId.AllowedProxies) == 0 {
+			logger.Warn().Str("projectId", projectId).Str("header", cfg.ForwardedClientId.Header).
+				Msg("forwardedClientId auth strategy accepts its header from any peer; set allowedProxies to the proxy that sets it")
+		}
 	default:
 		return nil, common.NewErrInvalidConfig(fmt.Sprintf("unknown auth strategy type: %s", cfg.Type))
 	}

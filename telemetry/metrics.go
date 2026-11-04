@@ -135,6 +135,16 @@ var (
 		Help:      "Whether the upstream WebSocket connection is currently established (1) or down/wedged (0).",
 	}, []string{"project", "vendor", "network", "upstream"})
 
+	// MetricUpstreamWebsocketHeadsStallReconnectsTotal counts reconnects
+	// forced because an upstream's newHeads subscription went silent while
+	// the same upstream's polled head kept advancing. Any increase means a
+	// node dropped a live subscription without closing it.
+	MetricUpstreamWebsocketHeadsStallReconnectsTotal = DefineCounter(prometheus.CounterOpts{
+		Namespace: "erpc",
+		Name:      "upstream_websocket_heads_stall_reconnects_total",
+		Help:      "Upstream WebSocket reconnects forced by a silent newHeads subscription while the upstream head advanced.",
+	}, []string{"project", "network", "upstream"})
+
 	MetricWebsocketSubscriptionNotificationsDroppedTotal = DefineCounter(prometheus.CounterOpts{
 		Namespace: "erpc",
 		Name:      "websocket_subscription_notifications_dropped_total",
@@ -195,36 +205,54 @@ var (
 		Help:      "Event keys held by the network's logs and newPendingTransactions dedup windows; each filter's window holds at most indexer.dedupWindowSize keys (default 8192).",
 	}, []string{"project", "network"})
 
+	MetricSubscriptionWithheldHeadsTotal = DefineCounter(prometheus.CounterOpts{
+		Namespace: "erpc",
+		Name:      "subscription_withheld_heads_total",
+		Help:      "Upstream newHeads events not delivered to clients because the network did not accept the head.",
+	}, []string{"project", "network"})
+
+	MetricSubscriptionUndeliveredTotal = DefineCounter(prometheus.CounterOpts{
+		Namespace: "erpc",
+		Name:      "subscription_undelivered_total",
+		Help:      "Upstream subscription events that passed dedup but matched no client subscription.",
+	}, []string{"project", "network", "kind"})
+
+	MetricNetworkSubscriptionLastHeadTimestamp = DefineGauge(prometheus.GaugeOpts{
+		Namespace: "erpc",
+		Name:      "network_subscription_last_head_timestamp_seconds",
+		Help:      "Unix time the subscription indexer last accepted a new head for the network.",
+	}, []string{"project", "network"})
+
 	// MetricNetworkServedTipBlockNumber is the block number the network actually
 	// advertises/serves as the tip for a block tag (axis=latest|finalized): the
-	// freshest block a strict MAJORITY of eligible upstreams already have (see
-	// common.PickServedTip). lane="all" is the network-wide pick; a named lane is a
-	// use-upstream group's own pick (present only for networks receiving
-	// targeted traffic).
+	// freshest block at least servedTip.quorum eligible upstreams already have
+	// (see common.PickServedTip). lane="all" is the network-wide pick; a named
+	// lane is a use-upstream group's own pick (present only for networks
+	// receiving targeted traffic).
 	MetricNetworkServedTipBlockNumber = DefineGauge(prometheus.GaugeOpts{
 		Namespace: "erpc",
 		Name:      "network_served_tip_block_number",
-		Help:      "Block number served/advertised as the tip (freshest block a strict majority of eligible upstreams already have). lane=\"all\" = network-wide; a named lane = a use-upstream group's own tip.",
+		Help:      "Block number served/advertised as the tip (freshest block at least servedTip.quorum eligible upstreams already have). lane=\"all\" = network-wide; a named lane = a use-upstream group's own tip.",
 	}, []string{"project", "network", "lane", "axis"})
 
 	// MetricNetworkServedTipLagBlocks is the deliberate, bounded served-tip lag:
-	// blocks the majority tip sits behind the single freshest upstream view at
-	// pick time (Freshest - Tip). Computed at the same instant as the pick, so it
-	// is exact (no cross-metric scrape skew). NOTE: the series is ABSENT (not 0)
-	// when served-tip is in default MAX mode (feature off) for that axis.
+	// blocks the served tip sits behind the corroborated freshest upstream view
+	// at pick time (Freshest - Tip). Computed at the same instant as the pick,
+	// so it is exact (no cross-metric scrape skew).
 	MetricNetworkServedTipLagBlocks = DefineGauge(prometheus.GaugeOpts{
 		Namespace: "erpc",
 		Name:      "network_served_tip_lag_blocks",
-		Help:      "Blocks the majority served tip sits behind the single freshest upstream view at pick time, per network, lane and axis. lane=\"all\" is the network-wide pick; a named lane is a use-upstream group's own pick.",
+		Help:      "Blocks the served tip sits behind the corroborated freshest upstream view at pick time, per network, lane and axis. lane=\"all\" is the network-wide pick; a named lane is a use-upstream group's own pick.",
 	}, []string{"project", "network", "lane", "axis"})
 
 	// MetricNetworkServedTipAdvanceAgeSeconds is the time since this process
 	// last observed the served-tip VALUE change, exported at pick time. This
 	// is the universal stuck-tip detector: regardless of WHICH mechanism would
 	// freeze the tip (a failure mode nobody predicted included), a healthy
-	// network advances every block or two, so `age >> block time` on a network
-	// with live traffic is always alert-worthy. Absent until the process
-	// observes its first change (and absent in default MAX mode).
+	// network advances every block or two, so `age >> block time` on the
+	// network-wide lane, which is evaluated every second whatever the
+	// traffic, is always alert-worthy. Absent until the process
+	// observes its first change.
 	MetricNetworkServedTipAdvanceAgeSeconds = DefineGauge(prometheus.GaugeOpts{
 		Namespace: "erpc",
 		Name:      "network_served_tip_advance_age_seconds",
@@ -234,7 +262,7 @@ var (
 	// MetricNetworkServedTipRegressionTotal counts the TRANSITIONS into a guard
 	// state: a pick fell further than the configured tolerance below the
 	// corroborated live head, i.e. a ballot poisoned by values that are not head
-	// observations (the 2026-08 celo incident: two upstreams voting their
+	// observations (e.g. two capped legacy upstreams voting their
 	// blockAvailability.upper bound). outcome="held" = the network started
 	// serving its last corroborated pick instead; outcome="failed_open" = a hold
 	// outlasted the guard's window and the pick is served as computed.
@@ -250,29 +278,25 @@ var (
 		Help:      "Transitions into a served-tip regression-guard state (counts state ENTRIES, not evaluations; any nonzero rate is alert-worthy), by outcome: held = the last corroborated pick is being served instead of a pick far below the corroborated live head; failed_open = that hold outlasted the guard's window and the pick is served as computed.",
 	}, []string{"project", "network", "lane", "axis", "outcome"})
 
-	// MetricNetworkServedTipTrajectoryTotal counts the TRANSITIONS into a
-	// trajectory-referee state: a FRESHER corroborated group of live heads sat
-	// above the majority pick. outcome="override" = that group matched the
-	// network's own head trajectory, earned its dwell, and is being served
-	// instead of a stalled majority — rare, and the reason to page someone: some
-	// upstreams froze while remaining eligible. outcome="fallback" = it was
-	// refused (too far from the trajectory, or it has not held its place long
-	// enough), so the majority pick stands.
-	//
-	// TRANSITIONS, NOT EVALUATIONS (see MetricNetworkServedTipRegressionTotal),
-	// and an override the guaranteed-method floor pulls back to the majority pick
-	// is not counted at all — it changed nothing.
-	//
-	// Both outcomes are silent in steady state by construction: a fleet whose
-	// live heads form one cluster elects that cluster, and a fleet permanently
-	// split around its own median elects the median's group (the trajectory is
-	// fitted to the median, so no permanently-offset group is ever closer to it).
-	// Any nonzero rate here means the fleet's groups are genuinely diverging.
-	MetricNetworkServedTipTrajectoryTotal = DefineCounter(prometheus.CounterOpts{
+	// MetricUpstreamHeadBenchedTotal counts the times the health tracker benched
+	// an upstream's head: it stayed behind peers that kept advancing (stalled,
+	// or replaying far behind the tip) for its stall window. A benched upstream
+	// votes in no served-tip ballot and is not the network lag reference until
+	// its head catches up with the live ones.
+	MetricUpstreamHeadBenchedTotal = DefineCounter(prometheus.CounterOpts{
 		Namespace: "erpc",
-		Name:      "network_served_tip_trajectory_total",
-		Help:      "Transitions into a served-tip trajectory-referee state (counts state ENTRIES, not evaluations; any nonzero rate is alert-worthy), by outcome: override = a corroborated group of live heads matched the network's head trajectory and is served in place of a stalled majority; fallback = such a group sat above the majority pick and was refused.",
-	}, []string{"project", "network", "lane", "axis", "outcome"})
+		Name:      "upstream_head_benched_total",
+		Help:      "Times an upstream's head was benched out of the served-tip ballots and the network lag reference: it stayed behind peers that kept advancing for its stall window.",
+	}, []string{"project", "vendor", "network", "upstream"})
+
+	// MetricWebsocketRejectedTotal counts client WebSocket connections and
+	// subscriptions refused by the instance-wide caps, by reason:
+	// conn_global, conn_per_ip or sub_global.
+	MetricWebsocketRejectedTotal = DefineCounter(prometheus.CounterOpts{
+		Namespace: "erpc",
+		Name:      "websocket_rejected_total",
+		Help:      "Client WebSocket connections and subscriptions refused by server.webSocket caps, by reason (conn_global, conn_per_ip, sub_global).",
+	}, []string{"project", "reason"})
 
 	MetricUpstreamCordoned = DefineGauge(prometheus.GaugeOpts{
 		Namespace: "erpc",
@@ -347,6 +371,12 @@ var (
 		Namespace: "erpc",
 		Name:      "selection_shadow_exclusion_total",
 		Help:      "Per-upstream WOULD-HAVE-BEEN-EXCLUDED events from `shadowExcludeIf` predicates. Same leaf-slug attribution as `selection_exclusion_total`, but the upstream stays in rotation — meant for safely auditioning a new (or removed) exclusion rule in production before promoting it to a real `excludeIf`.",
+	}, []string{"project", "network", "method", "upstream", "reason"})
+
+	MetricSelectionMethodBlockTotal = DefineCounter(prometheus.CounterOpts{
+		Namespace: "erpc",
+		Name:      "selection_method_block_total",
+		Help:      "Ticks where `blockMethods` blocked an upstream for one method; it stays in rotation for other methods. `method` is the blocked method, `reason` the leaf-predicate slug.",
 	}, []string{"project", "network", "method", "upstream", "reason"})
 
 	MetricSelectionExcludedSeconds = DefineGauge(prometheus.GaugeOpts{
@@ -472,12 +502,13 @@ var (
 	}, []string{"project", "vendor", "network", "upstream"})
 
 	// MetricUpstreamStateProbe counts probe outcomes, by probe kind
-	// (context = execution-context call, proof = eth_getProof) and outcome
-	// (match/mismatch/unsupported/error).
+	// (context = execution-context call at a pinned block, proof = eth_getProof,
+	// latest = execution-context call at the "latest" tag) and outcome
+	// (match/stale/pin_ignored/mismatch/unsupported/error).
 	MetricUpstreamStateProbe = DefineCounter(prometheus.CounterOpts{
 		Namespace: "erpc",
 		Name:      "upstream_state_probe_total",
-		Help:      "Total state-trie probes by kind (context/proof) and outcome (match/mismatch/unsupported/error).",
+		Help:      "Total state-trie probes by kind (context/proof/latest) and outcome (match/stale/pin_ignored/mismatch/unsupported/error).",
 	}, []string{"project", "vendor", "network", "upstream", "probe", "outcome"})
 
 	// MetricIntegrityFollowHead is the highest block of the CONTIGUOUS,
@@ -788,6 +819,20 @@ var (
 		Help:      "Total vendor credit units accrued by upstream attempts, per (project, network, upstream, vendor, method, finality). Vendor-owned units, not money; not comparable across vendors.",
 	}, []string{"project", "network", "upstream", "vendor", "category", "finality"})
 
+	// Vendor requests saved by packing = sum(outcome="packed") - count(batch_size).
+	MetricUpstreamMulticall3CallsTotal = DefineCounter(prometheus.CounterOpts{
+		Namespace: "erpc",
+		Name:      "upstream_multicall3_calls_total",
+		Help:      "eth_calls seen by an upstream with multicall3 packing, by outcome: packed (answered by a multicall), alone (no other call to pack with), reverted/empty/failed (multicall could not answer it exactly, sent alone), ineligible (not packable, sent alone), bypassed (target in bypassContracts or learned, sent alone), canceled (attempt ended while waiting).",
+	}, []string{"project", "network", "upstream", "vendor", "outcome"})
+
+	MetricUpstreamMulticall3BatchSize = DefineLabeledHistogram(prometheus.HistogramOpts{
+		Namespace: "erpc",
+		Name:      "upstream_multicall3_batch_size",
+		Help:      "eth_calls carried by each multicall3 request sent to an upstream.",
+		Buckets:   []float64{2, 3, 5, 8, 13, 20, 50, 100},
+	}, []string{"project", "network", "upstream", "vendor"})
+
 	// MetricNetworkRetryAttemptTotal counts retry attempts at the
 	// network scope, labeled by the reason for retry (empty_result /
 	// pending_tx / retryable_error / block_unavailable / missing_data).
@@ -886,27 +931,30 @@ var (
 		Help:      "Total number of rate limiter fail-open events (requests allowed due to errors/timeouts).",
 	}, []string{"project", "network", "user", "agent_name", "budget", "category", "reason"})
 
+	// MetricRateLimiterStoreFailureTotal counts requests the remote store could
+	// not decide, by reason (store_unavailable | store_error | admission_full |
+	// limit_timeout) and what onFailure decided (allow | deny | local_allow |
+	// local_deny). rate_limiter_failopen_total keeps counting the allow ones.
+	MetricRateLimiterStoreFailureTotal = DefineCounter(prometheus.CounterOpts{
+		Namespace: "erpc",
+		Name:      "rate_limiter_store_failure_total",
+		Help:      "Total number of rate-limit checks the remote store could not decide, by reason and onFailure decision.",
+	}, []string{"budget", "reason", "decision"})
+
 	// MetricRateLimiterRemoteInflight is a per-budget gauge of concurrent in-flight
-	// remote (e.g. Redis) DoLimit calls. When a remote rate limiter is overwhelmed
-	// this gauge climbs without bound — the admission semaphore in
-	// doLimitWithTimeout uses MetricRateLimiterAdmissionSheddedTotal to indicate
-	// when the cap is reached, but this gauge is the canary that something is
-	// queueing on the remote.
+	// remote (e.g. Redis) DoLimit calls, bounded by the admission semaphore.
 	MetricRateLimiterRemoteInflight = DefineGauge(prometheus.GaugeOpts{
 		Namespace: "erpc",
 		Name:      "rate_limiter_remote_inflight",
 		Help:      "Current number of in-flight remote rate-limit checks per budget.",
 	}, []string{"budget"})
 
-	// MetricRateLimiterRemoteAdmissionSheddedTotal is a counter of fail-open events
-	// caused by the per-budget admission semaphore being full. This is intentionally
-	// distinct from "limit_timeout" in MetricRateLimiterFailopenTotal because it
-	// indicates load shedding (we never even attempted the remote call) vs the
-	// remote being slow.
+	// MetricRateLimiterRemoteAdmissionSheddedTotal counts checks that never
+	// reached the remote because the per-budget admission semaphore was full.
 	MetricRateLimiterRemoteAdmissionSheddedTotal = DefineCounter(prometheus.CounterOpts{
 		Namespace: "erpc",
 		Name:      "rate_limiter_remote_admission_shedded_total",
-		Help:      "Total number of remote rate-limit checks fail-opened because the admission semaphore was full.",
+		Help:      "Total number of remote rate-limit checks shed because the admission semaphore was full.",
 	}, []string{"budget"})
 
 	MetricCacheSetSuccessTotal = DefineCounter(prometheus.CounterOpts{

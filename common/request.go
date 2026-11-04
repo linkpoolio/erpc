@@ -19,6 +19,7 @@ const (
 	CompositeTypeLogsSplitProactive        = "logs-split-proactive"
 	CompositeTypeTraceFilterSplitOnError   = "trace-filter-split-on-error"
 	CompositeTypeTraceFilterSplitProactive = "trace-filter-split-proactive"
+	CompositeTypeMulticall3                = "multicall3"
 )
 
 const RequestContextKey ContextKey = "rq"
@@ -64,6 +65,32 @@ func WithSweepIteration(ctx context.Context) context.Context {
 func IsSweepIteration(ctx context.Context) bool {
 	v, _ := ctx.Value(SweepIterationContextKey).(bool)
 	return v
+}
+
+// wireParamsContextKey carries the JSON-RPC params one upstream attempt sends
+// for one request in place of its own. The request keeps its params, so the
+// cache key, response binding and every other upstream see the original question.
+type wireParamsContextKey struct{}
+
+// wireParams binds the override to its request: any other request sent with a
+// derived ctx on the same attempt (a probe, a state poll) keeps its own params.
+type wireParams struct {
+	req    *NormalizedRequest
+	params []interface{}
+}
+
+// WithWireParams returns ctx whose upstream attempt sends params for req on the wire.
+func WithWireParams(ctx context.Context, req *NormalizedRequest, params []interface{}) context.Context {
+	return context.WithValue(ctx, wireParamsContextKey{}, wireParams{req: req, params: params})
+}
+
+// WireParams returns the params an upstream client sends for req under ctx:
+// the attempt's override for exactly req when set, else req's own params.
+func WireParams(ctx context.Context, req *NormalizedRequest, params []interface{}) []interface{} {
+	if w, ok := ctx.Value(wireParamsContextKey{}).(wireParams); ok && w.req == req {
+		return w.params
+	}
+	return params
 }
 
 type directiveKeyNames struct {
@@ -230,6 +257,10 @@ type NormalizedRequest struct {
 	upstreamMutex    sync.Mutex
 	UpstreamIdx      uint32
 	ErrorsByUpstream sync.Map
+	// Upstream -> its latest block when the ErrorsByUpstream entry was stored.
+	// Wrong-empty accounting needs the head at answer time: by the time the
+	// request ends, a lagging upstream may have caught up.
+	headsAtError sync.Map
 
 	// Fields for centralized upstream management
 	upstreamList      []Upstream // Available upstreams for this request
@@ -1522,6 +1553,7 @@ func (r *NormalizedRequest) MarkUpstreamCompleted(ctx context.Context, upstream 
 	// permanent errors (method ignored, execution exception).
 	if err != nil {
 		r.ErrorsByUpstream.Store(upstream, err)
+		r.headsAtError.Store(upstream, latestBlockOf(upstream))
 	} else if resp != nil && resp.IsResultEmptyish(ctx) {
 		jr, jrErr := resp.JsonRpcResponse(ctx)
 		if jr == nil {
@@ -1529,6 +1561,7 @@ func (r *NormalizedRequest) MarkUpstreamCompleted(ctx context.Context, upstream 
 		} else {
 			r.ErrorsByUpstream.Store(upstream, NewErrEndpointMissingData(fmt.Errorf("upstream responded emptyish: %v", jr.GetResultString()), upstream))
 		}
+		r.headsAtError.Store(upstream, latestBlockOf(upstream))
 	}
 
 	// Free from ConsumedUpstreams if the upstream can be retried on a
@@ -1544,4 +1577,25 @@ func (r *NormalizedRequest) MarkUpstreamCompleted(ctx context.Context, upstream 
 	if canReUse {
 		r.ConsumedUpstreams.Delete(upstream)
 	}
+}
+
+// HeadAtError returns the upstream's latest block as eRPC knew it when the
+// upstream's ErrorsByUpstream entry was stored; 0 when unknown.
+func (r *NormalizedRequest) HeadAtError(upstream Upstream) int64 {
+	if v, ok := r.headsAtError.Load(upstream); ok {
+		return v.(int64)
+	}
+	return 0
+}
+
+func latestBlockOf(upstream Upstream) int64 {
+	eu, ok := upstream.(EvmUpstream)
+	if !ok {
+		return 0
+	}
+	sp := eu.EvmStatePoller()
+	if sp == nil || sp.IsObjectNull() {
+		return 0
+	}
+	return sp.LatestBlock()
 }

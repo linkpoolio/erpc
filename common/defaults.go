@@ -1365,14 +1365,7 @@ func (p *ProjectConfig) SetDefaults(opts *DefaultOptions) error {
 			if err := repositoryCfg.SetDefaults(p.UpstreamDefaults); err != nil {
 				return fmt.Errorf("failed to set defaults for repository provider: %w", err)
 			}
-			envioCfg := &ProviderConfig{
-				Id:     "envio",
-				Vendor: "envio",
-			}
-			if err := envioCfg.SetDefaults(p.UpstreamDefaults); err != nil {
-				return fmt.Errorf("failed to set defaults for envio provider: %w", err)
-			}
-			p.Providers = append(p.Providers, repositoryCfg, envioCfg)
+			p.Providers = append(p.Providers, repositoryCfg)
 		}
 	}
 	if p.Providers == nil {
@@ -2142,6 +2135,23 @@ func (e *EvmUpstreamConfig) SetDefaults(defaults *EvmUpstreamConfig) error {
 		}
 	}
 
+	if e.PinLatestTag == nil && defaults != nil {
+		e.PinLatestTag = defaults.PinLatestTag
+	}
+
+	if e.Multicall3 == nil && defaults != nil && defaults.Multicall3 != nil {
+		v := *defaults.Multicall3
+		e.Multicall3 = &v
+	}
+	if e.Multicall3 != nil {
+		if e.Multicall3.MaxWait == 0 {
+			e.Multicall3.MaxWait = Duration(10 * time.Millisecond)
+		}
+		if e.Multicall3.MaxCalls == 0 {
+			e.Multicall3.MaxCalls = 20
+		}
+	}
+
 	return nil
 }
 
@@ -2245,6 +2255,9 @@ func (n *NetworkConfig) SetDefaults(upstreams []*UpstreamConfig, defaults *Netwo
 			if n.Evm.DynamicBlockTimeDebounceMultiplier == nil && defaults.Evm.DynamicBlockTimeDebounceMultiplier != nil {
 				n.Evm.DynamicBlockTimeDebounceMultiplier = defaults.Evm.DynamicBlockTimeDebounceMultiplier
 			}
+			if n.Evm.FinalizedDebounceDepthMultiplier == nil && defaults.Evm.FinalizedDebounceDepthMultiplier != nil {
+				n.Evm.FinalizedDebounceDepthMultiplier = defaults.Evm.FinalizedDebounceDepthMultiplier
+			}
 			if n.Evm.BlockUnavailableDelayMultiplier == nil && defaults.Evm.BlockUnavailableDelayMultiplier != nil {
 				n.Evm.BlockUnavailableDelayMultiplier = defaults.Evm.BlockUnavailableDelayMultiplier
 			}
@@ -2290,6 +2303,14 @@ func (n *NetworkConfig) SetDefaults(upstreams []*UpstreamConfig, defaults *Netwo
 			}
 			if n.Evm.StripSubscribeFromBlockZero == nil && defaults.Evm.StripSubscribeFromBlockZero != nil {
 				n.Evm.StripSubscribeFromBlockZero = defaults.Evm.StripSubscribeFromBlockZero
+			}
+			for method, on := range defaults.Evm.LocalAnswers {
+				if _, set := n.Evm.LocalAnswers[method]; !set {
+					if n.Evm.LocalAnswers == nil {
+						n.Evm.LocalAnswers = make(map[string]bool, len(defaults.Evm.LocalAnswers))
+					}
+					n.Evm.LocalAnswers[method] = on
+				}
 			}
 		} else if n.Evm == nil && defaults.Evm != nil && n.Svm == nil && n.Architecture != ArchitectureSvm {
 			// Copy EVM defaults only onto networks that are (or can become) EVM.
@@ -2440,6 +2461,7 @@ func migrateLegacyIntegrityChecks(n *NetworkConfig) {
 const DefaultEvmFinalityDepth = 1024
 const DefaultEvmStatePollerDebounce = Duration(5 * time.Second)
 const DefaultDynamicBlockTimeDebounceMultiplier = 0.7
+const DefaultFinalizedDebounceDepthMultiplier = 0.05
 const DefaultBlockUnavailableDelayMultiplier = 1.0
 
 // DefaultToleratedBlockHeadRollback is the tolerance (in blocks) applied when a
@@ -2450,37 +2472,12 @@ const DefaultBlockUnavailableDelayMultiplier = 1.0
 // and the health tracker so both layers converge on the same head.
 const DefaultToleratedBlockHeadRollback = 1024
 
-// DefaultServedTipTrajectoryWindow is how much head history the served-tip
-// trajectory referee needs before it may participate in a pick
-// (EvmServedTipConfig.TrajectoryWindow). Ten minutes is long enough that a
-// majority stall cannot masquerade as the trajectory (the referee's evidence is
-// the median of live heads, so a stall of half the window already flattens the
-// fit and stands the referee down), and short enough to be warm well within a
-// pod's lifetime.
-const DefaultServedTipTrajectoryWindow = 10 * time.Minute
-
-// ServedTipTrajectorySampleInterval and ServedTipTrajectoryMaxSamples are the
-// referee's recording cadence and its hard ring cap (architecture/evm's
-// tipSampleInterval / tipMaxBufferCapacity, which read them from here so the
-// config bounds below cannot drift from the mechanism they describe).
-const (
-	ServedTipTrajectorySampleInterval = 5 * time.Second
-	ServedTipTrajectoryMaxSamples     = 1024
-)
-
-// MinServedTipTrajectoryWindow / MaxServedTipTrajectoryWindow bound a configured
-// EvmServedTipConfig.TrajectoryWindow to the values that can actually work.
-//
-// Below a minute the window is self-defeating: it must be long enough that a
-// stall cannot look like a trajectory, and a fit over seconds of history is
-// noise. Above 80% of what the ring can span (cadence × capacity) the required
-// span is never reached, so the referee would stand down forever while looking
-// configured — the failure mode a range check exists to prevent, since nothing
-// in the metrics distinguishes "never warm" from "never needed".
-const (
-	MinServedTipTrajectoryWindow = time.Minute
-	MaxServedTipTrajectoryWindow = ServedTipTrajectorySampleInterval * ServedTipTrajectoryMaxSamples * 4 / 5
-)
+// DefaultServedTipQuorum is how many eligible upstreams must have a block
+// before the network serves it as "latest"/"finalized" (ServedTipQuorum).
+// Two keeps a lone far-ahead head out of every multi-upstream ballot, while a
+// ballot reduced to one voter (benched peers, a one-upstream network) still
+// serves that voter's head.
+const DefaultServedTipQuorum = 2
 
 // DefaultEmptyResultMaxAttempts bounds retries when the requested data isn't on the
 // upstream yet (empty/missing-data point-lookups, pending tx-lookups, and
@@ -2643,6 +2640,10 @@ func (e *EvmNetworkConfig) SetDefaults() error {
 	if e.DynamicBlockTimeDebounceMultiplier == nil {
 		d := DefaultDynamicBlockTimeDebounceMultiplier
 		e.DynamicBlockTimeDebounceMultiplier = &d
+	}
+	if e.FinalizedDebounceDepthMultiplier == nil {
+		d := DefaultFinalizedDebounceDepthMultiplier
+		e.FinalizedDebounceDepthMultiplier = &d
 	}
 	if e.BlockUnavailableDelayMultiplier == nil {
 		d := DefaultBlockUnavailableDelayMultiplier
@@ -3395,6 +3396,9 @@ func (r *RateLimitStoreConfig) SetDefaults() error {
 		}
 		if err := r.Redis.SetDefaults(); err != nil {
 			return fmt.Errorf("failed to set defaults for redis connector: %w", err)
+		}
+		if r.OnFailure == "" {
+			r.OnFailure = RateLimitStoreFailureAllow
 		}
 	}
 	return nil

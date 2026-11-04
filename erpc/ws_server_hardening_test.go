@@ -247,7 +247,8 @@ func TestWebSocket_UnsubscribeIsScopedToConnection(t *testing.T) {
 }
 
 // Shutdown closes client connections with 1001 as soon as it starts, not
-// after waitBeforeShutdown, and lets in-flight requests answer first.
+// after waitBeforeShutdown, lets in-flight requests answer first, and
+// refuses new connections before the upgrade.
 func TestWebSocket_ShutdownClosesPromptlyAfterInflightRequests(t *testing.T) {
 	util.ResetGock()
 	defer util.ResetGock()
@@ -299,13 +300,14 @@ func TestWebSocket_ShutdownClosesPromptlyAfterInflightRequests(t *testing.T) {
 	require.ErrorAs(t, err, &closeErr)
 	assert.Equal(t, websocket.CloseGoingAway, closeErr.Code)
 
-	// A draining server closes new connections straight away.
-	late := dialWs(t, addr)
-	defer late.Close()
-	_ = late.SetReadDeadline(time.Now().Add(3 * time.Second))
-	_, _, err = late.ReadMessage()
-	require.ErrorAs(t, err, &closeErr)
-	assert.Equal(t, websocket.CloseGoingAway, closeErr.Code)
+	// A draining server refuses new connections with 503 before the upgrade.
+	late, lateResp, err := websocket.DefaultDialer.Dial(fmt.Sprintf("ws://%s/test_ws/evm/123", addr), nil)
+	if late != nil {
+		_ = late.Close()
+	}
+	require.ErrorIs(t, err, websocket.ErrBadHandshake, "a draining server must not complete the handshake")
+	require.NotNil(t, lateResp)
+	assert.Equal(t, http.StatusServiceUnavailable, lateResp.StatusCode)
 }
 
 // A peer that never answers pings is disconnected.

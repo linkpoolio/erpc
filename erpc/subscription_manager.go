@@ -116,7 +116,7 @@ func (sm *SubscriptionManager) Subscribe(
 	reqFinality := nq.Finality(ctx)
 	telemetry.CounterHandle(telemetry.MetricNetworkRequestsReceived,
 		project.Config.Id, nw.Label(), method,
-		reqFinality.String(), nq.UserId(), nq.AgentName(),
+		reqFinality.String(), nq.UserId(), nq.AgentName(), nq.Transport(),
 	).Inc()
 
 	jrReq, err := nq.JsonRpcRequest()
@@ -150,7 +150,10 @@ func (sm *SubscriptionManager) Subscribe(
 	// Counted before it is visible, so a racing cleanup never takes the
 	// gauge below zero.
 	wsc.subscriptionsGauge(kind).Inc()
-	if err := conn.adapter.AddSubscription(clientSubID, key, kind, filterHash, maxSubs); err != nil {
+	if err := conn.adapter.AddSubscription(clientSubID, key, kind, filterHash, maxSubs, wsclient.SubscriptionLabels{
+		User:      nq.UserId(),
+		AgentName: nq.AgentName(),
+	}); err != nil {
 		wsc.subscriptionsGauge(kind).Dec()
 		sm.activeSubs.Add(-1)
 		sm.releaseFilter(ctx, key, kind, filterHash)
@@ -195,7 +198,7 @@ func (sm *SubscriptionManager) Unsubscribe(
 	reqFinality := nq.Finality(ctx)
 	telemetry.CounterHandle(telemetry.MetricNetworkRequestsReceived,
 		project.Config.Id, nw.Label(), method,
-		reqFinality.String(), nq.UserId(), nq.AgentName(),
+		reqFinality.String(), nq.UserId(), nq.AgentName(), nq.Transport(),
 	).Inc()
 
 	jrReq, err := nq.JsonRpcRequest()

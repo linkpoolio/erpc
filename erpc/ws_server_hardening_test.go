@@ -164,7 +164,7 @@ func wsConnCount(s *HttpServer) (active, subscribed int) {
 // client connections, client subscriptions of kind, and the subscriptions
 // of kind live on ws-upstream.
 func wsGauges(kind string) (conns, clientSubs, upstreamSubs float64) {
-	return testutil.ToFloat64(telemetry.MetricWebsocketConnectionsActive.WithLabelValues("test_ws")),
+	return testutil.ToFloat64(telemetry.MetricWebsocketConnectionsActive.WithLabelValues("test_ws", "evm:123")),
 		testutil.ToFloat64(telemetry.MetricWebsocketSubscriptionsActive.WithLabelValues("test_ws", "evm:123", kind)),
 		testutil.ToFloat64(telemetry.MetricUpstreamSubscriptionsActive.WithLabelValues("test_ws", "evm:123", "ws-upstream", kind))
 }

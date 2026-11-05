@@ -5,14 +5,21 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 
 	"github.com/erpc/erpc/common"
 )
 
-func NewPayloadFromHttp(method string, remoteAddr string, headers http.Header, args url.Values) (*AuthPayload, error) {
+// NewPayloadFromHttp extracts auth signals from an HTTP (or WebSocket
+// upgrade) request. credentialPath is the request path when the server does
+// not use it for routing (a domain alias preselects project, architecture and
+// chain), and "" otherwise; see PathSegmentSecret.
+func NewPayloadFromHttp(method string, remoteAddr string, headers http.Header, args url.Values, credentialPath string) (*AuthPayload, error) {
 	ap := &AuthPayload{
-		Method: method,
+		Method:     method,
+		Headers:    headers,
+		RemoteAddr: remoteAddr,
 	}
 
 	if token := args.Get("token"); token != "" { // deprecated
@@ -79,12 +86,63 @@ func NewPayloadFromHttp(method string, remoteAddr string, headers http.Header, a
 		}
 	}
 
+	// Secondary secret locations, for clients and gateways that use the
+	// common "API key" conventions. They fill ap.Secret only when no other
+	// secret was found and never change ap.Type, so they do not alter which
+	// strategies a request without one of the credentials above reaches:
+	// a request that only carries an X-Api-Key header still reaches a
+	// network strategy, and only secret/database strategies that list the
+	// location in additionalLocations pick the key up.
+	if ap.Secret == nil {
+		if apikey := args.Get("apikey"); apikey != "" {
+			ap.Secret = &SecretPayload{Value: apikey, Location: common.SecretLocationApikeyQuery}
+		} else if apikey := firstNonEmptyHeader(headers, "X-Api-Key", "Apikey"); apikey != "" {
+			ap.Secret = &SecretPayload{Value: apikey, Location: common.SecretLocationApikeyHeader}
+		} else if pathSecret := PathSegmentSecret(credentialPath); pathSecret != "" {
+			ap.Secret = &SecretPayload{Value: pathSecret, Location: common.SecretLocationPath}
+		}
+	}
+
 	// Default to network strategy when no other auth signals are present.
 	if ap.Type == "" {
 		ap.Type = common.AuthTypeNetwork
 	}
 
 	return ap, nil
+}
+
+// reservedPathSegments are single-segment paths eRPC serves itself; they are
+// never treated as a secret.
+var reservedPathSegments = map[string]struct{}{
+	"admin":       {},
+	"healthcheck": {},
+	"metrics":     {},
+}
+
+// PathSegmentSecret returns the secret carried as the only path segment of
+// requestPath ("/<secret>" or "/<secret>/"), or "" when the path is empty,
+// "/", has several segments, or is a reserved endpoint.
+func PathSegmentSecret(requestPath string) string {
+	if requestPath == "" {
+		return ""
+	}
+	seg := strings.TrimPrefix(path.Clean("/"+requestPath), "/")
+	if seg == "" || strings.Contains(seg, "/") {
+		return ""
+	}
+	if _, reserved := reservedPathSegments[seg]; reserved {
+		return ""
+	}
+	return seg
+}
+
+func firstNonEmptyHeader(headers http.Header, names ...string) string {
+	for _, name := range names {
+		if v := strings.TrimSpace(headers.Get(name)); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func normalizeSiweMessage(msg string) string {

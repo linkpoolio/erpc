@@ -313,7 +313,7 @@ func TestHealthCheckJsonRpcNetworkScope(t *testing.T) {
 		ctx, w,
 		&http.Request{Method: "GET", URL: &url.URL{Path: "/"}},
 		&startTime,
-		"test_project", "jsonrpc", "bitcoin-mainnet",
+		"test_project", "jsonrpc", "bitcoin-mainnet", "",
 		encoder,
 		func(ctx context.Context, statusCode int, body error) {
 			w.WriteHeader(statusCode)

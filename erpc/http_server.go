@@ -346,6 +346,10 @@ func (s *HttpServer) createRequestHandler() http.Handler {
 			}
 		}
 
+		// Only a domain alias that preselects project, architecture and chain
+		// leaves the path free of routing, so only then can it carry a secret.
+		fullyAliased := projectId != "" && architecture != "" && chainId != ""
+
 		w.Header().Set("Content-Type", "application/json")
 		// executionHeaders:"off" suppresses all X-ERPC-* headers, including these.
 		if s.executionHeadersMode() != common.ExecutionHeadersOff {
@@ -382,13 +386,18 @@ func (s *HttpServer) createRequestHandler() http.Handler {
 		}
 
 		if isHealthCheck {
-			s.handleHealthCheck(httpCtx, w, r, &startedAt, projectId, architecture, chainId, encoder, writeFatalError)
+			var healthCheckAuth *common.AuthConfig
+			if s.healthCheckCfg != nil {
+				healthCheckAuth = s.healthCheckCfg.Auth
+			}
+			credentialPath := credentialPathFor(httpCtx, r, fullyAliased, healthCheckAuth)
+			s.handleHealthCheck(httpCtx, w, r, &startedAt, projectId, architecture, chainId, credentialPath, encoder, writeFatalError)
 			return
 		}
 
 		if isAdmin {
 			if s.adminCfg != nil && s.adminCfg.CORS != nil {
-				if !s.handleCORS(httpCtx, w, r, s.adminCfg.CORS) || r.Method == http.MethodOptions {
+				if !s.handleCORS(httpCtx, w, r, s.adminCfg.CORS, r.URL.Path) || r.Method == http.MethodOptions {
 					return
 				}
 			}
@@ -436,8 +445,17 @@ func (s *HttpServer) createRequestHandler() http.Handler {
 			return
 		}
 
+		var credentialPath string
+		if project != nil {
+			credentialPath = credentialPathFor(httpCtx, r, fullyAliased, project.Config.Auth)
+		}
+		corsPath := r.URL.Path
+		if credentialPath != "" {
+			corsPath = common.RedactedPath
+		}
+
 		if project != nil && project.Config.CORS != nil {
-			if !s.handleCORS(httpCtx, w, r, project.Config.CORS) || r.Method == http.MethodOptions {
+			if !s.handleCORS(httpCtx, w, r, project.Config.CORS, corsPath) || r.Method == http.MethodOptions {
 				return
 			}
 		}
@@ -466,7 +484,7 @@ func (s *HttpServer) createRequestHandler() http.Handler {
 			// served. Method scoping and rate limits still apply per message.
 			nq := common.NewNormalizedRequest(nil)
 			nq.SetClientIP(s.resolveRealClientIP(r))
-			ap, err := auth.NewPayloadFromHttp("", r.RemoteAddr, r.Header, r.URL.Query())
+			ap, err := auth.NewPayloadFromHttp("", r.RemoteAddr, r.Header, r.URL.Query(), credentialPath)
 			if err == nil {
 				err = project.AcceptsConsumerPayload(httpCtx, nq, ap)
 			}
@@ -486,7 +504,7 @@ func (s *HttpServer) createRequestHandler() http.Handler {
 				)
 				return
 			}
-			s.handleWebSocket(w, r, &lg, project, architecture, chainId)
+			s.handleWebSocket(w, r, &lg, project, architecture, chainId, credentialPath)
 			return
 		}
 
@@ -682,9 +700,9 @@ func (s *HttpServer) createRequestHandler() http.Handler {
 				var ap *auth.AuthPayload
 
 				if project != nil {
-					ap, err = auth.NewPayloadFromHttp(method, r.RemoteAddr, headers, queryArgs)
+					ap, err = auth.NewPayloadFromHttp(method, r.RemoteAddr, headers, queryArgs, credentialPath)
 				} else if isAdmin {
-					ap, err = auth.NewPayloadFromHttp(method, r.RemoteAddr, headers, queryArgs)
+					ap, err = auth.NewPayloadFromHttp(method, r.RemoteAddr, headers, queryArgs, credentialPath)
 				}
 				if err != nil {
 					responses[index] = processErrorBody(&rlg, &startedAt, nq, err, &common.TRUE)
@@ -1186,7 +1204,23 @@ func (s *HttpServer) parseUrlPath(
 	return projectId, architecture, chainId, isAdmin, isHealthCheck, nil
 }
 
-func (s *HttpServer) handleCORS(httpCtx context.Context, w http.ResponseWriter, r *http.Request, corsConfig *common.CORSConfig) bool {
+// credentialPathFor returns r's path when it carries a secret (see
+// auth.PathSegmentSecret), and "" otherwise. Only a domain alias that
+// preselects project, architecture and chain leaves the path free of routing,
+// and only an auth config with a strategy that lists the path location reads
+// it. A returned path is also redacted from the request span.
+func credentialPathFor(ctx context.Context, r *http.Request, fullyAliased bool, authCfg *common.AuthConfig) string {
+	if !fullyAliased || !authCfg.AcceptsSecretLocation(common.SecretLocationPath) || auth.PathSegmentSecret(r.URL.Path) == "" {
+		return ""
+	}
+	common.RedactHTTPServerSpanPath(ctx, r.URL)
+	return r.URL.Path
+}
+
+// handleCORS applies corsConfig to r. metricPath is the path label for the
+// CORS metrics (the request path, or common.RedactedPath when it carries a
+// secret).
+func (s *HttpServer) handleCORS(httpCtx context.Context, w http.ResponseWriter, r *http.Request, corsConfig *common.CORSConfig, metricPath string) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
 		// When no Origin is provided, we allow the request as there's no point in enforcing CORS.
@@ -1198,7 +1232,7 @@ func (s *HttpServer) handleCORS(httpCtx context.Context, w http.ResponseWriter, 
 		return true
 	}
 
-	telemetry.MetricCORSRequestsTotal.WithLabelValues(r.URL.Path, origin).Inc()
+	telemetry.MetricCORSRequestsTotal.WithLabelValues(metricPath, origin).Inc()
 
 	allowed := false
 	for _, allowedOrigin := range corsConfig.AllowedOrigins {
@@ -1216,7 +1250,7 @@ func (s *HttpServer) handleCORS(httpCtx context.Context, w http.ResponseWriter, 
 	// If disallowed origin, we can continue without CORS headers
 	if !allowed {
 		s.logger.Debug().Str("origin", origin).Msg("CORS request from disallowed origin, continuing without CORS headers")
-		telemetry.MetricCORSDisallowedOriginTotal.WithLabelValues(r.URL.Path, origin).Inc()
+		telemetry.MetricCORSDisallowedOriginTotal.WithLabelValues(metricPath, origin).Inc()
 
 		// If it's a preflight OPTIONS request, we can send a basic 204 with no CORS.
 		if r.Method == http.MethodOptions {
@@ -1247,7 +1281,7 @@ func (s *HttpServer) handleCORS(httpCtx context.Context, w http.ResponseWriter, 
 
 	// If it's a preflight request, return a 204 and don't continue to main handler.
 	if r.Method == http.MethodOptions {
-		telemetry.MetricCORSPreflightRequestsTotal.WithLabelValues(r.URL.Path, origin).Inc()
+		telemetry.MetricCORSPreflightRequestsTotal.WithLabelValues(metricPath, origin).Inc()
 		w.WriteHeader(http.StatusNoContent)
 		common.EnrichHTTPServerSpan(httpCtx, http.StatusNoContent, nil)
 		return false

@@ -1368,6 +1368,17 @@ type JsonRpcUpstreamConfig struct {
 	EnableGzip    *bool             `yaml:"enableGzip,omitempty" json:"enableGzip"`
 	Headers       map[string]string `yaml:"headers,omitempty" json:"headers"`
 	ProxyPool     string            `yaml:"proxyPool,omitempty" json:"proxyPool"`
+	// NetworkId binds an upstream of type "jsonrpc" to the passthrough network
+	// "jsonrpc:<networkId>" (slug only, e.g. "bitcoin-mainnet"). Required for
+	// type jsonrpc; setting it on an upstream without an explicit type infers
+	// type jsonrpc. Ignored for other upstream types.
+	NetworkId string `yaml:"networkId,omitempty" json:"networkId,omitempty"`
+	// OmitEmptyParams leaves the "params" member out of outbound requests
+	// whose params are empty instead of sending "params":[]. "params" is
+	// optional in JSON-RPC 2.0 and some servers reject an empty positional
+	// array for methods without parameters. Defaults to true for upstreams of
+	// type jsonrpc and false otherwise.
+	OmitEmptyParams *bool `yaml:"omitEmptyParams,omitempty" json:"omitEmptyParams,omitempty"`
 }
 
 func (c *JsonRpcUpstreamConfig) Copy() *JsonRpcUpstreamConfig {
@@ -2649,6 +2660,7 @@ type NetworkConfig struct {
 	Failsafe          []*FailsafeConfig        `yaml:"failsafe,omitempty" json:"failsafe"`
 	Evm               *EvmNetworkConfig        `yaml:"evm,omitempty" json:"evm"`
 	Svm               *SvmNetworkConfig        `yaml:"svm,omitempty" json:"svm"`
+	JsonRpc           *JsonRpcNetworkConfig    `yaml:"jsonRpc,omitempty" json:"jsonRpc"`
 	SelectionPolicy   *SelectionPolicyConfig   `yaml:"selectionPolicy,omitempty" json:"selectionPolicy"`
 	DirectiveDefaults *DirectiveDefaultsConfig `yaml:"directiveDefaults,omitempty" json:"directiveDefaults"`
 	Alias             string                   `yaml:"alias,omitempty" json:"alias"`
@@ -2730,6 +2742,7 @@ func (n *NetworkConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 		Failsafe          *FailsafeConfig          `yaml:"failsafe,omitempty"`
 		Evm               *EvmNetworkConfig        `yaml:"evm,omitempty"`
 		Svm               *SvmNetworkConfig        `yaml:"svm,omitempty"`
+		JsonRpc           *JsonRpcNetworkConfig    `yaml:"jsonRpc,omitempty"`
 		SelectionPolicy   *SelectionPolicyConfig   `yaml:"selectionPolicy,omitempty"`
 		DirectiveDefaults *DirectiveDefaultsConfig `yaml:"directiveDefaults,omitempty"`
 		Alias             string                   `yaml:"alias,omitempty"`
@@ -2751,6 +2764,7 @@ func (n *NetworkConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	n.RateLimitBudget = old.RateLimitBudget
 	n.Evm = old.Evm
 	n.Svm = old.Svm
+	n.JsonRpc = old.JsonRpc
 	n.SelectionPolicy = old.SelectionPolicy
 	n.DirectiveDefaults = old.DirectiveDefaults
 	n.Alias = old.Alias
@@ -3750,6 +3764,11 @@ func (c *NetworkConfig) NetworkId() string {
 			return ""
 		}
 		return util.SvmNetworkId(c.Svm.Chain, c.Svm.Cluster)
+	case ArchitectureJsonRpc:
+		if c.JsonRpc == nil || c.JsonRpc.Id == "" {
+			return ""
+		}
+		return util.JsonRpcNetworkId(c.JsonRpc.Id)
 	default:
 		return ""
 	}

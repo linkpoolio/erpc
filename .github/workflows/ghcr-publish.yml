@@ -1,7 +1,5 @@
-# Build and push ghcr.io/linkpoolio/docker-images/erpc:<tag> from an arbitrary git ref.
-# Uses the existing docker-images GHCR namespace (same registry path family as other LinkPool images).
-# Auth: GITHUB_TOKEN with packages:write. May require package Actions access for linkpoolio/erpc
-# if the package is owned/linked to docker-images.
+# Build and push the eRPC image to GHCR from an arbitrary git ref.
+# Auth: GITHUB_TOKEN with packages:write. The package may need Actions access granted for this repo.
 #
 # Run: Actions → "Publish to GHCR" → workflow_dispatch
 #   tag: sha-1234abc

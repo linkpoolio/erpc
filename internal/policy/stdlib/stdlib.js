@@ -716,10 +716,21 @@
     if (weights.errorRate)       p += m.errorRate       * weights.errorRate;
     if (weights.respLatency)     p += m[latencyKey]     * weights.respLatency;
     if (weights.throttledRate)   p += m.throttledRate   * weights.throttledRate;
-    if (weights.blockHeadLag)    p += m.blockHeadLag    * weights.blockHeadLag;
-    if (weights.finalizationLag) p += m.finalizationLag * weights.finalizationLag;
+    if (weights.blockHeadLag)    p += lagUnits(m.blockHeadLag, m.blockHeadLagSeconds) * weights.blockHeadLag;
+    if (weights.finalizationLag) p += lagUnits(m.finalizationLag, m.finalizationLagSeconds) * weights.finalizationLag;
     if (weights.misbehaviors)    p += m.misbehaviorRate * weights.misbehaviors;
     return p;
+  }
+
+  // Lag weighs per block, but never more than per second of lag. Counted
+  // in blocks alone, a chain with sub-second blocks turns a fraction of a
+  // second of staleness into a large penalty: at 10 blocks/s an upstream
+  // 0.4 s behind costs 4, more than 0.24 s of p70 latency (3.6) under
+  // PREFER_FASTEST, so a far but fresh upstream outranks a near one. Chains
+  // with 1 s or slower blocks, and a network whose block time is not yet
+  // estimated (seconds read 0), keep the block count.
+  function lagUnits(blocks, seconds) {
+    return seconds > 0 ? Math.min(blocks, seconds) : blocks;
   }
 
   // sortByScore(base, opts) — rank upstreams best-first. HIGHER score wins.
@@ -1398,6 +1409,17 @@
   globalThis.throttleRateAbove    = function (rate) { return _leaf(u => u.metrics.throttledRate   > rate, 'throttledRate>'   + rate, 'throttle_rate_above'); };
   globalThis.throttleRateBelow    = function (rate) { return _leaf(u => u.metrics.throttledRate   < rate, 'throttledRate<'   + rate, 'throttle_rate_below'); };
   globalThis.misbehaviorRateAbove = function (rate) { return _leaf(u => u.metrics.misbehaviorRate > rate, 'misbehaviorRate>' + rate, 'misbehavior_rate_above'); };
+
+  // Prepaid-credit pacing. `u.creditPace` is account credits used this
+  // billing period over the pro-rata `creditAllowance` (1.0 = on track to
+  // use it exactly); `u.creditRemaining` is allowance minus credits used.
+  // Both are absent without an allowance or before the first usage reading,
+  // and every factory here is false on absence: a cold start neither
+  // excludes a prepaid vendor nor promotes it.
+  globalThis.creditPaceAbove = function (pace) { return _leaf(u => typeof u.creditPace === 'number' && u.creditPace > pace, 'creditPace>' + pace, 'credit_pace_above'); };
+  globalThis.creditPaceBelow = function (pace) { return _leaf(u => typeof u.creditPace === 'number' && u.creditPace < pace, 'creditPace<' + pace, 'credit_pace_below'); };
+  globalThis.creditRemainingBelow = function (credits) { return _leaf(u => typeof u.creditRemaining === 'number' && u.creditRemaining < credits, 'creditRemaining<' + credits, 'credit_remaining_below'); };
+  globalThis.creditRemainingAbove = function (credits) { return _leaf(u => typeof u.creditRemaining === 'number' && u.creditRemaining > credits, 'creditRemaining>' + credits, 'credit_remaining_above'); };
 
   // Latency factory — millisecond threshold at any quantile.
   //

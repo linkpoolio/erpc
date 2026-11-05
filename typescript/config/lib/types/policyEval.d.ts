@@ -54,6 +54,8 @@ export type PolicyEvalUpstreamMetrics = {
  * Score-preset weight map used by `sortByScore`. Missing keys are treated
  * as zero. The built-in presets (`PREFER_FASTEST`, `PREFER_FRESHEST`,
  * `PREFER_LEAST_ERRORS`) are exposed as bare globals inside the eval.
+ * `blockHeadLag` and `finalizationLag` weigh each lag in blocks, but never
+ * more than in seconds: `min(blocks, seconds)` once the block time is known.
  */
 export type ScoreWeights = {
     errorRate?: number;
@@ -100,6 +102,15 @@ export type PolicyEvalUpstream = {
     readonly tags: readonly string[];
     readonly config: UpstreamConfig;
     readonly metrics: PolicyEvalUpstreamMetrics;
+    /**
+     * Account credits used this billing period over the pro-rata
+     * `creditAllowance` (1.0 = on track). Absent without an allowance,
+     * before the vendor's first usage reading, or when the reading is over
+     * 30 minutes old.
+     */
+    readonly creditPace?: number;
+    /** `creditAllowance.credits` minus account credits used; absent like `creditPace`. */
+    readonly creditRemaining?: number;
     /**
      * Per-method latency snapshot for this upstream — keyed by method
      * name, values are a minimal `{ requestsTotal, p50ms, …, p99ms }`
@@ -584,6 +595,12 @@ declare global {
     function throttleRateAbove(rate: number): PolicyEvalPredicate;
     function throttleRateBelow(rate: number): PolicyEvalPredicate;
     function misbehaviorRateAbove(rate: number): PolicyEvalPredicate;
+    /** Account credit use ahead of / behind the pro-rata allowance; false when unknown. */
+    function creditPaceAbove(pace: number): PolicyEvalPredicate;
+    function creditPaceBelow(pace: number): PolicyEvalPredicate;
+    /** Allowance minus credits used, below / above `credits`; false when unknown. */
+    function creditRemainingBelow(credits: number): PolicyEvalPredicate;
+    function creditRemainingAbove(credits: number): PolicyEvalPredicate;
     function latencyAbove(ms: number, quantile?: number): PolicyEvalPredicate;
     function latencyDeviationAbove(multiplier: number, optsOrQuantile?: number | LatencyDeviationOptions): PolicyEvalPredicate;
     function blockNumberLagAbove(blocks: number): PolicyEvalPredicate;

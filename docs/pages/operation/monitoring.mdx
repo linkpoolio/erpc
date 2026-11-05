@@ -432,7 +432,7 @@ SVM upstreams feed the same tracker as EVM, so the gauges below populate — but
 | `erpc_upstream_finalized_block_number` | The upstream's **finalized (rooted) slot** |
 | `erpc_upstream_block_head_lag` | Processed **slots** behind the freshest upstream |
 | `erpc_upstream_finalization_lag` | Finalized **slots** behind the freshest upstream |
-| `erpc_upstream_cordoned` | An SVM upstream is cordoned by its own state poller when `getHealth` fails **or** shred-insert lag exceeds 100 slots; the `reason` label distinguishes them |
+| `erpc_upstream_cordoned` | An SVM upstream is cordoned by its own state poller after 2 consecutive all-silent state polls **or** when shred-insert lag exceeds 100 slots; the `reason` label distinguishes them |
 | `erpc_upstream_stale_latest_block_total` | A `getSlot` answer was corrected to the highest known slot for its commitment |
 
 Ingestion lag (`maxShredInsertSlot − processedSlot`) has **no gauge** — it is logged and drives cordoning only. See [SVM slot tracking & health](/reference/svm/slot-tracking).

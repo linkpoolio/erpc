@@ -212,9 +212,9 @@ The default `evalScope: "network"` creates one slot per network. Setting `evalSc
 
 **Score inputs (health tracker).** Every metric available to `evalFunc` comes from the health tracker's rolling window. The tracker maintains 10 atomic sub-buckets per `(upstream, method, finality)` tuple; one bucket rotates out every `windowSize / 10`, so data drips out with no cliff. A DDSketch per bucket (1% relative accuracy) produces p50/p70/p90/p95/p99 latency quantiles.
 
-`errorRate` counts only genuine upstream-quality failures: connection refused, 5xx, genuine timeouts. EVM reverts, rate-limit 429s, client disconnects, and hedge cancellations are deliberately excluded so a misbehaving caller or aggressive hedger cannot inflate a healthy upstream's error rate.
+`errorRate` counts only genuine upstream-quality failures: connection refused, 5xx, genuine timeouts. EVM reverts, rate-limit 429s, oversized-request rejections (`ErrEndpointRequestTooLarge`), client disconnects, and hedge cancellations are deliberately excluded so a misbehaving caller or aggressive hedger cannot inflate a healthy upstream's error rate.
 
-`throttledRate` counts remote 429 responses specifically — vendor quota exhaustion. `misbehaviorRate` tracks upstreams returning semantically wrong data. Latency quantiles are populated only from _successful_ responses — a fast-failing upstream that rejects connections in 1ms has empty quantile sketches and reports `p70 = 0` (unknown quality, not ultra-fast). A well-written policy should guard `latencyAbove` with `samplesAbove(N)`.
+`throttledRate` counts remote 429 responses specifically — vendor quota exhaustion. `misbehaviorRate` tracks upstreams returning semantically wrong data. Latency quantiles come from successful responses plus primary attempts cancelled because another attempt won the hedge race, which count at their elapsed time as a lower bound. Client cancels and deadlines record nothing. An upstream whose every attempt loses the hedge race therefore reads at least the hedge delay, not `0`. A fast-failing upstream that rejects connections in 1ms has empty quantile sketches and reports `p70 = 0` (unknown quality, not ultra-fast). A well-written policy should guard `latencyAbove` with `samplesAbove(N)`.
 
 `blockHeadLag` and `finalizationLag` are atomic point-in-time state, not rolling counters. They persist across window rotations and stay non-zero until the upstream catches up to the network tip. `blockHeadLagSeconds` and `finalizationLagSeconds` multiply the block count by the tracker's EMA-estimated block time (alpha 0.1, minimum 3 samples before publishing). Until the EMA is warm, both seconds fields are `0` — pair `blockSecondsLagAbove` with `blockNumberLagAbove` for cold-start coverage.
 
@@ -248,7 +248,7 @@ Each `excludeIf` step records per-leaf attribution into `erpc_selection_exclusio
 score(u) = overall / (1 + errorRate×w₁ + respLatency×w₂ + throttledRate×w₃ + blockHeadLag×w₄ + finalizationLag×w₅ + misbehaviors×w₆)
 ```
 
-A clean upstream with no penalties scores `1.0`; every unit of penalty divides the score. Three built-in weight presets:
+A clean upstream with no penalties scores `1.0`; every unit of penalty divides the score. A lag term counts blocks, but never more than seconds of lag: `min(blockHeadLag, blockHeadLagSeconds)`, and the same for `finalizationLag`. On chains with blocks of 1 s or slower, and while the block-time EMA is cold, it is the block count; on sub-second chains it is seconds, so 0.4 s behind costs 0.4, not the 4 blocks it is at 10 blocks/s. Three built-in weight presets:
 
 | Preset | errorRate | respLatency | throttledRate | blockHeadLag | finalizationLag | misbehaviors |
 |---|---|---|---|---|---|---|
@@ -344,7 +344,16 @@ Global JS helpers available inside every `evalFunc`:
 
 **Exclusion attribution leaf slugs.** `excludeIf` records which leaf predicate actually tripped per upstream. Bounded-cardinality slugs emitted by `erpc_selection_exclusion_total{reason}`:
 
-`error_rate_above`, `error_rate_below`, `throttle_rate_above`, `throttle_rate_below`, `misbehavior_rate_above`, `latency_p<Q>_above`, `latency_p<Q>_deviation_above`, `block_head_lag_above`, `finalization_lag_above`, `block_head_lag_seconds_above`, `finalization_lag_seconds_above`, `samples_below`, `samples_above` (guard — not a failure slug), `not_<child_slug>`, `custom`.
+`error_rate_above`, `error_rate_below`, `throttle_rate_above`, `throttle_rate_below`, `misbehavior_rate_above`, `credit_pace_above`, `credit_pace_below`, `credit_remaining_above`, `credit_remaining_below`, `latency_p<Q>_above`, `latency_p<Q>_deviation_above`, `block_head_lag_above`, `finalization_lag_above`, `block_head_lag_seconds_above`, `finalization_lag_seconds_above`, `samples_below`, `samples_above` (guard — not a failure slug), `not_<child_slug>`, `custom`.
+
+**Prepaid credit pacing.** For an upstream with `creditAllowance`, `u.creditPace` is the vendor account's credits used this billing period over the allowance pro-rated to now (`1.0` spends exactly the allowance by period end), and `u.creditRemaining` is allowance minus credits used. Predicates: `creditPaceAbove(x)`, `creditPaceBelow(x)`, `creditRemainingAbove(n)`, `creditRemainingBelow(n)`. Both fields are absent with no allowance, before the first usage reading, or when the reading is over 30 minutes old; every credit predicate is then false, so the policy keeps its usual order. Fill a prepaid vendor ahead of per-call vendors while behind pace, and stop it near the allowance. Only upstreams whose endpoint is on the allowance account get the fields:
+
+```js
+const live = upstreams.excludeIf(creditRemainingBelow(4e9), { probe: false });
+return live.filter(creditPaceBelow(1.0)).union(live);
+```
+
+Size the `creditRemainingBelow` margin above the credits the account bills during the vendor's usage-reporting lag (QuickNode: 2-3 h of hourly buckets) plus the stale window.
 
 Note: `samplesAbove`/`samplesBelow` predicates are marked `isGuard=true` so they do not appear as primary exclusion reasons when they do NOT trip; they only appear when they are the leaf that fires.
 

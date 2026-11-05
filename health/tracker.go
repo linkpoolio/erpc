@@ -2,6 +2,7 @@ package health
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -89,6 +90,9 @@ type NetworkMetadata struct {
 	// only; guarded by the network entry's headMu.
 	headReport      headReport
 	finalizedReport headReport
+	// headReportedAt is headReport.at in unix ns, read lock-free by
+	// HeadCredit on the request path.
+	headReportedAt atomic.Int64
 
 	// Dynamic block time via EMA on on-chain block timestamps: on the network
 	// entry from the corroborated head, on an upstream entry from that
@@ -122,6 +126,14 @@ func (t *Timer) ObserveDuration(isSuccess bool) {
 	t.tracker.RecordUpstreamDuration(t.upstream, t.method, duration, isSuccess, t.compositeType, t.finality, t.userId)
 }
 
+// ObserveCancelled records a primary attempt cancelled because another
+// attempt won the hedge race: the elapsed time is a lower bound on its
+// latency.
+func (t *Timer) ObserveCancelled() {
+	duration := time.Since(t.start)
+	t.tracker.RecordUpstreamCancelledDuration(t.upstream, t.method, duration, t.compositeType, t.finality, t.userId)
+}
+
 // ------------------------------------
 // TrackedMetrics
 // ------------------------------------
@@ -145,11 +157,38 @@ type TrackedMetrics struct {
 	MisbehaviorsTotal      *RollingCounter  `json:"misbehaviorsTotal"`
 	BlockHeadLag           atomic.Int64     `json:"blockHeadLag"`
 	FinalizationLag        atomic.Int64     `json:"finalizationLag"`
-	Cordoned               atomic.Bool      `json:"cordoned"`
-	LastCordonedReason     atomic.Value     `json:"lastCordonedReason"`
-	// CordonedAtMs is unix-millis when Cordoned was last flipped true.
-	// `0` means not cordoned (or never cordoned). Read by Uncordon to
-	// observe the cordon-duration histogram for dashboards.
+	// CordonMask is a per-class bitmask over the closed CordonClass enum
+	// (see cordonClassBits). An upstream can be cordoned by several sources
+	// at once — punishment (consensus sitout), availability (state pollers),
+	// operator (admin) — and each source sets/clears only its own bit, so a
+	// later cordon from one source can neither overwrite nor clear another's.
+	// "Cordoned" is any bit set (mask != 0). This replaces the single
+	// `Cordoned atomic.Bool`, which was last-writer-wins on one shared flag.
+	CordonMask         atomic.Uint32 `json:"-"`
+	LastCordonedReason atomic.Value  `json:"lastCordonedReason"`
+	// cordonReasons holds the diagnostic reason last written for each class
+	// (index 0=punishment, 1=availability, 2=operator). LastCordonedReason is
+	// the public snapshot: the most recent Cordon, or restored from a remaining
+	// class when Uncordon clears only one bit. Without this, a partial uncordon
+	// would leave LastCordonedReason as the class that was just removed.
+	cordonReasons [3]atomic.Value
+	// cordonGen is a per-class monotonic generation bumped on every Cordon of
+	// that class (including re-cordon while already set). Local UncordonAdmin
+	// snapshots these gens so a delayed same-pod clear cannot remove a class
+	// cordoned after the recovery was issued.
+	cordonGen [3]atomic.Uint64
+	// cordonSetAtMs is unix-millis when each class bit was last set. Fleet
+	// recovery epochs compare against this so a delayed peer OnValue cannot
+	// clear a class cordoned after the admin recovery was published.
+	cordonSetAtMs [3]atomic.Int64
+	// cordonMu serializes the full Cordon/Uncordon transition (mask + reasons
+	// + timestamp + gauge side effects). The mask atomics alone are not enough:
+	// a concurrent Uncordon can clear a bit between Or and the reason/timestamp
+	// stores and leave an uncordoned entry with a stale gauge/timestamp.
+	cordonMu sync.Mutex
+	// CordonedAtMs is unix-millis when the mask last went empty→non-empty.
+	// `0` means not cordoned (or never cordoned). Read by Uncordon on the
+	// non-empty→empty transition to observe the cordon-duration histogram.
 	CordonedAtMs atomic.Int64 `json:"cordonedAtMs"`
 
 	// LastAccessedAtMs is unix-millis of the last Record* or Get*
@@ -167,6 +206,13 @@ type TrackedMetrics struct {
 	// look idle to the very next sweep tick) and refreshed on every
 	// hot-path write.
 	LastAccessedAtMs atomic.Int64 `json:"-"`
+
+	// cancelledQuantiles holds the elapsed time of primary attempts
+	// cancelled because another attempt won the hedge race: lower bounds
+	// on their latency. Kept out of ResponseQuantiles, which also drives
+	// adaptive timeouts and hedge delays; only PolicyQuantiles reads it.
+	// Allocated on the first such cancellation.
+	cancelledQuantiles atomic.Pointer[QuantileTracker]
 }
 
 // newTrackedMetrics constructs an empty TrackedMetrics with all
@@ -206,6 +252,27 @@ func (m *TrackedMetrics) GetResponseQuantiles() common.QuantileTracker {
 	return m.ResponseQuantiles
 }
 
+// PolicyQuantiles reads qtiles off ResponseQuantiles merged with the
+// cancelled-attempt lower bounds. Each answered or hedge-lost primary
+// attempt then counts as min(latency, elapsed at cancel), so these
+// quantiles never exceed the true ones. Without the lower bounds, an
+// upstream whose every attempt loses a hedge race keeps an empty sketch
+// and reads as 0 s, the fastest.
+func (m *TrackedMetrics) PolicyQuantiles(qtiles []float64) []time.Duration {
+	return m.ResponseQuantiles.quantilesWith(m.cancelledQuantiles.Load(), qtiles)
+}
+
+func (m *TrackedMetrics) addCancelled(logger *zerolog.Logger, seconds float64) {
+	q := m.cancelledQuantiles.Load()
+	if q == nil {
+		q = NewQuantileTracker(logger)
+		if !m.cancelledQuantiles.CompareAndSwap(nil, q) {
+			q = m.cancelledQuantiles.Load()
+		}
+	}
+	q.Add(seconds)
+}
+
 func (m *TrackedMetrics) ThrottledRate() float64 {
 	reqs := m.RequestsTotal.Load()
 	if reqs == 0 {
@@ -232,7 +299,8 @@ func (m *TrackedMetrics) MarshalJSON() ([]byte, error) {
 		"misbehaviorsTotal":      m.MisbehaviorsTotal.Load(),
 		"blockHeadLag":           m.BlockHeadLag.Load(),
 		"finalizationLag":        m.FinalizationLag.Load(),
-		"cordoned":               m.Cordoned.Load(),
+		"cordoned":               m.CordonMask.Load() != 0,
+		"cordonClasses":          decodeCordonMask(m.CordonMask.Load()),
 		"lastCordonedReason":     m.LastCordonedReason.Load(),
 		"errorRate":              m.ErrorRate(),
 		"throttledRate":          m.ThrottledRate(),
@@ -257,6 +325,9 @@ func (m *TrackedMetrics) Rotate() {
 	m.RemoteRateLimitedTotal.RotateOldest()
 	m.MisbehaviorsTotal.RotateOldest()
 	m.ResponseQuantiles.RotateOldest()
+	if q := m.cancelledQuantiles.Load(); q != nil {
+		q.RotateOldest()
+	}
 }
 
 // Reset wipes every counter and the quantile sketch fully. Test/admin
@@ -267,8 +338,12 @@ func (m *TrackedMetrics) Reset() {
 	m.RemoteRateLimitedTotal.Wipe()
 	m.MisbehaviorsTotal.Wipe()
 	m.ResponseQuantiles.Reset()
-	m.Cordoned.Store(false)
+	if q := m.cancelledQuantiles.Load(); q != nil {
+		q.Reset()
+	}
+	m.CordonMask.Store(0)
 	m.LastCordonedReason.Store("")
+	m.clearCordonReasons()
 }
 
 // ------------------------------------
@@ -662,7 +737,7 @@ func (t *Tracker) sweepIdle() {
 			return true // never evict the per-upstream wildcard rollup
 		}
 		tm := value.(*TrackedMetrics)
-		if tm.Cordoned.Load() {
+		if tm.CordonMask.Load() != 0 {
 			return true // preserve admin-set cordon state
 		}
 		if tm.LastAccessedAtMs.Load() >= cutoffMs {
@@ -885,24 +960,135 @@ func (t *Tracker) getNtwMetrics(k networkKey) *TrackedMetrics {
 // Cordon / Uncordon
 // --------------------
 
+// cordonClassBits maps each closed-enum CordonClass to its bit in
+// TrackedMetrics.CordonMask. Adding a class means adding a bit here; an
+// unmapped class (which the typed parameter makes unreachable from in-repo
+// callers) falls back to the operator bit — fail closed, never availability.
+var cordonClassBits = map[common.CordonClass]uint32{
+	common.CordonClassPunishment:   1 << 0,
+	common.CordonClassAvailability: 1 << 1,
+	common.CordonClassOperator:     1 << 2,
+}
+
+// cordonBit returns the bit for a class, defaulting to the operator (fail
+// closed) bit for any class not in the map.
+func cordonBit(class common.CordonClass) uint32 {
+	if b, ok := cordonClassBits[class]; ok {
+		return b
+	}
+	return cordonClassBits[common.CordonClassOperator]
+}
+
+// decodeCordonMask turns a mask into its set of classes (stable order:
+// punishment, availability, operator).
+func decodeCordonMask(mask uint32) []common.CordonClass {
+	if mask == 0 {
+		return nil
+	}
+	var out []common.CordonClass
+	for _, c := range []common.CordonClass{common.CordonClassPunishment, common.CordonClassAvailability, common.CordonClassOperator} {
+		if mask&cordonClassBits[c] != 0 {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// cordonClassIndex maps a known class to cordonReasons' slot. Unknown classes
+// have no slot (Uncordon ignores them; Cordon aliases the operator bit).
+func cordonClassIndex(class common.CordonClass) (int, bool) {
+	switch class {
+	case common.CordonClassPunishment:
+		return 0, true
+	case common.CordonClassAvailability:
+		return 1, true
+	case common.CordonClassOperator:
+		return 2, true
+	default:
+		return 0, false
+	}
+}
+
+func (m *TrackedMetrics) storeCordonReason(class common.CordonClass, reason string) {
+	idx, ok := cordonClassIndex(class)
+	if !ok {
+		// Unknown class aliases the operator bit on Cordon; keep the reason
+		// with that bit so a later operator uncordon / listCordoned still
+		// reports something coherent.
+		idx, _ = cordonClassIndex(common.CordonClassOperator)
+	}
+	m.cordonReasons[idx].Store(reason)
+}
+
+func (m *TrackedMetrics) clearCordonReasons() {
+	for i := range m.cordonReasons {
+		m.cordonReasons[i].Store("")
+	}
+}
+
+// reasonForMask returns a remaining class's stored reason (stable order:
+// punishment, availability, operator). Empty if none of the set bits have one.
+func (m *TrackedMetrics) reasonForMask(mask uint32) string {
+	for _, c := range []common.CordonClass{common.CordonClassPunishment, common.CordonClassAvailability, common.CordonClassOperator} {
+		if mask&cordonClassBits[c] == 0 {
+			continue
+		}
+		idx, ok := cordonClassIndex(c)
+		if !ok {
+			continue
+		}
+		if r, ok := m.cordonReasons[idx].Load().(string); ok && r != "" {
+			return r
+		}
+	}
+	return ""
+}
+
+// Cordon is the stable HealthTracker method. A caller that does not name a
+// class gets an operator cordon: undifferentiated, and it blocks consensus
+// policy fallback.
 func (t *Tracker) Cordon(upstream common.Upstream, method, reason string) {
+	t.CordonClass(upstream, method, reason, common.CordonClassOperator)
+}
+
+// Uncordon is the stable HealthTracker method. It clears only the operator
+// class, which is what Cordon sets.
+func (t *Tracker) Uncordon(upstream common.Upstream, method, reason string) {
+	t.UncordonClass(upstream, method, reason, common.CordonClassOperator)
+}
+
+func (t *Tracker) CordonClass(upstream common.Upstream, method, reason string, class common.CordonClass) {
 	lg := upstream.Logger()
 	lg.Debug().
 		Str("method", method).
 		Str("reason", reason).
+		Str("class", string(class)).
 		Msg("cordoning upstream to disable routing")
 
 	// Cordon state is finality-agnostic — operators cordon "drpc for
 	// eth_call", not "drpc for eth_call when reading finalized data".
 	// Store on the all-finalities key so every finality-specific
-	// lookup sees the same cordon flag.
+	// lookup sees the same cordon flags.
 	tm := t.getUpsMetrics(upstreamKey{upstream, method, common.DataFinalityStateAll})
-	wasCordoned := tm.Cordoned.Swap(true)
+	tm.cordonMu.Lock()
+	defer tm.cordonMu.Unlock()
+	// Set only this class's bit. Or returns the mask BEFORE the set, so
+	// prev==0 is the empty→non-empty transition. A repeated cordon of the
+	// same class (or another class while already cordoned) is idempotent for
+	// duration accounting — the start timestamp is stamped once and not reset.
+	prev := tm.CordonMask.Or(cordonBit(class))
+	tm.storeCordonReason(class, reason)
 	tm.LastCordonedReason.Store(reason)
-	if !wasCordoned {
-		// Only record the start timestamp on the OFF→ON transition so
-		// repeated cordons (e.g. operator updating the reason) don't
-		// reset the duration accounting mid-cordon.
+	idx, ok := cordonClassIndex(class)
+	if !ok {
+		// Unknown classes set the operator bit (cordonBit); advance the
+		// operator generation too so a class cordoned after an admin snapshot
+		// is not cleared by UncordonClassesAtMostGens as if it predated it.
+		idx, _ = cordonClassIndex(common.CordonClassOperator)
+	}
+	tm.cordonGen[idx].Add(1)
+	tm.cordonSetAtMs[idx].Store(time.Now().UnixMilli())
+	if prev == 0 {
 		tm.CordonedAtMs.Store(time.Now().UnixMilli())
 		telemetry.MetricUpstreamCordonEventTotal.WithLabelValues(
 			t.projectId, upstream.NetworkId(), upstream.Id(), "cordon",
@@ -912,20 +1098,109 @@ func (t *Tracker) Cordon(upstream common.Upstream, method, reason string) {
 	t.getCordonedGauge(upstream, method, reason).Set(1)
 }
 
-func (t *Tracker) Uncordon(upstream common.Upstream, method string, reason string) {
+// CordonGens returns the current per-class cordon generations for the
+// (upstream, method) all-finalities cell: [punishment, availability, operator].
+// Used by UncordonAdmin to snapshot state before a fleet-wide clear.
+func (t *Tracker) CordonGens(upstream common.Upstream, method string) [3]uint64 {
+	tm := t.getUpsMetrics(upstreamKey{upstream, method, common.DataFinalityStateAll})
+	return [3]uint64{
+		tm.cordonGen[0].Load(),
+		tm.cordonGen[1].Load(),
+		tm.cordonGen[2].Load(),
+	}
+}
+
+// UncordonClassesAtMostGens clears each class on the cell only when that
+// class's generation is still <= the snapshot taken before the admin recovery.
+// Classes cordoned after the snapshot keep their bits. Gen check + clear run
+// under one cordonMu hold so a detector Cordon cannot slip between them. It
+// reports the set of classes actually cleared, so a caller can reset detector
+// state (e.g. a consensus sit-out) only for a punishment that was truly
+// lifted — not for a newer punishment that survived the snapshot.
+func (t *Tracker) UncordonClassesAtMostGens(upstream common.Upstream, method, reason string, maxGens [3]uint64) []common.CordonClass {
+	tm := t.getUpsMetrics(upstreamKey{upstream, method, common.DataFinalityStateAll})
+	tm.cordonMu.Lock()
+	defer tm.cordonMu.Unlock()
+	var cleared []common.CordonClass
+	for _, class := range []common.CordonClass{
+		common.CordonClassOperator,
+		common.CordonClassPunishment,
+		common.CordonClassAvailability,
+	} {
+		idx, ok := cordonClassIndex(class)
+		if !ok {
+			continue
+		}
+		if tm.cordonGen[idx].Load() > maxGens[idx] {
+			continue
+		}
+		if tm.CordonMask.Load()&cordonBit(class) == 0 {
+			continue
+		}
+		t.uncordonLocked(upstream, method, reason, class, tm)
+		cleared = append(cleared, class)
+	}
+	return cleared
+}
+
+func (t *Tracker) UncordonClass(upstream common.Upstream, method string, reason string, class common.CordonClass) {
 	lg := upstream.Logger()
 	lg.Debug().
 		Str("method", method).
+		Str("class", string(class)).
 		Msg("uncordoning upstream to enable routing")
 
 	// Cordon state is finality-agnostic — operators cordon "drpc for
 	// eth_call", not "drpc for eth_call when reading finalized data".
 	// Store on the all-finalities key so every finality-specific
-	// lookup sees the same cordon flag.
+	// lookup sees the same cordon flags.
 	tm := t.getUpsMetrics(upstreamKey{upstream, method, common.DataFinalityStateAll})
-	wasCordoned := tm.Cordoned.Swap(false)
-	tm.LastCordonedReason.Store("")
-	if wasCordoned {
+	_, known := cordonClassBits[class]
+	if !known {
+		lg.Warn().
+			Str("method", method).
+			Str("class", string(class)).
+			Msg("uncordon requested for an unrecognized cordon class — ignoring so it cannot clear an existing operator/other cordon")
+		return
+	}
+	tm.cordonMu.Lock()
+	defer tm.cordonMu.Unlock()
+	t.uncordonLocked(upstream, method, reason, class, tm)
+}
+
+// uncordonLocked clears one class bit. Caller must hold tm.cordonMu.
+func (t *Tracker) uncordonLocked(upstream common.Upstream, method, reason string, class common.CordonClass, tm *TrackedMetrics) {
+	// Clear only this class's bit and leave the others (feature §4.5). And
+	// returns the mask BEFORE the clear; the entry returns to "not cordoned"
+	// only when this clear empties the mask (prev held the bit and nothing
+	// else remains).
+	//
+	// cordonBit() fails CLOSED for an unknown class by aliasing the operator
+	// bit — correct when SETTING (it over-cordons), but the opposite when
+	// CLEARING: clearing the operator bit for an unrecognized class would
+	// fail OPEN. Unknown/future-class uncordons are therefore a no-op.
+	bit, known := cordonClassBits[class]
+	if !known {
+		return
+	}
+	prev := tm.CordonMask.And(^bit)
+	nowEmpty := prev != 0 && prev&^bit == 0
+	// Clear the gauge series for the class reason we are lifting — including
+	// on a partial uncordon where other class bits remain. Using the stored
+	// cordon reason (not the uncordon reason arg) keeps the label set correct.
+	clearedReason := ""
+	if idx, ok := cordonClassIndex(class); ok {
+		if r, ok := tm.cordonReasons[idx].Load().(string); ok {
+			clearedReason = r
+		}
+		tm.cordonReasons[idx].Store("")
+		tm.cordonSetAtMs[idx].Store(0)
+	}
+	if clearedReason != "" {
+		t.getCordonedGauge(upstream, method, clearedReason).Set(0)
+	}
+	if nowEmpty {
+		tm.LastCordonedReason.Store("")
 		startedMs := tm.CordonedAtMs.Swap(0)
 		if startedMs > 0 {
 			dur := time.Duration(time.Now().UnixMilli()-startedMs) * time.Millisecond
@@ -938,47 +1213,61 @@ func (t *Tracker) Uncordon(upstream common.Upstream, method string, reason strin
 		telemetry.MetricUpstreamCordonEventTotal.WithLabelValues(
 			t.projectId, upstream.NetworkId(), upstream.Id(), "uncordon",
 		).Inc()
+	} else if prev != 0 {
+		// Other class bits remain: restore a reason that still applies so
+		// erpc_listCordoned / CordonedReason don't report the class we just
+		// cleared.
+		tm.LastCordonedReason.Store(tm.reasonForMask(prev &^ bit))
 	}
-
-	t.getCordonedGauge(upstream, method, reason).Set(0)
 }
 
-// IsCordoned checks if (ups, network, method) or (ups, network, "*") is cordoned.
-// Cordon flags live on the all-finalities key (see Cordon).
-func (t *Tracker) IsCordoned(upstream common.Upstream, method string) bool {
+// cordonMaskFor returns the union of the wildcard ("*") and exact-method
+// cordon masks for an upstream. Cordon flags live on the all-finalities key.
+func (t *Tracker) cordonMaskFor(upstream common.Upstream, method string) uint32 {
+	var mask uint32
 	if val, ok := t.upsMetrics.Load(upstreamKey{upstream, "*", common.DataFinalityStateAll}); ok {
-		if val.(*TrackedMetrics).Cordoned.Load() {
-			return true
+		mask |= val.(*TrackedMetrics).CordonMask.Load()
+	}
+	if method != "*" {
+		if val, ok := t.upsMetrics.Load(upstreamKey{upstream, method, common.DataFinalityStateAll}); ok {
+			mask |= val.(*TrackedMetrics).CordonMask.Load()
 		}
 	}
-	if val, ok := t.upsMetrics.Load(upstreamKey{upstream, method, common.DataFinalityStateAll}); ok {
-		return val.(*TrackedMetrics).Cordoned.Load()
-	}
-	return false
+	return mask
+}
+
+// IsCordoned checks if (ups, network, method) or (ups, network, "*") is cordoned
+// by any class. Cordon flags live on the all-finalities key (see Cordon).
+func (t *Tracker) IsCordoned(upstream common.Upstream, method string) bool {
+	return t.cordonMaskFor(upstream, method) != 0
+}
+
+// CordonClasses returns the set of cordon classes held for (upstream, method),
+// the union of the exact-method scope and the wildcard "*" scope. Empty means
+// not cordoned. Read by the consensus selector.
+func (t *Tracker) CordonClasses(upstream common.Upstream, method string) []common.CordonClass {
+	return decodeCordonMask(t.cordonMaskFor(upstream, method))
 }
 
 // CordonedReason returns the cordon reason and whether the (upstream,
 // method) is currently cordoned. Falls back to the wildcard (`"*"`)
 // cordon if the specific method scope isn't cordoned. Used by admin
 // endpoints + tooling to surface "why is this upstream out" without
-// going through the metrics-snapshot JSON path.
+// going through the metrics-snapshot JSON path. The reason is diagnostic
+// only (the selector matches on class, never on the reason string).
 func (t *Tracker) CordonedReason(upstream common.Upstream, method string) (string, bool) {
-	if val, ok := t.upsMetrics.Load(upstreamKey{upstream, "*", common.DataFinalityStateAll}); ok {
-		tm := val.(*TrackedMetrics)
-		if tm.Cordoned.Load() {
-			if r, ok := tm.LastCordonedReason.Load().(string); ok {
-				return r, true
+	for _, k := range []upstreamKey{
+		{upstream, "*", common.DataFinalityStateAll},
+		{upstream, method, common.DataFinalityStateAll},
+	} {
+		if val, ok := t.upsMetrics.Load(k); ok {
+			tm := val.(*TrackedMetrics)
+			if tm.CordonMask.Load() != 0 {
+				if r, ok := tm.LastCordonedReason.Load().(string); ok {
+					return r, true
+				}
+				return "", true
 			}
-			return "", true
-		}
-	}
-	if val, ok := t.upsMetrics.Load(upstreamKey{upstream, method, common.DataFinalityStateAll}); ok {
-		tm := val.(*TrackedMetrics)
-		if tm.Cordoned.Load() {
-			if r, ok := tm.LastCordonedReason.Load().(string); ok {
-				return r, true
-			}
-			return "", true
 		}
 	}
 	return "", false
@@ -1025,10 +1314,8 @@ func (t *Tracker) RecordUpstreamDuration(up common.Upstream, method string, d ti
 	if isSuccess {
 		// Feed the quantile only when `isSuccess` — the caller already
 		// filtered to outcomes whose duration is a real latency signal:
-		// successful responses, EVM reverts (upstream did real work),
-		// and canceled-by-hedge / client-disconnect / engine-timeout
-		// observations (lower-bound on completion time, important for
-		// scoring upstreams that lose every hedge race).
+		// successful responses and EVM reverts (upstream did real work).
+		// Cancelled attempts go through RecordUpstreamCancelledDuration.
 		// Hard upstream errors (connection refused, server 5xx,
 		// throttling) stay out so an upstream that's failing fast
 		// doesn't get crowned "fastest in the pool".
@@ -1049,6 +1336,24 @@ func (t *Tracker) RecordUpstreamDuration(up common.Upstream, method string, d ti
 	obs.Observe(sec)
 }
 
+// RecordUpstreamCancelledDuration records the elapsed time of a primary
+// attempt cancelled because another attempt won the hedge race. It feeds
+// only the per-upstream lower-bound sketch read by PolicyQuantiles;
+// ResponseQuantiles and the network aggregates stay real-latency only.
+func (t *Tracker) RecordUpstreamCancelledDuration(up common.Upstream, method string, d time.Duration, comp string, finality common.DataFinalityState, userId string) {
+	if comp == "" {
+		comp = "none"
+	}
+	sec := d.Seconds()
+	nowMs := time.Now().UnixMilli()
+	for _, k := range t.getUpsKeys(up, method, finality) {
+		tm := t.getUpsMetrics(k)
+		tm.addCancelled(t.logger, sec)
+		tm.touch(nowMs)
+	}
+	t.getUpstreamRequestDurationObserver(up, method, comp, finality, userId).Observe(sec)
+}
+
 func (t *Tracker) RecordUpstreamFailure(up common.Upstream, method string, finality common.DataFinalityState, err error) {
 	// Ignore errors that do not reflect upstream quality:
 	// - ExecutionException: valid blockchain state (e.g. revert)
@@ -1056,12 +1361,14 @@ func (t *Tracker) RecordUpstreamFailure(up common.Upstream, method string, final
 	// - Unsupported: capability, not quality
 	// - CapacityExceeded: remote 429, already penalized via ThrottledRate
 	// - ClientSideException: user sent a bad request, not upstream's fault
+	// - RequestTooLarge: the request exceeds this upstream's cap (range, result
+	//   count, size); deterministic and request-shaped, not a quality fault
 	// - RequestCanceled / HedgeCancelled: indistinguishable from a client
 	//   disconnect at this layer (both surface as context cancellation). Hedge
 	//   attempts are excluded from RequestsTotal / ErrorsTotal at the call
 	//   site in upstream.tryForward, so cancellations only reach here for
 	//   primary attempts — where they almost always mean "client gave up,"
-	//   not "upstream failed."  Slowness is already captured by ResponseQuantiles.
+	//   not "upstream failed."  Slowness shows in PolicyQuantiles instead.
 	// - BlockUnavailable: the requested height is outside this upstream's
 	//   served window or has not been applied yet. Retry/failover still
 	//   happens; scoring lag is BlockHeadLag, not ErrorRate. Counting these
@@ -1075,6 +1382,7 @@ func (t *Tracker) RecordUpstreamFailure(up common.Upstream, method string, final
 		common.ErrCodeEndpointUnsupported,
 		common.ErrCodeEndpointCapacityExceeded,
 		common.ErrCodeEndpointClientSideException,
+		common.ErrCodeEndpointRequestTooLarge,
 		common.ErrCodeEndpointRequestCanceled,
 		common.ErrCodeUpstreamHedgeCancelled,
 		common.ErrCodeUpstreamBlockUnavailable,
@@ -1704,6 +2012,34 @@ func (t *Tracker) IsHeadBenched(ups common.Upstream) bool {
 	return false
 }
 
+// HeadCredit is how many blocks ups is presumed to have gained since its last
+// latest-head report, and the corroborated network head. The credit is what
+// the network made since that report beyond ups's lag then (BlockHeadLag, see
+// headReport), so it freezes one poll period after the report, is 0 for a
+// benched head and for a head above the network head, and never exceeds the
+// blocks the chain can make in the time since the report at the network
+// block time: a network head that rose only because peers reported late is
+// not progress. 0 until the block time is known.
+func (t *Tracker) HeadCredit(ups common.Upstream) (credit, network int64) {
+	net := ups.NetworkId()
+	um, ok := t.metadata.Load(metadataKey{ups, net})
+	if !ok {
+		return 0, 0
+	}
+	meta := um.(*NetworkMetadata)
+	ntwMeta := t.getMetadata(metadataKey{nil, net})
+	network = ntwMeta.evmLatestBlockNumber.Load()
+	head, at := meta.evmLatestBlockNumber.Load(), meta.headReportedAt.Load()
+	blockTime := time.Duration(ntwMeta.evmBlockTime.Load())
+	m, ok := t.upsMetrics.Load(upstreamKey{ups, "*", common.DataFinalityStateAll})
+	if !ok || head <= 0 || network <= 0 || at == 0 || blockTime <= 0 {
+		return 0, network
+	}
+	byLag := network - m.(*TrackedMetrics).BlockHeadLag.Load() - head
+	byTime := int64(t.now().Sub(time.Unix(0, at)) / blockTime)
+	return max(0, min(byLag, byTime)), network
+}
+
 func (t *Tracker) SetLatestBlockNumber(upstream common.Upstream, blockNumber int64, blockTimestamp int64) {
 	id := upstream.Id()
 	net := upstream.NetworkId()
@@ -1809,6 +2145,10 @@ func (t *Tracker) SetLatestBlockNumber(upstream common.Upstream, blockNumber int
 				netLabel,
 				"evm_state_poller",
 			).Set(float64(distanceMs) / 1000.0)
+		} else if strings.HasPrefix(net, "svm:") && headTs <= 0 && ntwBn > oldNtwVal {
+			// SVM has no on-chain tip timestamp (pollers pass 0). Use wall-clock only
+			// for the block-time EMA — do not write it into tip-age fields/metrics.
+			t.updateBlockTimeSample(ntwMeta, netLabel, ntwBn, time.Now().Unix())
 		}
 	}
 
@@ -1821,6 +2161,7 @@ func (t *Tracker) SetLatestBlockNumber(upstream common.Upstream, blockNumber int
 	// network made beyond its last report (headReport).
 	now, blockTime := t.now(), time.Duration(ntwMeta.evmBlockTime.Load())
 	upsMeta.headReport.reported(now, ntwBn)
+	upsMeta.headReportedAt.Store(now.UnixNano())
 	lagHead := func(ups common.Upstream, meta *NetworkMetadata) int64 {
 		h := meta.evmLatestBlockNumber.Load()
 		if !meta.headBenched.Load() {
@@ -1846,6 +2187,19 @@ func (t *Tracker) SetLatestBlockNumber(upstream common.Upstream, blockNumber int
 			t.getHeadLagGauge,
 			&lg,
 		)
+		// Every reporter's {*, All} lag follows the new head, served or not:
+		// the index above holds only upstreams with traffic or a policy read,
+		// and a reporter missing from it would keep the lag it had when its
+		// poller last reported, after the poller stopped. Network-scope lag
+		// policies and HeadCredit read this bucket.
+		for _, r := range ntwMeta.reporters {
+			if r.meta.evmLatestBlockNumber.Load() <= 0 {
+				continue
+			}
+			lag := blocksBehind(ntwBn, lagHead(r.ups, r.meta))
+			t.loadOrStoreUpsMetrics(upstreamKey{r.ups, "*", common.DataFinalityStateAll}).BlockHeadLag.Store(lag)
+			t.getHeadLagGauge(t.projectId, r.ups.VendorName(), netLabel, r.ups.Id()).Set(float64(lag))
+		}
 	} else {
 		// Only update items for this single upstream
 		t.updateSingleUpstreamLag(

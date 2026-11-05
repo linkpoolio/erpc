@@ -4506,7 +4506,7 @@ func TestHttpServer_HandleHealthCheck(t *testing.T) {
 			startTime := time.Now()
 
 			encoder := common.SonicCfg.NewEncoder(w)
-			s.handleHealthCheck(ctx, w, tt.request, &startTime, tt.projectId, tt.architecture, tt.chainId, encoder, func(ctx context.Context, statusCode int, body error) {
+			s.handleHealthCheck(ctx, w, tt.request, &startTime, tt.projectId, tt.architecture, tt.chainId, "", encoder, func(ctx context.Context, statusCode int, body error) {
 				w.WriteHeader(statusCode)
 				encoder.Encode(map[string]string{"error": body.Error()})
 			})

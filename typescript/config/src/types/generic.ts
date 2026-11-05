@@ -1,6 +1,7 @@
 import type {
     DynamoDBConnectorConfig,
     EvmNetworkConfig,
+    ForwardedClientIdStrategyConfig,
     SvmNetworkConfig,
     AuthStrategyConfig as GenAuthStrategyConfig,
     JwtStrategyConfig,
@@ -115,14 +116,19 @@ import type {
   /**
    * Supported auth type
    */
-  export type AuthType = "secret" | "jwt" | "siwe" | "network";
+  export type AuthType =
+    | "secret"
+    | "jwt"
+    | "siwe"
+    | "network"
+    | "forwardedClientId";
   
   /**
    * Connector config depending on the upstream type
    */
   export type AuthStrategyConfig = Omit<
     GenAuthStrategyConfig,
-    "type" | "network" | "secret" | "jwt" | "siwe"
+    "type" | "network" | "secret" | "jwt" | "siwe" | "forwardedClientId"
   > &
     (
       | {
@@ -140,6 +146,10 @@ import type {
       | {
           type: "siwe";
           secret: SiweStrategyConfig;
+        }
+      | {
+          type: "forwardedClientId";
+          forwardedClientId?: ForwardedClientIdStrategyConfig;
         }
     );
   

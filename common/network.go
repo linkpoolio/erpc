@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/erpc/erpc/util"
 	"github.com/rs/zerolog"
 )
 
@@ -14,6 +15,9 @@ type NetworkArchitecture string
 const (
 	ArchitectureEvm NetworkArchitecture = "evm"
 	ArchitectureSvm NetworkArchitecture = "svm"
+	// ArchitectureJsonRpc is a chain-agnostic passthrough for generic JSON-RPC
+	// upstreams: requests are forwarded as-is, with no architecture hooks.
+	ArchitectureJsonRpc NetworkArchitecture = "jsonrpc"
 )
 
 type Network interface {
@@ -99,7 +103,7 @@ func EvmRefreshLatestBlock(n Network, ctx context.Context) {
 
 func IsValidArchitecture(architecture string) bool {
 	switch NetworkArchitecture(architecture) {
-	case ArchitectureEvm, ArchitectureSvm:
+	case ArchitectureEvm, ArchitectureSvm, ArchitectureJsonRpc:
 		return true
 	}
 	return false
@@ -154,6 +158,9 @@ func IsValidNetwork(network string) bool {
 			return true
 		}
 		return isIdentifier(chain) && isIdentifier(cluster)
+	}
+	if strings.HasPrefix(network, "jsonrpc:") {
+		return util.IsValidIdentifier(strings.TrimPrefix(network, "jsonrpc:"))
 	}
 
 	return false

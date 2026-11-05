@@ -57,3 +57,30 @@ func TestCanonicalNetworkId_SvmWithChain(t *testing.T) {
 		})
 	}
 }
+
+func TestJsonRpcNetworkId(t *testing.T) {
+	if got := JsonRpcNetworkId("bitcoin-mainnet"); got != "jsonrpc:bitcoin-mainnet" {
+		t.Fatalf("JsonRpcNetworkId = %q", got)
+	}
+
+	cases := []struct {
+		id   string
+		want bool
+	}{
+		{"jsonrpc:bitcoin-mainnet", true},
+		{"jsonrpc:stellar_testnet", true},
+		{"jsonrpc:", false},
+		{"jsonrpc:a:b", false},
+		{"jsonrpc:a.b", false},
+		{"jsonrpc:a b", false},
+	}
+	for _, tc := range cases {
+		id, got := CanonicalNetworkId(tc.id)
+		if got != tc.want {
+			t.Errorf("CanonicalNetworkId(%q) valid = %v, want %v", tc.id, got, tc.want)
+		}
+		if got && id != tc.id {
+			t.Errorf("CanonicalNetworkId(%q) = %q, want it unchanged", tc.id, id)
+		}
+	}
+}

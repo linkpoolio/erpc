@@ -1881,12 +1881,13 @@ func (u *UpstreamConfig) ApplyDefaults(defaults *UpstreamConfig) error {
 	}
 	if u.JsonRpc == nil && defaults.JsonRpc != nil {
 		u.JsonRpc = &JsonRpcUpstreamConfig{
-			SupportsBatch: defaults.JsonRpc.SupportsBatch,
-			BatchMaxSize:  defaults.JsonRpc.BatchMaxSize,
-			BatchMaxWait:  defaults.JsonRpc.BatchMaxWait,
-			EnableGzip:    defaults.JsonRpc.EnableGzip,
-			ProxyPool:     defaults.JsonRpc.ProxyPool,
-			Headers:       defaults.JsonRpc.Headers,
+			SupportsBatch:   defaults.JsonRpc.SupportsBatch,
+			BatchMaxSize:    defaults.JsonRpc.BatchMaxSize,
+			BatchMaxWait:    defaults.JsonRpc.BatchMaxWait,
+			EnableGzip:      defaults.JsonRpc.EnableGzip,
+			ProxyPool:       defaults.JsonRpc.ProxyPool,
+			Headers:         defaults.JsonRpc.Headers,
+			OmitEmptyParams: defaults.JsonRpc.OmitEmptyParams,
 		}
 	}
 	if u.Grpc == nil && defaults.Grpc != nil {
@@ -1947,8 +1948,14 @@ func (u *UpstreamConfig) SetDefaults(defaults *UpstreamConfig) error {
 		}
 	}
 	if u.Type == "" {
-		// TODO make actual calls to detect other types (solana, btc, etc)?
-		u.Type = UpstreamTypeEvm
+		if u.JsonRpc != nil && u.JsonRpc.NetworkId != "" {
+			// jsonRpc.networkId only has meaning for the jsonrpc passthrough
+			// architecture, so it is an unambiguous type signal.
+			u.Type = UpstreamTypeJsonRpc
+		} else {
+			// TODO make actual calls to detect other types (solana, btc, etc)?
+			u.Type = UpstreamTypeEvm
+		}
 	}
 
 	if len(u.Failsafe) > 0 {
@@ -2035,6 +2042,9 @@ func (u *UpstreamConfig) SetDefaults(defaults *UpstreamConfig) error {
 	}
 	if err := u.JsonRpc.SetDefaults(); err != nil {
 		return fmt.Errorf("failed to set defaults for json rpc: %w", err)
+	}
+	if u.Type == UpstreamTypeJsonRpc && u.JsonRpc.OmitEmptyParams == nil {
+		u.JsonRpc.OmitEmptyParams = util.BoolPtr(true)
 	}
 	// By default if any allowed methods are specified, all other methods are ignored (unless ignoreMethods is explicitly defined by user)
 	// Similar to how common network security policies work.
@@ -2322,12 +2332,13 @@ func (n *NetworkConfig) SetDefaults(upstreams []*UpstreamConfig, defaults *Netwo
 					n.Evm.LocalAnswers[method] = on
 				}
 			}
-		} else if n.Evm == nil && defaults.Evm != nil && n.Svm == nil && n.Architecture != ArchitectureSvm {
+		} else if n.Evm == nil && defaults.Evm != nil && n.Svm == nil && n.Architecture != ArchitectureSvm &&
+			n.JsonRpc == nil && n.Architecture != ArchitectureJsonRpc {
 			// Copy EVM defaults only onto networks that are (or can become) EVM.
-			// Without the SVM guard, a mixed project with networkDefaults.evm
-			// would inject an evm block into every svm network — and the
-			// architecture derivation below checks n.Evm BEFORE n.Svm, silently
-			// flipping an `svm:`-authored network to architecture=evm.
+			// Without the SVM/JSON-RPC guards, a mixed project with
+			// networkDefaults.evm would inject an evm block into every svm or
+			// jsonrpc network — and the architecture derivation below checks
+			// n.Evm first, silently flipping such a network to architecture=evm.
 			n.Evm = &EvmNetworkConfig{}
 			*n.Evm = *defaults.Evm
 		}
@@ -2353,6 +2364,8 @@ func (n *NetworkConfig) SetDefaults(upstreams []*UpstreamConfig, defaults *Netwo
 			n.Architecture = "evm"
 		} else if n.Svm != nil {
 			n.Architecture = ArchitectureSvm
+		} else if n.JsonRpc != nil {
+			n.Architecture = ArchitectureJsonRpc
 		}
 	}
 
@@ -2361,6 +2374,16 @@ func (n *NetworkConfig) SetDefaults(upstreams []*UpstreamConfig, defaults *Netwo
 	}
 	if n.Architecture == ArchitectureSvm && n.Svm == nil {
 		n.Svm = &SvmNetworkConfig{}
+	}
+	if n.Architecture == ArchitectureJsonRpc {
+		if n.JsonRpc == nil {
+			n.JsonRpc = &JsonRpcNetworkConfig{}
+		}
+		// The alias doubles as the network slug when no explicit id is given,
+		// so `architecture: jsonrpc` + `alias: foo` serves "jsonrpc:foo".
+		if n.JsonRpc.Id == "" {
+			n.JsonRpc.Id = n.Alias
+		}
 	}
 
 	// Apply methods defaults

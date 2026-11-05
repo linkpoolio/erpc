@@ -224,7 +224,7 @@ func (s *HttpServer) handleHealthCheck(
 					if upsConfig.Evm != nil && upsConfig.Evm.ChainId == cid {
 						filteredUpstreams = append(filteredUpstreams, ups)
 					}
-				case common.ArchitectureSvm:
+				case common.ArchitectureSvm, common.ArchitectureJsonRpc:
 					if ups.NetworkId() == targetNetworkId {
 						filteredUpstreams = append(filteredUpstreams, ups)
 					}
@@ -534,6 +534,11 @@ func (s *HttpServer) evaluateNetworkHealth(
 					if upsCfg.Svm != nil && nwCfg.Svm != nil &&
 						common.ResolveSvmChain(upsCfg.Svm.Chain) == common.ResolveSvmChain(nwCfg.Svm.Chain) &&
 						upsCfg.Svm.Cluster == nwCfg.Svm.Cluster {
+						networkStaticUpsCount++
+					}
+				case common.ArchitectureJsonRpc:
+					if upsCfg.Type == common.UpstreamTypeJsonRpc && upsCfg.JsonRpc != nil && nwCfg.JsonRpc != nil &&
+						upsCfg.JsonRpc.NetworkId == nwCfg.JsonRpc.Id {
 						networkStaticUpsCount++
 					}
 				}

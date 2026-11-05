@@ -102,6 +102,56 @@ func TestHttpJsonRpcClient_SingleRequests(t *testing.T) {
 	})
 }
 
+func TestHttpJsonRpcClient_OmitEmptyParams(t *testing.T) {
+	cases := []struct {
+		name       string
+		omit       *bool
+		wantParams bool
+	}{
+		{name: "DefaultSendsEmptyParams", omit: nil, wantParams: true},
+		{name: "DisabledSendsEmptyParams", omit: util.BoolPtr(false), wantParams: true},
+		{name: "EnabledOmitsEmptyParams", omit: util.BoolPtr(true), wantParams: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			util.ResetGock()
+			defer util.ResetGock()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			logger := log.Logger
+
+			var sentBody string
+			gock.New("http://rpc1.localhost:8545").
+				Post("/").
+				Filter(func(req *http.Request) bool {
+					sentBody = util.SafeReadBody(req)
+					return true
+				}).
+				Reply(200).
+				BodyString(`{"jsonrpc":"2.0","id":1,"result":"ok"}`)
+
+			ups := common.NewFakeUpstream("rpc1")
+			ups.Config().Endpoint = "http://rpc1.localhost:8545"
+			jrCfg := &common.JsonRpcUpstreamConfig{OmitEmptyParams: tc.omit}
+			client, err := NewGenericHttpJsonRpcClient(ctx, &logger, "prj1", ups, &url.URL{Scheme: "http", Host: "rpc1.localhost:8545"}, jrCfg, nil, &noopErrorExtractor{})
+			require.NoError(t, err)
+
+			req := common.NewNormalizedRequest([]byte(`{"jsonrpc":"2.0","id":1,"method":"getHealth","params":[]}`))
+			resp, err := client.SendRequest(ctx, req)
+			require.NoError(t, err)
+			require.NotNil(t, resp)
+
+			assert.Contains(t, sentBody, `"method":"getHealth"`)
+			if tc.wantParams {
+				assert.Contains(t, sentBody, `"params":[]`)
+			} else {
+				assert.NotContains(t, sentBody, `"params"`)
+			}
+		})
+	}
+}
+
 func TestHttpJsonRpcClient_BatchRequests(t *testing.T) {
 	logger := log.Logger
 
